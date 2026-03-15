@@ -12,6 +12,7 @@ proto_1/data/
 *.mat
 *.h5
 *.hdf5
+*.mp3
 
 # macOS
 .DS_Store
