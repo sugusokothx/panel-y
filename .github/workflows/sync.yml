@@ -19,7 +19,7 @@ jobs:
         id: sync
         uses: aieri/workflow-upstream-sync@v2
         with:
-          upstream_repository: sugusokothx/panel-y # ここを書き換え
+          upstream_repository: https://github.com/sugusokothx/panel-y.git # ここを書き換え
           target_branch: main # 同期先のブランチ名
           upstream_branch: main # 同期元のブランチ名
           force: false # 自分の変更を上書きしたくない場合はfalse
