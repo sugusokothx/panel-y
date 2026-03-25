@@ -27,6 +27,7 @@ Proto #1（ファイル選択・計測モード・カーソル差分・ホバー
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import dash
@@ -1027,18 +1028,19 @@ def update_delta_panel(cursor_a, cursor_b, row_groups):
         ))
     children.append(html.Div(cursor_info))
 
-    # 差分計算
+    # 差分計算 + 区間解析
     if cursor_a is not None and cursor_b is not None and df is not None:
         dt = cursor_b - cursor_a
         children.append(html.Div(
-            f"Δt = {abs(dt) * 1000:.3f} ms",
+            f"Δt = {abs(dt) * 1000:.3f} ms   ({1/abs(dt):.4g} Hz)" if dt != 0 else "Δt = 0 ms",
             style={"marginTop": "4px", "color": "#fff", "fontWeight": "bold"},
         ))
 
         idx_a = (df["time"] - cursor_a).abs().idxmin()
         idx_b = (df["time"] - cursor_b).abs().idxmin()
+        i_lo, i_hi = min(idx_a, idx_b), max(idx_a, idx_b) + 1
 
-        # 全行の全チャンネルを対象に差分表示（重複除去・順序維持）
+        # 全行の全チャンネルを対象（重複除去・順序維持）
         seen = set()
         unique_channels = []
         if row_groups:
@@ -1048,17 +1050,54 @@ def update_delta_panel(cursor_a, cursor_b, row_groups):
                         seen.add(ch)
                         unique_channels.append(ch)
 
-        delta_items = []
+        # テーブルヘッダー
+        hdr_style = {"padding": "2px 8px", "color": "#888", "fontSize": "11px",
+                     "borderBottom": "1px solid #444", "whiteSpace": "nowrap"}
+        val_style = {"padding": "2px 8px", "fontSize": "12px", "whiteSpace": "nowrap"}
+
+        table_rows = [html.Tr([
+            html.Th("ch", style=hdr_style),
+            html.Th("A", style=hdr_style),
+            html.Th("B", style=hdr_style),
+            html.Th("Δ", style=hdr_style),
+            html.Th("Mean", style=hdr_style),
+            html.Th("Max", style=hdr_style),
+            html.Th("Min", style=hdr_style),
+            html.Th("P-P", style=hdr_style),
+            html.Th("RMS", style=hdr_style),
+            html.Th("Slope/s", style=hdr_style),
+        ])]
+
         for ch in unique_channels:
             if ch in df.columns:
+                seg = df[ch].iloc[i_lo:i_hi]
                 va = df[ch].iloc[idx_a]
                 vb = df[ch].iloc[idx_b]
-                delta_items.append(html.Div(
-                    f"{ch}:  A={va:.4f}   B={vb:.4f}   Δ={vb - va:.4f}",
-                    style={"marginTop": "2px"},
-                ))
-        if delta_items:
-            children.append(html.Div(delta_items, style={"marginTop": "4px"}))
+                v_mean = seg.mean()
+                v_max = seg.max()
+                v_min = seg.min()
+                v_pp = v_max - v_min
+                v_rms = np.sqrt((seg ** 2).mean())
+                v_slope = (vb - va) / dt if dt != 0 else 0
+
+                table_rows.append(html.Tr([
+                    html.Td(ch, style={**val_style, "color": "#aaa"}),
+                    html.Td(f"{va:.4g}", style={**val_style, "color": "#4fc3f7"}),
+                    html.Td(f"{vb:.4g}", style={**val_style, "color": "#ef5350"}),
+                    html.Td(f"{vb - va:.4g}", style=val_style),
+                    html.Td(f"{v_mean:.4g}", style=val_style),
+                    html.Td(f"{v_max:.4g}", style=val_style),
+                    html.Td(f"{v_min:.4g}", style=val_style),
+                    html.Td(f"{v_pp:.4g}", style=val_style),
+                    html.Td(f"{v_rms:.4g}", style=val_style),
+                    html.Td(f"{v_slope:.4g}", style=val_style),
+                ]))
+
+        if len(table_rows) > 1:
+            children.append(html.Table(
+                table_rows,
+                style={"marginTop": "6px", "borderCollapse": "collapse"},
+            ))
 
     return children, base_style
 
