@@ -1,0 +1,39 @@
+/* Panel_y Proto #1 — Dark theme overrides */
+
+/* --- dcc.Dropdown --- */
+.Select-control {
+    background-color: #2a2a2a !important;
+    border-color: #555 !important;
+}
+.Select-value-label {
+    color: #eee !important;
+}
+.Select-placeholder {
+    color: #888 !important;
+}
+.Select-menu-outer {
+    background-color: #2a2a2a !important;
+    border-color: #555 !important;
+}
+.VirtualizedSelectOption {
+    background-color: #2a2a2a !important;
+    color: #eee !important;
+}
+.VirtualizedSelectFocusedOption {
+    background-color: #3a3a3a !important;
+}
+.Select-input > input {
+    color: #eee !important;
+}
+.Select--multi .Select-value {
+    background-color: #3a3a3a !important;
+    border-color: #555 !important;
+    color: #eee !important;
+}
+.Select--multi .Select-value-icon {
+    border-color: #555 !important;
+}
+.Select-clear-zone,
+.Select-arrow-zone {
+    color: #888 !important;
+}
