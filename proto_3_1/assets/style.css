@@ -1,0 +1,470 @@
+/* Panel_y Proto #3.1 — Theme system */
+
+/* ===================================================================
+   CSS Variables — Dark / Light
+   =================================================================== */
+:root,
+.theme-dark {
+    --bg-primary:   #141414;
+    --bg-secondary: #1e1e1e;
+    --bg-surface:   #252525;
+    --bg-header:    #1a1a1a;
+    --bg-input:     #2a2a2a;
+    --bg-hover:     #333;
+    --border:       #333;
+    --border-light: #444;
+    --text-primary: #e8e8e8;
+    --text-secondary: #aaa;
+    --text-muted:   #666;
+    --accent:       #4fc3f7;
+    --accent-dim:   #2a6496;
+    --danger:       #633;
+    --danger-hover: #844;
+    --success:      #8bc34a;
+    --value-color:  #7ec8e3;
+    --plot-bg:      #1a1a1a;
+    --scrollbar-bg: #1a1a1a;
+    --scrollbar-thumb: #444;
+    --suggestion-bg: #2a2a2a;
+    --suggestion-hover: #353535;
+    --shadow:       0 1px 4px rgba(0,0,0,0.5);
+    --plotly-template: dark;
+}
+
+.theme-light {
+    --bg-primary:   #f0f0f0;
+    --bg-secondary: #fafafa;
+    --bg-surface:   #ffffff;
+    --bg-header:    #e8e8e8;
+    --bg-input:     #ffffff;
+    --bg-hover:     #e0e0e0;
+    --border:       #ccc;
+    --border-light: #ddd;
+    --text-primary: #1a1a1a;
+    --text-secondary: #555;
+    --text-muted:   #999;
+    --accent:       #0288d1;
+    --accent-dim:   #1565c0;
+    --danger:       #c62828;
+    --danger-hover: #e53935;
+    --success:      #558b2f;
+    --value-color:  #0277bd;
+    --plot-bg:      #fafafa;
+    --scrollbar-bg: #e8e8e8;
+    --scrollbar-thumb: #bbb;
+    --suggestion-bg: #fff;
+    --suggestion-hover: #f0f0f0;
+    --shadow:       0 1px 4px rgba(0,0,0,0.12);
+    --plotly-template: light;
+}
+
+/* ===================================================================
+   Global reset & base
+   =================================================================== */
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ===================================================================
+   App container
+   =================================================================== */
+.app-container {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    transition: background-color 0.2s, color 0.2s;
+}
+
+/* ===================================================================
+   Header bar
+   =================================================================== */
+.header-bar {
+    display: flex;
+    align-items: center;
+    padding: 8px 16px;
+    background-color: var(--bg-header);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+    gap: 8px;
+    transition: background-color 0.2s;
+}
+
+.header-bar-sticky {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+
+.header-title {
+    margin: 0 12px 0 0;
+    color: var(--text-primary);
+    font-weight: 700;
+    font-size: 17px;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+
+.header-credit {
+    margin-left: auto;
+    color: var(--text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.status-text {
+    margin-left: 16px;
+    color: var(--success);
+    font-family: "SF Mono", "Consolas", "Liberation Mono", monospace;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+/* ===================================================================
+   Buttons
+   =================================================================== */
+.btn {
+    padding: 5px 14px;
+    background-color: var(--bg-surface);
+    color: var(--text-primary);
+    border: 1px solid var(--border-light);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    font-family: inherit;
+    transition: background-color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+}
+.btn:hover {
+    background-color: var(--bg-hover);
+    border-color: var(--text-secondary);
+}
+
+.btn-accent {
+    background-color: var(--accent);
+    color: #000;
+    border: none;
+    font-weight: 600;
+}
+.btn-accent:hover {
+    filter: brightness(1.1);
+}
+
+.btn-primary {
+    background-color: var(--accent-dim);
+    color: #fff;
+    border: 1px solid var(--accent-dim);
+}
+.btn-primary:hover {
+    filter: brightness(1.15);
+}
+
+.btn-danger {
+    background-color: var(--danger);
+    color: #ddd;
+    border: 1px solid var(--danger);
+}
+.btn-danger:hover {
+    background-color: var(--danger-hover);
+}
+
+.btn-toggle-on {
+    background-color: var(--accent);
+    color: #000;
+    border: 1px solid var(--accent);
+    font-weight: 600;
+}
+
+.btn-toggle-off {
+    background-color: var(--bg-surface);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-light);
+}
+
+/* Theme toggle */
+.btn-theme {
+    padding: 4px 10px;
+    font-size: 15px;
+    line-height: 1;
+    background: none;
+    border: 1px solid var(--border-light);
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text-secondary);
+    transition: border-color 0.15s;
+}
+.btn-theme:hover {
+    border-color: var(--text-primary);
+}
+
+/* Header pin toggle */
+.btn-pin-on {
+    color: var(--accent) !important;
+}
+.btn-pin-off {
+    opacity: 0.5;
+}
+
+/* ===================================================================
+   Row definition area
+   =================================================================== */
+.row-def-area {
+    padding: 10px 16px;
+    max-width: 900px;
+    border-bottom: 1px solid var(--border);
+}
+
+.row-def-actions {
+    display: flex;
+    margin-bottom: 8px;
+    gap: 8px;
+}
+
+.dropdown-row {
+    display: flex;
+    align-items: center;
+    padding: 5px 0;
+}
+
+.row-label {
+    color: var(--text-secondary);
+    font-size: 12px;
+    min-width: 28px;
+    margin-right: 6px;
+    align-self: center;
+}
+
+.input-field {
+    width: 70px;
+    padding: 4px 6px;
+    background-color: var(--bg-input);
+    color: var(--text-primary);
+    border: 1px solid var(--border-light);
+    border-radius: 4px;
+    font-family: "SF Mono", "Consolas", "Liberation Mono", monospace;
+    font-size: 12px;
+    transition: border-color 0.15s;
+}
+.input-field:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.input-path {
+    width: 420px;
+    padding: 6px 10px;
+    background-color: var(--bg-input);
+    color: var(--text-primary);
+    border: 1px solid var(--border-light);
+    border-radius: 4px;
+    font-family: "SF Mono", "Consolas", "Liberation Mono", monospace;
+    font-size: 13px;
+    transition: border-color 0.15s;
+}
+.input-path:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+/* ===================================================================
+   Channel settings panel
+   =================================================================== */
+.ch-settings-panel {
+    padding: 4px 16px;
+    border-bottom: 1px solid var(--border);
+}
+
+.ch-settings-summary {
+    color: var(--text-secondary);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 6px 0;
+    font-family: "SF Mono", "Consolas", "Liberation Mono", monospace;
+}
+
+.ch-settings-item {
+    display: inline-flex;
+    flex-direction: column;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin: 2px 4px 2px 0;
+    background-color: var(--bg-surface);
+    gap: 2px;
+}
+
+.ch-name {
+    color: var(--text-primary);
+    font-size: 11px;
+    font-family: "SF Mono", "Consolas", "Liberation Mono", monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 200px;
+}
+
+.ch-label-text {
+    color: var(--text-muted);
+    font-size: 10px;
+    margin-right: 3px;
+    white-space: nowrap;
+}
+
+/* ===================================================================
+   Waveform rows
+   =================================================================== */
+.wf-row {
+    display: flex;
+    align-items: stretch;
+    border-bottom: 1px solid var(--border);
+    background-color: var(--bg-primary);
+    transition: background-color 0.2s;
+}
+
+.wf-label-col {
+    width: var(--label-col-width, 200px);
+    min-width: 80px;
+    flex-shrink: 0;
+    padding: 8px 14px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    border-right: 1px solid var(--border);
+    font-family: "SF Mono", "Consolas", "Liberation Mono", monospace;
+    overflow: hidden;
+}
+
+.wf-label-col-header {
+    resize: horizontal;
+    cursor: col-resize;
+}
+
+.wf-label-name {
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: bold;
+}
+
+.wf-label-value {
+    color: var(--value-color);
+    font-size: 16px;
+    margin-top: 6px;
+    transition: color 0.2s;
+}
+
+/* ===================================================================
+   Suggestion dropdown
+   =================================================================== */
+.suggestion-panel {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    width: 420px;
+    z-index: 1000;
+    max-height: 300px;
+    overflow-y: auto;
+    background-color: var(--suggestion-bg);
+    border: 1px solid var(--border-light);
+    border-radius: 0 0 4px 4px;
+    box-shadow: var(--shadow);
+}
+
+.suggestion-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 6px 12px;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    background-color: var(--suggestion-bg);
+    cursor: pointer;
+    font-family: "SF Mono", "Consolas", "Liberation Mono", monospace;
+    font-size: 13px;
+    color: var(--text-secondary);
+    transition: background-color 0.1s;
+}
+.suggestion-item:hover {
+    background-color: var(--suggestion-hover);
+}
+.suggestion-item-file {
+    color: var(--success);
+}
+
+/* ===================================================================
+   Delta / measure panel
+   =================================================================== */
+.delta-panel {
+    padding: 8px 16px;
+    background-color: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    font-family: "SF Mono", "Consolas", "Liberation Mono", monospace;
+    font-size: 12px;
+}
+
+/* ===================================================================
+   dcc.Dropdown overrides (themed)
+   =================================================================== */
+.Select-control {
+    background-color: var(--bg-input) !important;
+    border-color: var(--border-light) !important;
+    transition: border-color 0.15s;
+}
+.Select-control:hover {
+    border-color: var(--text-secondary) !important;
+}
+.Select-value-label {
+    color: var(--text-primary) !important;
+}
+.Select-placeholder {
+    color: var(--text-muted) !important;
+}
+.Select-menu-outer {
+    background-color: var(--bg-input) !important;
+    border-color: var(--border-light) !important;
+    box-shadow: var(--shadow);
+}
+.VirtualizedSelectOption {
+    background-color: var(--bg-input) !important;
+    color: var(--text-primary) !important;
+}
+.VirtualizedSelectFocusedOption {
+    background-color: var(--bg-hover) !important;
+}
+.Select-input > input {
+    color: var(--text-primary) !important;
+}
+.Select--multi .Select-value {
+    background-color: var(--bg-surface) !important;
+    border-color: var(--border-light) !important;
+    color: var(--text-primary) !important;
+}
+.Select--multi .Select-value-icon {
+    border-color: var(--border-light) !important;
+}
+.Select-clear-zone,
+.Select-arrow-zone {
+    color: var(--text-muted) !important;
+}
+
+/* ===================================================================
+   Scrollbar
+   =================================================================== */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+::-webkit-scrollbar-track {
+    background: var(--scrollbar-bg);
+}
+::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: var(--text-secondary);
+}
