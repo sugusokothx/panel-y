@@ -13,12 +13,15 @@ factory/panel-y/
 │   ├── proto_*_設計書.md
 │   └── bug_report_*.md
 ├── journal/               ← 開発日誌（YYYY-MM-DD.md）← 秘書課はここを読む
-├── old_type/              ← 旧TypeScript実装（参考用アーカイブ）
-├── proto_0_1/ ～ proto_1/ ← 初期プロトタイプ（アーカイブ）
-├── proto_2_0/             ← Min-Max envelope実装
-├── proto_3_0/             ← データ間引き + ズーム連動
-├── proto_3_1/             ← 現行最新（FFT・テーマ対応）
-└── requirements.txt
+└── code/                  ← 実装
+    ├── requirements.txt
+    ├── old_type/          ← 初期プロトタイプ（アーカイブ）
+    │   ├── Proto_0_0/     ← 旧TypeScript実装
+    │   ├── proto_0_1/ ～ proto_0_4/  ← Python初期版
+    ├── proto_1/           ← マルチフォーマット対応
+    ├── proto_2_0/         ← Min-Max envelope実装
+    ├── proto_3_0/         ← データ間引き + ズーム連動
+    └── proto_3_1/         ← 現行最新（FFT・テーマ対応）
 ```
 
 ## 現在の状態
@@ -32,7 +35,7 @@ factory/panel-y/
 ## 開発の進め方
 
 ```bash
-cd proto_3_1
+cd code/proto_3_1
 source ../.venv/bin/activate  # または proto内の venv
 python app.py
 ```
