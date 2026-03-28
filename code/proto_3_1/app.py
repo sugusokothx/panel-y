@@ -745,6 +745,10 @@ def update_waveform_rows(
 ):
     """ドロップダウンの値から波形行を生成する。"""
     if not all_values:
+        # 返却値の意味:
+        # 1) waveform-container: 空状態メッセージを表示
+        # 2) row-groups-store: 空配列で内部の行定義を初期化
+        # 3) ch-settings-container: 空配列でチャンネル設定パネルを初期化
         return html.Div(
             "チャンネルが選択されていません",
             style={"color": "var(--text-muted)", "padding": "20px"},
@@ -773,10 +777,11 @@ def update_waveform_rows(
             step_list.append(set(raw_step) if raw_step and isinstance(raw_step, list) else set())
 
     if not row_groups or df is None:
+        # 空状態時はメッセージ表示と同時に、row-groups/ch-settings の両方を空へ揃える。
         return html.Div(
             "チャンネルが選択されていません",
             style={"color": "#888", "padding": "20px"},
-        ), []
+        ), [], []
 
     rows = [
         # ヘッダー行
