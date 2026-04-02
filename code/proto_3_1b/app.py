@@ -650,6 +650,14 @@ def load_file(n_clicks, file_path):
     # time軸キャッシュ（毎回 .values を呼ばないように）
     time_arr_cache = df["time"].values
 
+    # time列が非単調ならロード時に安定ソートして補正する
+    status_warn = ""
+    if not np.all(np.diff(time_arr_cache) >= 0):
+        sort_idx = np.argsort(time_arr_cache, kind="stable")
+        df = df.iloc[sort_idx].reset_index(drop=True)
+        time_arr_cache = df["time"].values
+        status_warn = " ⚠️ time列が非単調のためソートしました"
+
     # 全体表示用ダウンサンプルキャッシュ（OVERVIEW_POINTS 点に間引き）
     n = len(df)
     if n > OVERVIEW_POINTS:
@@ -660,7 +668,7 @@ def load_file(n_clicks, file_path):
 
     ts = df["time"].iloc[1] - df["time"].iloc[0]
     mem_mb = df.memory_usage(deep=True).sum() / 1024 / 1024
-    status = f"✓ {path.name} ({len(channels)} ch, {n:,} 点, {1/ts:,.0f} Hz, {mem_mb:.0f} MB)"
+    status = f"✓ {path.name} ({len(channels)} ch, {n:,} 点, {1/ts:,.0f} Hz, {mem_mb:.0f} MB){status_warn}"
 
     # 初期行: チャンネルごとに1行ずつ（最大8行まで）
     initial_channels = channels[:8]
