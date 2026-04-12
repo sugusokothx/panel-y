@@ -997,6 +997,9 @@ def manage_rows(add_clicks, delete_clicks, current_children, row_count):
         return current_children, row_count + 1
 
     if isinstance(triggered, dict) and triggered.get("type") == "row-delete":
+        # パターンマッチ更新による誤発火を防止（実際にクリックされたか確認）
+        if not any(n for n in (delete_clicks or []) if n):
+            return no_update, no_update
         delete_index = triggered["index"]
         updated = []
         for child in current_children:
@@ -1174,7 +1177,7 @@ def update_waveform_rows(
             if ch not in seen:
                 used_chs.append(ch)
                 seen.add(ch)
-    ch_settings = make_ch_settings(used_chs)
+    ch_settings = make_ch_settings(used_chs, ch_styles)
 
     return rows, row_groups, ch_settings
 
