@@ -1,7 +1,13 @@
 """
-app.py - Panel_y Proto #3.1 — テーマ対応デザイン改善
+app.py - Panel_y Proto #3.1b — 大容量データ対応パフォーマンス改善
 
-Proto #3.0 の全機能を継承し、Dark/Light テーマ切替を追加。
+Proto #3.1 の全機能を継承し、大容量データ（~90M点）でのハングアップを修正。
+
+主な変更点（→ docs/bug_report_3_1.md 参照）:
+  - minmax_envelope: Pythonループ → numpy vectorize化（~100x高速化）
+  - 表示範囲スライス: boolean mask → np.searchsorted（メモリ削減）
+  - データ読み込み: float32ダウンキャストでメモリ半減
+  - 全体表示用事前ダウンサンプリングキャッシュ（df_overview）
 
 アーキテクチャ:
   - 各行は独立した go.Figure()（make_subplotsは使わない）
@@ -53,8 +59,12 @@ PLOT_BG = {"dark": "#1a1a1a", "light": "#fafafa"}
 # ---------------------------------------------------------------------------
 # グローバル状態
 # ---------------------------------------------------------------------------
-df: pd.DataFrame | None = None
+df: pd.DataFrame | None = None          # フルデータ（float32）
+df_overview: pd.DataFrame | None = None  # 全体表示用事前ダウンサンプル（~10000点）
+time_arr_cache: np.ndarray | None = None  # df["time"].values キャッシュ
 channels: list[str] = []
+
+OVERVIEW_POINTS = 10_000  # 全体表示用ダウンサンプル目標点数
 
 # ---------------------------------------------------------------------------
 # ヘルパー関数
@@ -64,96 +74,57 @@ channels: list[str] = []
 def minmax_envelope(time: np.ndarray, data: np.ndarray, n_buckets: int):
     """Min-Max envelope: バケットごとにmin/maxを保持し、ピークを欠落させずに圧縮する。
 
+    np.linspace でバケット境界を作成し、numpy.reduceat で完全vectorize集計する。
+    データ長がn_bucketsで割り切れない場合も末尾を切り捨てず、全点を対象にする。
+
     Returns (t_env, d_min, d_max) — 各バケットの代表時刻, 最小値, 最大値。
     """
     n = len(data)
-    bucket_size = n / n_buckets
-    t_env = np.empty(n_buckets)
-    d_min = np.empty(n_buckets)
-    d_max = np.empty(n_buckets)
-    for i in range(n_buckets):
-        i0 = int(i * bucket_size)
-        i1 = int((i + 1) * bucket_size)
-        if i1 <= i0:
-            i1 = i0 + 1
-        seg = data[i0:i1]
-        t_env[i] = time[i0]
-        d_min[i] = seg.min()
-        d_max[i] = seg.max()
+    idx = np.linspace(0, n, n_buckets + 1, dtype=int)
+    starts = idx[:-1]
+    ends = idx[1:]
+
+    # n_buckets > n のときに発生する空バケットを除外
+    valid = ends > starts
+    starts = starts[valid]
+
+    t_env = time[starts]
+    d_min = np.minimum.reduceat(data, starts)
+    d_max = np.maximum.reduceat(data, starts)
     return t_env, d_min, d_max
 
 
 
-def make_row_fig(
-    chs: list[str],
-    show_xaxis: bool = False,
-    ymin: float | None = None,
-    ymax: float | None = None,
-    lock_y: bool = False,
-    step_chs: set[str] | None = None,
-    ch_styles: dict[str, dict] | None = None,
-    x_range: list | None = None,
-    theme: str = DEFAULT_THEME,
-) -> go.Figure:
-    """行1つ分の Figure を生成する。点数に応じてenvelope/生データを自動切り替え。"""
-    fig = go.Figure()
+def _hex_to_rgba(color: str, alpha: float = 0.3) -> str:
+    """色文字列を rgba() 形式に変換する。"""
+    if color.startswith("#") and len(color) == 7:
+        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+    elif color.startswith("rgb("):
+        return color.replace("rgb(", "rgba(").replace(")", f",{alpha})")
+    return f"rgba(128,128,128,{alpha})"
 
-    # 表示範囲のスライス
-    time_arr = df["time"].values
-    if x_range and len(x_range) == 2:
-        mask = (time_arr >= x_range[0]) & (time_arr <= x_range[1])
-    else:
-        mask = np.ones(len(time_arr), dtype=bool)
-    t_vis = time_arr[mask]
-    n_vis = len(t_vis)
 
-    for j, ch in enumerate(chs):
-        if ch in df.columns:
-            style = ch_styles.get(ch, {}) if ch_styles else {}
-            color = style.get("color", TRACE_COLORS[j % len(TRACE_COLORS)])
-            width = style.get("width", 1)
-            is_step = step_chs and ch in step_chs
-            d_vis = df[ch].values[mask]
+def _add_envelope_traces(fig, ch, t_env, d_min, d_max, color, width):
+    """Min-Max envelope の上下トレースを fig に追加する。"""
+    fill_color = _hex_to_rgba(color)
+    fig.add_trace(go.Scatter(
+        x=t_env, y=d_max,
+        mode="lines", name=ch,
+        line=dict(width=0, color=color),
+        hoverinfo="none", showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=t_env, y=d_min,
+        mode="lines", name=f"{ch} (envelope)",
+        line=dict(width=width, color=color),
+        fill="tonexty", fillcolor=fill_color,
+        hoverinfo="none", showlegend=False,
+    ))
 
-            if n_vis > DECIMATE_THRESHOLD and not is_step:
-                # Min-Max envelope
-                n_buckets = DECIMATE_THRESHOLD // 2
-                t_env, d_min, d_max = minmax_envelope(t_vis, d_vis, n_buckets)
-                # 上限線
-                fig.add_trace(go.Scatter(
-                    x=t_env, y=d_max,
-                    mode="lines", name=ch,
-                    line=dict(width=0, color=color),
-                    hoverinfo="none", showlegend=False,
-                ))
-                # 下限線 + fill
-                # hex色をrgba(r,g,b,0.3)に変換
-                if color.startswith("#") and len(color) == 7:
-                    r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
-                    fill_color = f"rgba({r},{g},{b},0.3)"
-                elif color.startswith("rgb("):
-                    fill_color = color.replace("rgb(", "rgba(").replace(")", ",0.3)")
-                else:
-                    fill_color = "rgba(128,128,128,0.3)"
-                fig.add_trace(go.Scatter(
-                    x=t_env, y=d_min,
-                    mode="lines", name=f"{ch} (envelope)",
-                    line=dict(width=width, color=color),
-                    fill="tonexty",
-                    fillcolor=fill_color,
-                    hoverinfo="none", showlegend=False,
-                ))
-            else:
-                # 生データ
-                line_shape = "hv" if is_step else "linear"
-                fig.add_trace(go.Scatter(
-                    x=t_vis, y=d_vis,
-                    mode="lines", name=ch,
-                    line=dict(width=width, color=color, shape=line_shape),
-                    hoverinfo="none",
-                ))
 
-    # Y軸設定
+def _apply_fig_layout(fig, show_xaxis, ymin, ymax, lock_y, theme):
+    """Figure に共通レイアウトを適用する。"""
     yaxis_cfg = dict(automargin=False, tickformat=".3s")
     if ymin is not None and ymax is not None:
         yaxis_cfg["range"] = [ymin, ymax]
@@ -162,7 +133,6 @@ def make_row_fig(
         yaxis_cfg["range"] = [ymin, None]
     elif ymax is not None:
         yaxis_cfg["range"] = [None, ymax]
-    # scrollZoom有効時、Y軸方向のズームを無効化（X軸のみズーム可能）
     if lock_y:
         yaxis_cfg["fixedrange"] = True
 
@@ -180,6 +150,85 @@ def make_row_fig(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor=PLOT_BG.get(theme, "#1a1a1a"),
     )
+
+
+def make_row_fig(
+    chs: list[str],
+    show_xaxis: bool = False,
+    ymin: float | None = None,
+    ymax: float | None = None,
+    lock_y: bool = False,
+    step_chs: set[str] | None = None,
+    ch_styles: dict[str, dict] | None = None,
+    x_range: list | None = None,
+    theme: str = DEFAULT_THEME,
+) -> go.Figure:
+    """行1つ分の Figure を生成する。点数に応じてenvelope/生データを自動切り替え。"""
+    fig = go.Figure()
+
+    # 全体表示（x_range なし）かつ点数超過 → 事前ダウンサンプルキャッシュを使用
+    if (not x_range) and df_overview is not None and len(df_overview) < len(df):
+        src = df_overview
+        t_vis = src["time"].values
+        n_vis = len(t_vis)
+
+        for j, ch in enumerate(chs):
+            if ch not in src.columns:
+                continue
+            style = ch_styles.get(ch, {}) if ch_styles else {}
+            color = style.get("color", TRACE_COLORS[j % len(TRACE_COLORS)])
+            width = style.get("width", 1)
+            is_step = step_chs and ch in step_chs
+            d_vis = src[ch].values
+
+            if n_vis > DECIMATE_THRESHOLD and not is_step:
+                n_buckets = DECIMATE_THRESHOLD // 2
+                t_env, d_min, d_max = minmax_envelope(t_vis, d_vis, n_buckets)
+                _add_envelope_traces(fig, ch, t_env, d_min, d_max, color, width)
+            else:
+                line_shape = "hv" if is_step else "linear"
+                fig.add_trace(go.Scatter(
+                    x=t_vis, y=d_vis,
+                    mode="lines", name=ch,
+                    line=dict(width=width, color=color, shape=line_shape),
+                    hoverinfo="none",
+                ))
+
+        _apply_fig_layout(fig, show_xaxis, ymin, ymax, lock_y, theme)
+        return fig
+
+    # ズーム後の表示範囲スライス（searchsorted でインデックス範囲を取得、boolean mask不要）
+    time_arr = time_arr_cache
+    if x_range and len(x_range) == 2:
+        i0 = int(np.searchsorted(time_arr, x_range[0], side="left"))
+        i1 = int(np.searchsorted(time_arr, x_range[1], side="right"))
+    else:
+        i0, i1 = 0, len(time_arr)
+    t_vis = time_arr[i0:i1]
+    n_vis = len(t_vis)
+
+    for j, ch in enumerate(chs):
+        if ch in df.columns:
+            style = ch_styles.get(ch, {}) if ch_styles else {}
+            color = style.get("color", TRACE_COLORS[j % len(TRACE_COLORS)])
+            width = style.get("width", 1)
+            is_step = step_chs and ch in step_chs
+            d_vis = df[ch].values[i0:i1]
+
+            if n_vis > DECIMATE_THRESHOLD and not is_step:
+                n_buckets = DECIMATE_THRESHOLD // 2
+                t_env, d_min, d_max = minmax_envelope(t_vis, d_vis, n_buckets)
+                _add_envelope_traces(fig, ch, t_env, d_min, d_max, color, width)
+            else:
+                line_shape = "hv" if is_step else "linear"
+                fig.add_trace(go.Scatter(
+                    x=t_vis, y=d_vis,
+                    mode="lines", name=ch,
+                    line=dict(width=width, color=color, shape=line_shape),
+                    hoverinfo="none",
+                ))
+
+    _apply_fig_layout(fig, show_xaxis, ymin, ymax, lock_y, theme)
     return fig
 
 
@@ -359,6 +408,18 @@ def list_path_suggestions(path_str: str) -> list:
         pass
 
     return candidates[:30]
+
+
+def _make_load_status(path_name: str, n_channels: int, n_rows: int,
+                      df_ref: pd.DataFrame, warn: str = "") -> str:
+    """データ読み込み後のステータス文字列を生成する。"""
+    if n_rows >= 2:
+        ts = df_ref["time"].iloc[1] - df_ref["time"].iloc[0]
+        hz_str = f", {1/ts:,.0f} Hz" if ts != 0 else ""
+    else:
+        hz_str = ""
+    mem_mb = df_ref.memory_usage(deep=True).sum() / 1024 / 1024
+    return f"✓ {path_name} ({n_channels} ch, {n_rows:,} 点{hz_str}, {mem_mb:.0f} MB){warn}"
 
 
 def list_config_suggestions(path_str: str) -> list:
@@ -668,70 +729,6 @@ def on_config_suggestion_click(n_clicks_list):
 
 
 # ---------------------------------------------------------------------------
-# Callback: ファイル読み込み → 行UIを初期生成
-# ---------------------------------------------------------------------------
-@app.callback(
-    Output("data-store", "data"),
-    Output("load-status", "children"),
-    Output("rows-container", "children", allow_duplicate=True),
-    Output("row-count", "data", allow_duplicate=True),
-    Output("cursor-a-store", "data", allow_duplicate=True),
-    Output("cursor-b-store", "data", allow_duplicate=True),
-    Output("ch-settings-container", "children"),
-    Output("config-path-input", "value"),
-    Input("load-btn", "n_clicks"),
-    State("file-path-input", "value"),
-    prevent_initial_call=True,
-)
-def load_file(n_clicks, file_path):
-    if not n_clicks or not file_path:
-        return (no_update,) * 8
-
-    path = Path(file_path)
-
-    if not path.exists():
-        return no_update, "❌ ファイルが見つかりません", no_update, no_update, no_update, no_update, no_update, no_update
-    if path.is_dir():
-        return no_update, "❌ ディレクトリです", no_update, no_update, no_update, no_update, no_update, no_update
-    if path.suffix.lower() != ".parquet":
-        return no_update, "❌ .parquet を指定してください", no_update, no_update, no_update, no_update, no_update, no_update
-
-    global df, channels
-    df = pd.read_parquet(path)
-    channels = [col for col in df.columns if col != "time"]
-
-    if not channels:
-        df = None
-        channels = []
-        return no_update, "❌ 波形チャンネルがありません", no_update, no_update, no_update, no_update, no_update, no_update
-
-    n = len(df)
-    ts = df["time"].iloc[1] - df["time"].iloc[0]
-    status = f"✓ {path.name} ({len(channels)} ch, {n:,} 点, {1/ts:,.0f} Hz)"
-
-    # 初期行: チャンネルごとに1行ずつ（最大8行まで）
-    initial_channels = channels[:8]
-    row_divs = [make_dropdown_row(i, [ch]) for i, ch in enumerate(initial_channels)]
-
-    # チャンネル設定パネル生成（初期行に割り当てたchだけ表示）
-    ch_settings = make_ch_settings(initial_channels)
-
-    # 作図ファイルのデフォルトパス（データと同じディレクトリ）
-    default_config_path = str(path.parent / (path.stem + ".pyc.json"))
-
-    return (
-        {"path": str(path), "channels": channels},
-        status,
-        row_divs,
-        len(initial_channels),
-        None,
-        None,
-        ch_settings,
-        default_config_path,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Callback: 作図設定を保存
 # ---------------------------------------------------------------------------
 @app.callback(
@@ -843,23 +840,53 @@ def load_plotconfig(n_clicks, config_path):
 
     # データロード
     data_path_str = config.get("data_path", "")
+    if not data_path_str:
+        return (no_update, "❌ データパスが未設定です") + (no_update,) * 15
+
     data_path = Path(data_path_str)
 
-    if not data_path.exists():
+    if not data_path.is_file():
         return (no_update, f"❌ データが見つかりません: {data_path.name}") + (no_update,) * 15
+    if data_path.suffix.lower() != ".parquet":
+        return (no_update, f"❌ .parquet ではありません: {data_path.name}") + (no_update,) * 15
 
-    global df, channels
-    df = pd.read_parquet(data_path)
+    global df, df_overview, time_arr_cache, channels
+    try:
+        df = pd.read_parquet(data_path)
+    except Exception as e:
+        return (no_update, f"❌ データ読み込み失敗: {e}") + (no_update,) * 15
+
     channels = [col for col in df.columns if col != "time"]
 
     if not channels:
         df = None
+        df_overview = None
+        time_arr_cache = None
         channels = []
         return (no_update, "❌ 波形チャンネルがありません") + (no_update,) * 15
 
+    # float32 ダウンキャスト（メモリ半減）
+    for ch in channels:
+        df[ch] = df[ch].astype("float32")
+
+    # time軸キャッシュ
+    time_arr_cache = df["time"].values
+
+    # time列が非単調ならソート補正
+    if not np.all(np.diff(time_arr_cache) >= 0):
+        sort_idx = np.argsort(time_arr_cache, kind="stable")
+        df = df.iloc[sort_idx].reset_index(drop=True)
+        time_arr_cache = df["time"].values
+
+    # 全体表示用ダウンサンプルキャッシュ
     n = len(df)
-    ts = df["time"].iloc[1] - df["time"].iloc[0]
-    load_status = f"✓ {data_path.name} ({len(channels)} ch, {n:,} 点, {1/ts:,.0f} Hz)"
+    if n > OVERVIEW_POINTS:
+        step = n // OVERVIEW_POINTS
+        df_overview = df.iloc[::step].reset_index(drop=True)
+    else:
+        df_overview = df
+
+    load_status = _make_load_status(data_path.name, len(channels), n, df)
 
     # 設定を取得
     rows_cfg = config.get("rows", [])
@@ -972,6 +999,89 @@ def load_plotconfig(n_clicks, config_path):
         scroll_zoom,
         zoom_label,
         zoom_style,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Callback: ファイル読み込み → 行UIを初期生成
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("data-store", "data"),
+    Output("load-status", "children"),
+    Output("rows-container", "children", allow_duplicate=True),
+    Output("row-count", "data", allow_duplicate=True),
+    Output("cursor-a-store", "data", allow_duplicate=True),
+    Output("cursor-b-store", "data", allow_duplicate=True),
+    Output("ch-settings-container", "children"),
+    Output("config-path-input", "value"),
+    Input("load-btn", "n_clicks"),
+    State("file-path-input", "value"),
+    prevent_initial_call=True,
+)
+def load_file(n_clicks, file_path):
+    if not n_clicks or not file_path:
+        return (no_update,) * 8
+
+    path = Path(file_path)
+
+    if not path.exists():
+        return no_update, "❌ ファイルが見つかりません", no_update, no_update, no_update, no_update, no_update, no_update
+    if path.is_dir():
+        return no_update, "❌ ディレクトリです", no_update, no_update, no_update, no_update, no_update, no_update
+    if path.suffix.lower() != ".parquet":
+        return no_update, "❌ .parquet を指定してください", no_update, no_update, no_update, no_update, no_update, no_update
+
+    global df, df_overview, time_arr_cache, channels
+    df = pd.read_parquet(path)
+    channels = [col for col in df.columns if col != "time"]
+
+    if not channels:
+        return no_update, "❌ 波形チャンネルがありません", no_update, no_update, no_update, no_update, no_update, no_update
+
+    # float32 ダウンキャスト（メモリ半減）
+    for ch in channels:
+        df[ch] = df[ch].astype("float32")
+
+    # time軸キャッシュ（毎回 .values を呼ばないように）
+    time_arr_cache = df["time"].values
+
+    # time列が非単調ならロード時に安定ソートして補正する
+    status_warn = ""
+    if not np.all(np.diff(time_arr_cache) >= 0):
+        sort_idx = np.argsort(time_arr_cache, kind="stable")
+        df = df.iloc[sort_idx].reset_index(drop=True)
+        time_arr_cache = df["time"].values
+        status_warn = " ⚠️ time列が非単調のためソートしました"
+
+    # 全体表示用ダウンサンプルキャッシュ（OVERVIEW_POINTS 点に間引き）
+    n = len(df)
+    if n > OVERVIEW_POINTS:
+        step = n // OVERVIEW_POINTS
+        df_overview = df.iloc[::step].reset_index(drop=True)
+    else:
+        df_overview = df
+
+    status = _make_load_status(path.name, len(channels), n, df, status_warn)
+
+    # 初期行: チャンネルごとに1行ずつ（最大8行まで）
+    initial_channels = channels[:8]
+    row_divs = [make_dropdown_row(i, [ch]) for i, ch in enumerate(initial_channels)]
+
+    # チャンネル設定パネル生成（初期行に割り当てたchだけ表示）
+    ch_settings = make_ch_settings(initial_channels)
+
+    # 作図ファイルのデフォルトパス（データと同じディレクトリ）
+    default_config_path = str(path.parent / (path.stem + ".pyc.json"))
+
+    return (
+        {"path": str(path), "channels": channels},
+        status,
+        row_divs,
+        len(initial_channels),
+        None,
+        None,
+        ch_settings,
+        default_config_path,
     )
 
 
@@ -1136,7 +1246,7 @@ def update_waveform_rows(
         return html.Div(
             "チャンネルが選択されていません",
             style={"color": "#888", "padding": "20px"},
-        ), []
+        ), [], no_update
 
     rows = [
         # ヘッダー行
