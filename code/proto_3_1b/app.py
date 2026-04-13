@@ -410,6 +410,18 @@ def list_path_suggestions(path_str: str) -> list:
     return candidates[:30]
 
 
+def _make_load_status(path_name: str, n_channels: int, n_rows: int,
+                      df_ref: pd.DataFrame, warn: str = "") -> str:
+    """データ読み込み後のステータス文字列を生成する。"""
+    if n_rows >= 2:
+        ts = df_ref["time"].iloc[1] - df_ref["time"].iloc[0]
+        hz_str = f", {1/ts:,.0f} Hz" if ts != 0 else ""
+    else:
+        hz_str = ""
+    mem_mb = df_ref.memory_usage(deep=True).sum() / 1024 / 1024
+    return f"✓ {path_name} ({n_channels} ch, {n_rows:,} 点{hz_str}, {mem_mb:.0f} MB){warn}"
+
+
 def list_config_suggestions(path_str: str) -> list:
     """作図ファイルパス候補（.pyc.json）を返す。"""
     if not path_str:
@@ -828,13 +840,22 @@ def load_plotconfig(n_clicks, config_path):
 
     # データロード
     data_path_str = config.get("data_path", "")
+    if not data_path_str:
+        return (no_update, "❌ データパスが未設定です") + (no_update,) * 15
+
     data_path = Path(data_path_str)
 
-    if not data_path.exists():
+    if not data_path.is_file():
         return (no_update, f"❌ データが見つかりません: {data_path.name}") + (no_update,) * 15
+    if data_path.suffix.lower() != ".parquet":
+        return (no_update, f"❌ .parquet ではありません: {data_path.name}") + (no_update,) * 15
 
     global df, df_overview, time_arr_cache, channels
-    df = pd.read_parquet(data_path)
+    try:
+        df = pd.read_parquet(data_path)
+    except Exception as e:
+        return (no_update, f"❌ データ読み込み失敗: {e}") + (no_update,) * 15
+
     channels = [col for col in df.columns if col != "time"]
 
     if not channels:
@@ -865,9 +886,7 @@ def load_plotconfig(n_clicks, config_path):
     else:
         df_overview = df
 
-    ts = df["time"].iloc[1] - df["time"].iloc[0]
-    mem_mb = df.memory_usage(deep=True).sum() / 1024 / 1024
-    load_status = f"✓ {data_path.name} ({len(channels)} ch, {n:,} 点, {1/ts:,.0f} Hz, {mem_mb:.0f} MB)"
+    load_status = _make_load_status(data_path.name, len(channels), n, df)
 
     # 設定を取得
     rows_cfg = config.get("rows", [])
@@ -1042,9 +1061,7 @@ def load_file(n_clicks, file_path):
     else:
         df_overview = df
 
-    ts = df["time"].iloc[1] - df["time"].iloc[0]
-    mem_mb = df.memory_usage(deep=True).sum() / 1024 / 1024
-    status = f"✓ {path.name} ({len(channels)} ch, {n:,} 点, {1/ts:,.0f} Hz, {mem_mb:.0f} MB){status_warn}"
+    status = _make_load_status(path.name, len(channels), n, df, status_warn)
 
     # 初期行: チャンネルごとに1行ずつ（最大8行まで）
     initial_channels = channels[:8]
@@ -1229,7 +1246,7 @@ def update_waveform_rows(
         return html.Div(
             "チャンネルが選択されていません",
             style={"color": "#888", "padding": "20px"},
-        ), []
+        ), [], no_update
 
     rows = [
         # ヘッダー行
