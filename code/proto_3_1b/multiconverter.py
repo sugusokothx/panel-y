@@ -5,6 +5,7 @@
 使い方:
     python multiconverter.py --input ./input --output ./output
     python multiconverter.py --input ./input --output ./output --force
+    python multiconverter.py --input ./input --output ./output --time-unit ms
 """
 
 import argparse
@@ -20,6 +21,12 @@ def main() -> int:
     )
     parser.add_argument("--input", required=True, help="入力フォルダのパス")
     parser.add_argument("--output", required=True, help="出力フォルダのパス")
+    parser.add_argument(
+        "--time-unit",
+        choices=["s", "ms", "us"],
+        default=None,
+        help="時間単位を明示指定（省略時は自動判定）",
+    )
     parser.add_argument(
         "--force", action="store_true", help="既存の .parquet ファイルを上書きする"
     )
@@ -57,7 +64,7 @@ def main() -> int:
 
         print(f"\n--- {mat_file.name} ---")
         try:
-            convert_to_parquet(mat_file, out_file)
+            convert_to_parquet(mat_file, out_file, time_unit=args.time_unit)
             results["success"].append(mat_file.name)
         except Exception as e:
             print(f"[失敗] {mat_file.name}: {e}")
