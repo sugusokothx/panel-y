@@ -451,6 +451,69 @@ body {
     color: var(--text-muted) !important;
 }
 
+/* --- Dash 4.x dcc.Dropdown overrides (dash-dropdown-* classes) --- */
+.dash-dropdown {
+    background-color: var(--bg-input);
+    color: var(--text-primary);
+}
+.dash-dropdown-trigger {
+    background-color: var(--bg-input) !important;
+    border: 1px solid var(--border-light) !important;
+    border-radius: 4px;
+    transition: border-color 0.15s;
+}
+.dash-dropdown-trigger:hover {
+    border-color: var(--text-secondary) !important;
+}
+.dash-dropdown-value {
+    color: var(--text-primary) !important;
+}
+.dash-dropdown-placeholder {
+    color: var(--text-muted) !important;
+}
+.dash-dropdown-trigger-icon {
+    color: var(--text-muted) !important;
+}
+.dash-dropdown-content {
+    background-color: var(--bg-input) !important;
+    border: 1px solid var(--border-light) !important;
+    box-shadow: var(--shadow);
+}
+.dash-dropdown-options {
+    background-color: var(--bg-input) !important;
+}
+.dash-dropdown-option {
+    background-color: var(--bg-input) !important;
+    color: var(--text-primary) !important;
+}
+.dash-dropdown-option:hover,
+.dash-dropdown-option[aria-selected="true"] {
+    background-color: var(--bg-hover) !important;
+}
+.dash-dropdown-search {
+    background-color: var(--bg-input) !important;
+    color: var(--text-primary) !important;
+}
+.dash-dropdown-search input {
+    color: var(--text-primary) !important;
+}
+.dash-dropdown-search-icon {
+    color: var(--text-muted) !important;
+}
+.dash-dropdown-value-item {
+    background-color: var(--bg-surface) !important;
+    border: 1px solid var(--border-light) !important;
+    color: var(--text-primary) !important;
+}
+.dash-dropdown-clear,
+.dash-dropdown-action-button {
+    color: var(--text-muted) !important;
+}
+.dash-dropdown-clear:hover,
+.dash-dropdown-action-button:hover {
+    color: var(--text-primary) !important;
+}
+
 /* ===================================================================
    Scrollbar
    =================================================================== */
@@ -473,6 +536,9 @@ body {
    FFT controls
    =================================================================== */
 #fft-controls .Select-control {
+    min-height: 30px;
+}
+#fft-controls .dash-dropdown-trigger {
     min-height: 30px;
 }
 
