@@ -1,9 +1,0 @@
-# データ処理・数値計算（必須級）
-numpy
-pandas
-
-# JSON出力や特殊な計算用
-scipy
-
-# (任意) TypeScriptに渡す前のクイック確認用
-matplotlib
