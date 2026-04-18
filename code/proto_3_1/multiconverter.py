@@ -1,10 +1,13 @@
 """Panel_y マルチファイル変換 CLI。
 
 指定フォルダ直下の .mat ファイルを一括で Parquet に変換する。
+引数を省略すると exe（スクリプト）と同じフォルダの .mat を検出し、
+同階層に parquet/ フォルダを作成して出力する。
 
 使い方:
-    python multiconverter.py --input ./input --output ./output
-    python multiconverter.py --input ./input --output ./output --force
+    multiconverter.exe                          ← exe横の.matを自動変換
+    multiconverter.exe --force                  ← 上書きモード
+    multiconverter.exe --input ./in --output ./out  ← フォルダ明示指定
 """
 
 import argparse
@@ -14,19 +17,29 @@ from pathlib import Path
 from utils.converter import convert_to_parquet
 
 
+def _exe_dir() -> Path:
+    """exe（またはスクリプト）が置かれているフォルダを返す。"""
+    if getattr(sys, "frozen", False):
+        # PyInstaller でビルドされた exe
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
 def main() -> int:
+    exe_dir = _exe_dir()
+
     parser = argparse.ArgumentParser(
         description="Panel_y マルチファイル変換 — フォルダ内の .mat を一括 Parquet 変換"
     )
-    parser.add_argument("--input", required=True, help="入力フォルダのパス")
-    parser.add_argument("--output", required=True, help="出力フォルダのパス")
+    parser.add_argument("--input", default=None, help="入力フォルダ（省略時: exe と同じフォルダ）")
+    parser.add_argument("--output", default=None, help="出力フォルダ（省略時: exe横の parquet/）")
     parser.add_argument(
         "--force", action="store_true", help="既存の .parquet ファイルを上書きする"
     )
     args = parser.parse_args()
 
-    input_dir = Path(args.input)
-    output_dir = Path(args.output)
+    input_dir = Path(args.input) if args.input else exe_dir
+    output_dir = Path(args.output) if args.output else exe_dir / "parquet"
 
     # [1] 入力フォルダをスキャン（直下のみ）
     if not input_dir.is_dir():
