@@ -16,6 +16,18 @@ Phase 1 focuses on one risk path:
 cargo run
 ```
 
+Schema detection can also be checked without opening the GUI:
+
+```bash
+cargo run -- --schema ../proto_3_1b/data/test_100k.parquet
+```
+
+To verify the Phase 1 narrow read path without opening the GUI:
+
+```bash
+cargo run -- --load-channel ../proto_3_1b/data/test_100k.parquet sine_50Hz
+```
+
 ## Reference Data
 
 Use the Phase 0 datasets under:
@@ -40,4 +52,8 @@ The large-data target is:
 
 - `eframe` app shell is in place.
 - The central waveform drawing surface is ready.
-- Parquet loading and LOD drawing are not implemented yet.
+- Parquet schema loading is in place.
+- The `time` column and numeric channel columns are detected.
+- The selected channel read path loads only `time` plus that one channel (`time: f64`, value: `f32`).
+- Full-range min/max envelope drawing is in place for the selected channel.
+- Range-aware pan/zoom LOD is not implemented yet.
