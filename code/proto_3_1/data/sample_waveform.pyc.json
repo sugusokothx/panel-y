@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "data_path": "/Users/sugusokothx/life/factory/panel-y/code/proto_3_1/data/sample_waveform.parquet",
+  "rows": [
+    {
+      "channels": [
+        "voltage_u"
+      ],
+      "ymin": null,
+      "ymax": null,
+      "step_channels": []
+    },
+    {
+      "channels": [
+        "current_u"
+      ],
+      "ymin": null,
+      "ymax": null,
+      "step_channels": []
+    },
+    {
+      "channels": [
+        "voltage_u",
+        "current_u"
+      ],
+      "ymin": -20,
+      "ymax": 20,
+      "step_channels": []
+    }
+  ],
+  "ch_styles": {
+    "voltage_u": {
+      "color": "#1f77b4",
+      "width": 1
+    },
+    "current_u": {
+      "color": "#ff7f0e",
+      "width": 3
+    }
+  },
+  "theme": "dark",
+  "scroll_zoom": false
+}
