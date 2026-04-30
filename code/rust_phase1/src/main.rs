@@ -16,6 +16,9 @@ const MIN_WAVEFORM_ROW_HEIGHT: f32 = 180.0;
 const WAVEFORM_ROW_GAP: f32 = 10.0;
 const MAX_EXACT_STEP_SAMPLES: usize = 12_000;
 const MAX_STEP_CHANGE_POINTS: usize = 12_000;
+const DEFAULT_TRACE_LINE_WIDTH: f32 = 1.25;
+const MIN_TRACE_LINE_WIDTH: f32 = 0.5;
+const MAX_TRACE_LINE_WIDTH: f32 = 6.0;
 
 fn main() -> eframe::Result {
     if let Some(command) = cli_command_arg() {
@@ -176,11 +179,14 @@ struct PlotRow {
     channels: Vec<RowChannel>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct RowChannel {
     channel_path: String,
     color_index: usize,
     draw_mode: DrawMode,
+    visible: bool,
+    color_override: Option<egui::Color32>,
+    line_width: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +223,7 @@ struct VisibleTrace {
     channel_path: String,
     sample_count: usize,
     color: egui::Color32,
+    line_width: f32,
     draw_mode: DrawMode,
     data: VisibleTraceData,
 }
@@ -252,6 +259,7 @@ struct StepSample {
 struct VisibleRowTrace {
     row_id: u64,
     row_index: usize,
+    row_channel_count: usize,
     traces: Vec<VisibleTrace>,
 }
 
@@ -310,6 +318,24 @@ impl DrawMode {
             Self::Line => "Line",
             Self::Step => "Step",
         }
+    }
+}
+
+impl RowChannel {
+    fn new(channel_path: &str, color_index: usize) -> Self {
+        Self {
+            channel_path: channel_path.to_owned(),
+            color_index,
+            draw_mode: DrawMode::Line,
+            visible: true,
+            color_override: None,
+            line_width: DEFAULT_TRACE_LINE_WIDTH,
+        }
+    }
+
+    fn color(&self, dark_mode: bool) -> egui::Color32 {
+        self.color_override
+            .unwrap_or_else(|| channel_color(self.color_index, dark_mode))
     }
 }
 
@@ -427,16 +453,15 @@ impl ViewState {
             return (false, row.id);
         }
 
-        row.channels.push(RowChannel {
-            channel_path: channel_path.to_owned(),
-            color_index: row.channels.len(),
-            draw_mode: DrawMode::Line,
-        });
+        row.channels
+            .push(RowChannel::new(channel_path, row.channels.len()));
         (true, row.id)
     }
 
     fn has_visible_channels(&self) -> bool {
-        self.rows.iter().any(|row| !row.channels.is_empty())
+        self.rows
+            .iter()
+            .any(|row| row.channels.iter().any(|channel| channel.visible))
     }
 }
 
@@ -1139,6 +1164,7 @@ impl PanelYApp {
                 .map(|(row_index, row)| VisibleRowTrace {
                     row_id: row.id,
                     row_index,
+                    row_channel_count: row.channels.len(),
                     traces: Vec::new(),
                 })
                 .collect();
@@ -1152,6 +1178,7 @@ impl PanelYApp {
                 .map(|(row_index, row)| VisibleRowTrace {
                     row_id: row.id,
                     row_index,
+                    row_channel_count: row.channels.len(),
                     traces: Vec::new(),
                 })
                 .collect();
@@ -1183,7 +1210,12 @@ impl PanelYApp {
 
             for (row_index, row) in rows.into_iter().enumerate() {
                 let mut traces = Vec::with_capacity(row.channels.len());
+                let row_channel_count = row.channels.len();
                 for row_channel in row.channels {
+                    if !row_channel.visible {
+                        continue;
+                    }
+
                     let Some((channel_name, channel_path, sample_count)) = loaded_channels
                         .channel(&row_channel.channel_path)
                         .map(|channel| {
@@ -1258,7 +1290,10 @@ impl PanelYApp {
                         channel_name,
                         channel_path,
                         sample_count,
-                        color: channel_color(row_channel.color_index, dark_mode),
+                        color: row_channel.color(dark_mode),
+                        line_width: row_channel
+                            .line_width
+                            .clamp(MIN_TRACE_LINE_WIDTH, MAX_TRACE_LINE_WIDTH),
                         draw_mode: row_channel.draw_mode,
                         data,
                     });
@@ -1267,6 +1302,7 @@ impl PanelYApp {
                 visible_rows.push(VisibleRowTrace {
                     row_id: row.id,
                     row_index,
+                    row_channel_count,
                     traces,
                 });
             }
@@ -1511,6 +1547,9 @@ impl eframe::App for PanelYApp {
                                     &row.traces,
                                 );
                             }
+                            Some(row) if row.row_channel_count > 0 => {
+                                draw_status_label(&painter, plot_rect, "All channels are hidden");
+                            }
                             _ => {
                                 draw_row_placeholder(
                                     &painter,
@@ -1702,30 +1741,77 @@ fn draw_row_controls(
 
         let mut remove_channel = None;
         for channel in &mut row.channels {
-            ui.horizontal(|ui| {
-                let color = channel_color(channel.color_index, ui.visuals().dark_mode);
-                ui.colored_label(color, format!("ch {}", channel.color_index + 1));
-                ui.label(channel_display_name(schema, &channel.channel_path));
-                egui::ComboBox::from_id_salt(("draw_mode", row.id, channel.channel_path.as_str()))
-                    .selected_text(channel.draw_mode.as_str())
-                    .show_ui(ui, |ui| {
-                        for draw_mode in DrawMode::ALL {
-                            if ui
-                                .selectable_value(
-                                    &mut channel.draw_mode,
-                                    draw_mode,
-                                    draw_mode.as_str(),
-                                )
-                                .changed()
-                            {
-                                changed = true;
-                            }
+            ui.push_id(
+                ("channel_style", row.id, channel.channel_path.clone()),
+                |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .checkbox(&mut channel.visible, "")
+                            .on_hover_text("Visible")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        let mut color = channel.color(ui.visuals().dark_mode);
+                        if egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut color,
+                            egui::color_picker::Alpha::Opaque,
+                        )
+                        .changed()
+                        {
+                            channel.color_override = Some(color);
+                            changed = true;
+                        }
+
+                        ui.label(channel_display_name(schema, &channel.channel_path));
+                        egui::ComboBox::from_id_salt("draw_mode")
+                            .selected_text(channel.draw_mode.as_str())
+                            .show_ui(ui, |ui| {
+                                for draw_mode in DrawMode::ALL {
+                                    if ui
+                                        .selectable_value(
+                                            &mut channel.draw_mode,
+                                            draw_mode,
+                                            draw_mode.as_str(),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                }
+                            });
+
+                        let mut line_width = channel.line_width;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut line_width)
+                                    .speed(0.1)
+                                    .range(MIN_TRACE_LINE_WIDTH..=MAX_TRACE_LINE_WIDTH)
+                                    .prefix("w "),
+                            )
+                            .on_hover_text("Line width")
+                            .changed()
+                        {
+                            channel.line_width =
+                                line_width.clamp(MIN_TRACE_LINE_WIDTH, MAX_TRACE_LINE_WIDTH);
+                            changed = true;
+                        }
+
+                        if channel.color_override.is_some()
+                            && ui.small_button("Reset color").clicked()
+                        {
+                            channel.color_override = None;
+                            changed = true;
+                        }
+
+                        if ui.small_button("Remove").clicked() {
+                            remove_channel = Some(channel.channel_path.clone());
                         }
                     });
-                if ui.small_button("Remove").clicked() {
-                    remove_channel = Some(channel.channel_path.clone());
-                }
-            });
+                },
+            );
         }
 
         if let Some(channel_path) = remove_channel {
@@ -1897,8 +1983,14 @@ fn draw_waveform_traces(
     };
 
     for visible in visible_traces {
-        let vertical_stroke = egui::Stroke::new(1.0, visible.color.linear_multiply(0.45));
-        let line_stroke = egui::Stroke::new(1.25, visible.color);
+        let line_width = visible
+            .line_width
+            .clamp(MIN_TRACE_LINE_WIDTH, MAX_TRACE_LINE_WIDTH);
+        let vertical_stroke = egui::Stroke::new(
+            (line_width * 0.8).max(1.0),
+            visible.color.linear_multiply(0.45),
+        );
+        let line_stroke = egui::Stroke::new(line_width, visible.color);
 
         match &visible.data {
             VisibleTraceData::Envelope(envelope) => {
@@ -2483,6 +2575,12 @@ mod app_tests {
         assert_eq!(first_row_id, 0);
         assert_eq!(view.rows[0].channels.len(), 1);
         assert_eq!(view.rows[0].channels[0].draw_mode, DrawMode::Line);
+        assert!(view.rows[0].channels[0].visible);
+        assert_eq!(
+            view.rows[0].channels[0].line_width,
+            DEFAULT_TRACE_LINE_WIDTH
+        );
+        assert_eq!(view.rows[0].channels[0].color_override, None);
 
         let second_row_id = view.add_row();
         let (added_second, target_row_id) = view.add_channel_to_selected_row("pwm_1kHz");
@@ -2512,6 +2610,18 @@ mod app_tests {
         assert!(added_first);
         assert!(!added_duplicate);
         assert_eq!(view.rows[0].channels.len(), 1);
+    }
+
+    #[test]
+    fn hidden_channels_are_not_counted_as_visible() {
+        let mut view = ViewState::default();
+        let (added, _) = view.add_channel_to_selected_row("sine_50Hz");
+        assert!(added);
+        assert!(view.has_visible_channels());
+
+        view.rows[0].channels[0].visible = false;
+
+        assert!(!view.has_visible_channels());
     }
 
     #[test]

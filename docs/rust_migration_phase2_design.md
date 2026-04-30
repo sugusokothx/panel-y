@@ -297,6 +297,8 @@ UI実装の優先:
 - 2026-04-30: `step_validation_100k.parquet` の `pwm_1kHz` / `pwm_1kHz_delay_1sample` / `pwm_1kHz_advance_1sample` でLine/Step表示を確認し、1サンプル進み/遅れの相対関係が正確であることを確認した
 - 2026-04-30: P2-06b実装。高密度Stepでも値の変化点数が `MAX_STEP_CHANGE_POINTS` 以下なら change-point Step として正確なエッジ時刻を保持し、変化点が多すぎる場合だけmin/max envelopeへfallbackするようにした。`gate_pwm` / `pwm_10kHz` では中域ズームで変化点保持が必要なことを確認した
 - 2026-04-30: P2-06b GUI確認。`gate_pwm` のStep表示で、change-point Step対象範囲とmin/max envelope fallback範囲のどちらも見え方に違和感がないことを確認した
+- 2026-04-30: P2-07実装。row内channelごとにvisible、color override、line widthを編集できるようにし、hidden channelは描画・Y auto range・表示ステータス集計から外れるようにした
+- 2026-04-30: P2-07 GUI確認。visible ON/OFF、line width即時反映、custom color / resetが期待通り動作することを確認した
 
 ---
 

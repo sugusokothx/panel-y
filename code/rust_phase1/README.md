@@ -98,3 +98,4 @@ pwm_1kHz_advance_1sample
 - X-axis pan/zoom is in place for the selected channel.
 - The visible X range is re-extracted into a min/max envelope sized to the current plot width.
 - Step mode uses exact raw samples at low density, exact change points when sample density is high but edge count is still bounded, and min/max envelope only when there are too many changes to draw directly.
+- Row channels can be hidden and styled with per-row color overrides and line widths.
