@@ -4,7 +4,7 @@ doc_type: Phase 2設計方針
 target: Rust移植 Phase 2
 created: "2026-04-30"
 updated: "2026-04-30"
-status: 草案
+status: 実装中
 source_proto: "code/proto_3_1b"
 base_implementation: "code/rust_phase1"
 ---
@@ -287,6 +287,11 @@ UI実装の優先:
 - 2026-04-30: P2-01完了。`PanelYApp` を `DatasetState` / `ViewState` / `LoadState` に分離した
 - 2026-04-30: P2-02完了。dataset単位の共有timeとchannel単位のraw cache、表示range単位のenvelope cacheを追加した
 - 2026-04-30: P2-03一部完了。1行目へ複数channelを追加し、重ね表示できるようにした。行追加・削除とstyle編集は未実装
+- 2026-04-30: P2-04実装。row追加・削除、選択rowへのchannel追加、rowごとの描画rect分割に対応した
+- 2026-04-30: P2-05の実装土台を確認。`ViewState::x_range` は1つだけ保持し、pan/zoom/resetは全row共通rangeへ反映する。複数行GUIの手動操作確認は次回継続
+- 2026-04-30: P2-04/P2-05手動確認完了。複数行にわたるDelete/Remove、pan/zoom/resetの全row同期は軽快で問題なし
+- 2026-04-30: 行数増加時の見切れ対策として、左ペインを縦スクロール化し、波形ペインもrow最小高を維持して縦スクロールできるようにした
+- 2026-04-30: UI改善候補として、波形エリアのX zoomを `Ctrl + ホイール`、波形側の縦移動をホイールのみへ分離する案を記録した。性能検証段階では現仕様のまま進める
 
 ---
 

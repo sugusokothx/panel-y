@@ -4,7 +4,7 @@ doc_type: 移植計画書
 target: Rust版 波形ビューア
 created: "2026-04-27"
 updated: "2026-04-30"
-status: Phase 2準備
+status: Phase 2着手中
 source_proto: "code/proto_3_1b"
 ---
 
