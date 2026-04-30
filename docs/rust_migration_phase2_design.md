@@ -295,6 +295,8 @@ UI実装の優先:
 - 2026-04-30: P2-06a実装。`RowChannel` に `Line` / `Step` の表示モードを追加し、row内channelごとに切替UIを追加した。Stepは低密度表示範囲ではraw sampleから正確な階段描画を行い、高密度では既存min/max envelopeへfallbackする
 - 2026-04-30: P2-06a GUI確認。`pwm_1kHz` / `noise` で拡大状態のLine/Step切替はOK。エッジ位置検証用に `step_validation_100k.parquet` 生成スクリプトを追加した
 - 2026-04-30: `step_validation_100k.parquet` の `pwm_1kHz` / `pwm_1kHz_delay_1sample` / `pwm_1kHz_advance_1sample` でLine/Step表示を確認し、1サンプル進み/遅れの相対関係が正確であることを確認した
+- 2026-04-30: P2-06b実装。高密度Stepでも値の変化点数が `MAX_STEP_CHANGE_POINTS` 以下なら change-point Step として正確なエッジ時刻を保持し、変化点が多すぎる場合だけmin/max envelopeへfallbackするようにした。`gate_pwm` / `pwm_10kHz` では中域ズームで変化点保持が必要なことを確認した
+- 2026-04-30: P2-06b GUI確認。`gate_pwm` のStep表示で、change-point Step対象範囲とmin/max envelope fallback範囲のどちらも見え方に違和感がないことを確認した
 
 ---
 

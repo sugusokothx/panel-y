@@ -15,6 +15,7 @@ const STRESS_REPORT_BLOCKS: usize = 5;
 const MIN_WAVEFORM_ROW_HEIGHT: f32 = 180.0;
 const WAVEFORM_ROW_GAP: f32 = 10.0;
 const MAX_EXACT_STEP_SAMPLES: usize = 12_000;
+const MAX_STEP_CHANGE_POINTS: usize = 12_000;
 
 fn main() -> eframe::Result {
     if let Some(command) = cli_command_arg() {
@@ -232,6 +233,13 @@ struct RawStepTrace {
     source_sample_count: usize,
     time_range: Option<(f64, f64)>,
     value_range: Option<(f64, f64)>,
+    kind: StepTraceKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepTraceKind {
+    RawSamples,
+    ChangePoints,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1163,6 +1171,7 @@ impl PanelYApp {
         let mut visible_rows = Vec::with_capacity(rows.len());
         let mut built_count = 0usize;
         let mut exact_step_count = 0usize;
+        let mut edge_step_count = 0usize;
         {
             let dataset = &mut self.dataset;
             let Some(shared_time) = dataset.shared_time.as_ref() else {
@@ -1216,6 +1225,18 @@ impl PanelYApp {
                             {
                                 exact_step_count += 1;
                                 VisibleTraceData::RawStep(raw_step)
+                            } else if let Some(edge_step) =
+                                loaded_channels.channel(&channel_path).and_then(|channel| {
+                                    build_change_point_step_trace(
+                                        time_values,
+                                        &channel.values,
+                                        view_range,
+                                        MAX_STEP_CHANGE_POINTS,
+                                    )
+                                })
+                            {
+                                edge_step_count += 1;
+                                VisibleTraceData::RawStep(edge_step)
                             } else {
                                 let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
                                     &channel_path,
@@ -1251,7 +1272,7 @@ impl PanelYApp {
             }
         }
 
-        if built_count > 0 || exact_step_count > 0 {
+        if built_count > 0 || exact_step_count > 0 || edge_step_count > 0 {
             let visible_channel_count = visible_rows
                 .iter()
                 .map(|row| row.traces.len())
@@ -1263,7 +1284,7 @@ impl PanelYApp {
                 .map(trace_source_sample_count)
                 .unwrap_or_default();
             self.load.status = format!(
-                "View {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), exact step {}, cache {}",
+                "View {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, cache {}",
                 view_range.0,
                 view_range.1,
                 visible_rows.len(),
@@ -1271,6 +1292,7 @@ impl PanelYApp {
                 source_sample_count,
                 built_count,
                 exact_step_count,
+                edge_step_count,
                 self.dataset.loaded_channels.envelope_cache.len()
             );
         }
@@ -1985,6 +2007,13 @@ fn trace_draw_point_count(trace: &VisibleTrace) -> usize {
     }
 }
 
+fn trace_step_kind(trace: &VisibleTrace) -> Option<StepTraceKind> {
+    match &trace.data {
+        VisibleTraceData::RawStep(raw_step) => Some(raw_step.kind),
+        VisibleTraceData::Envelope(_) => None,
+    }
+}
+
 fn visible_envelope_bucket_count(rect: egui::Rect) -> usize {
     (rect.width().round() as usize)
         .clamp(MIN_VISIBLE_ENVELOPE_BUCKETS, MAX_VISIBLE_ENVELOPE_BUCKETS)
@@ -2059,15 +2088,20 @@ fn draw_axis_labels(
         .iter()
         .filter(|visible| visible.draw_mode == DrawMode::Step)
         .count();
+    let edge_step_count = visible_traces
+        .iter()
+        .filter(|visible| trace_step_kind(visible) == Some(StepTraceKind::ChangePoints))
+        .count();
 
     painter.text(
         rect.left_top() + egui::vec2(0.0, -16.0),
         egui::Align2::LEFT_TOP,
         format!(
-            "{}  ch={}  step={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
+            "{}  ch={}  step={}  edge={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
             channel_label,
             visible_traces.len(),
             step_count,
+            edge_step_count,
             source_sample_count,
             raw_sample_count,
             bucket_count,
@@ -2252,6 +2286,92 @@ fn build_raw_step_trace(
         source_sample_count,
         time_range: Some((range_start, range_end)),
         value_range,
+        kind: StepTraceKind::RawSamples,
+    })
+}
+
+fn build_change_point_step_trace(
+    time: &[f64],
+    values: &[f32],
+    time_range: (f64, f64),
+    max_change_points: usize,
+) -> Option<RawStepTrace> {
+    let (range_start, range_end) = normalized_range(time_range)?;
+    let sample_count = time.len().min(values.len());
+    if sample_count == 0 {
+        return None;
+    }
+
+    let start = time
+        .partition_point(|time| *time < range_start)
+        .min(sample_count);
+    let end = time
+        .partition_point(|time| *time <= range_end)
+        .min(sample_count);
+    let context_start = start.saturating_sub(usize::from(start > 0));
+    let source_sample_count = end.saturating_sub(start);
+    if end.saturating_sub(context_start) == 0 {
+        return None;
+    }
+
+    let mut samples = Vec::new();
+    let mut value_range = None;
+    let mut previous_value = None;
+    let mut change_points = 0usize;
+
+    if context_start < start {
+        let value = values[context_start];
+        if value.is_finite() {
+            samples.push(StepSample {
+                time: range_start,
+                value,
+            });
+            value_range = extend_range(value_range, f64::from(value));
+            previous_value = Some(value);
+        }
+    }
+
+    for index in start..end {
+        let sample_time = time[index];
+        let value = values[index];
+        if !sample_time.is_finite() || !value.is_finite() {
+            continue;
+        }
+
+        value_range = extend_range(value_range, f64::from(value));
+        match previous_value {
+            Some(previous) if previous == value => {}
+            Some(_) => {
+                if change_points >= max_change_points {
+                    return None;
+                }
+                samples.push(StepSample {
+                    time: sample_time.clamp(range_start, range_end),
+                    value,
+                });
+                previous_value = Some(value);
+                change_points += 1;
+            }
+            None => {
+                samples.push(StepSample {
+                    time: sample_time.clamp(range_start, range_end),
+                    value,
+                });
+                previous_value = Some(value);
+            }
+        }
+    }
+
+    if samples.is_empty() || value_range.is_none() {
+        return None;
+    }
+
+    Some(RawStepTrace {
+        samples,
+        source_sample_count,
+        time_range: Some((range_start, range_end)),
+        value_range,
+        kind: StepTraceKind::ChangePoints,
     })
 }
 
@@ -2457,6 +2577,70 @@ mod app_tests {
         let values = [0.0, 1.0, 0.0, 1.0];
 
         let trace = build_raw_step_trace(&time, &values, (0.0, 3.0), 2);
+
+        assert!(trace.is_none());
+    }
+
+    #[test]
+    fn change_point_step_trace_preserves_edges_when_sample_count_is_high() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let values = [0.0, 0.0, 0.0, 5.0, 5.0, 0.0, 0.0];
+
+        let trace = build_change_point_step_trace(&time, &values, (0.0, 6.0), 3)
+            .expect("change-point step trace");
+
+        assert_eq!(trace.kind, StepTraceKind::ChangePoints);
+        assert_eq!(trace.source_sample_count, 7);
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 0.0,
+                    value: 0.0,
+                },
+                StepSample {
+                    time: 3.0,
+                    value: 5.0,
+                },
+                StepSample {
+                    time: 5.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 5.0)));
+    }
+
+    #[test]
+    fn change_point_step_trace_carries_previous_state_at_range_start() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 5.0, 5.0, 0.0, 0.0];
+
+        let trace = build_change_point_step_trace(&time, &values, (2.5, 4.0), 3)
+            .expect("change-point step trace");
+
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 2.5,
+                    value: 5.0,
+                },
+                StepSample {
+                    time: 3.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 5.0)));
+    }
+
+    #[test]
+    fn change_point_step_trace_respects_change_limit() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 1.0, 0.0, 1.0, 0.0];
+
+        let trace = build_change_point_step_trace(&time, &values, (0.0, 4.0), 2);
 
         assert!(trace.is_none());
     }
