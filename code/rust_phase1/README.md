@@ -40,6 +40,12 @@ To stress repeated visible-range extraction and sample RSS:
 cargo run --release -- --stress-channel ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet iu 1000
 ```
 
+To benchmark Phase 2 shared-time multi-channel cache memory:
+
+```bash
+cargo run --release -- --bench-multi-channel ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet
+```
+
 ## Reference Data
 
 Use the Phase 0 datasets under:
@@ -67,6 +73,7 @@ The large-data target is:
 - Parquet schema loading is in place.
 - The `time` column and numeric channel columns are detected.
 - The selected channel read path loads only `time` plus that one channel (`time: f64`, value: `f32`).
+- Phase 2 shared-time channel cache is in place for multi-channel display.
 - Full-range min/max envelope drawing is in place for the selected channel.
 - X-axis pan/zoom is in place for the selected channel.
 - The visible X range is re-extracted into a min/max envelope sized to the current plot width.

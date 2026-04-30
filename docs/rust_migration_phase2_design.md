@@ -282,6 +282,12 @@ UI実装の優先:
 | P2-11 | theme切替 | light/darkを切り替えられる |
 | P2-12 | 性能再測定 | 中・大・90M点級で測定結果を残す |
 
+進捗メモ:
+
+- 2026-04-30: P2-01完了。`PanelYApp` を `DatasetState` / `ViewState` / `LoadState` に分離した
+- 2026-04-30: P2-02完了。dataset単位の共有timeとchannel単位のraw cache、表示range単位のenvelope cacheを追加した
+- 2026-04-30: P2-03一部完了。1行目へ複数channelを追加し、重ね表示できるようにした。行追加・削除とstyle編集は未実装
+
 ---
 
 ## 9. Phase 2完了条件
