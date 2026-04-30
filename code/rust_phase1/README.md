@@ -28,6 +28,18 @@ To verify the Phase 1 narrow read path without opening the GUI:
 cargo run -- --load-channel ../proto_3_1b/data/test_100k.parquet sine_50Hz
 ```
 
+To benchmark load time plus repeated visible-range envelope extraction:
+
+```bash
+cargo run --release -- --bench-channel ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet iu
+```
+
+To stress repeated visible-range extraction and sample RSS:
+
+```bash
+cargo run --release -- --stress-channel ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet iu 1000
+```
+
 ## Reference Data
 
 Use the Phase 0 datasets under:
@@ -56,4 +68,5 @@ The large-data target is:
 - The `time` column and numeric channel columns are detected.
 - The selected channel read path loads only `time` plus that one channel (`time: f64`, value: `f32`).
 - Full-range min/max envelope drawing is in place for the selected channel.
-- Range-aware pan/zoom LOD is not implemented yet.
+- X-axis pan/zoom is in place for the selected channel.
+- The visible X range is re-extracted into a min/max envelope sized to the current plot width.

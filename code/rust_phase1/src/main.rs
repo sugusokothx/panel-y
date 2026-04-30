@@ -4,6 +4,13 @@ mod parquet_schema;
 mod parquet_waveform;
 
 const FULL_RANGE_ENVELOPE_BUCKETS: usize = 4_096;
+const MIN_VISIBLE_ENVELOPE_BUCKETS: usize = 128;
+const MAX_VISIBLE_ENVELOPE_BUCKETS: usize = 8_192;
+const WHEEL_ZOOM_SENSITIVITY: f64 = 0.0015;
+const BENCH_VISIBLE_ENVELOPE_BUCKETS: usize = 1_200;
+const BENCH_RANGE_RUNS: usize = 24;
+const STRESS_RANGE_RUNS: usize = 1_000;
+const STRESS_REPORT_BLOCKS: usize = 5;
 
 fn main() -> eframe::Result {
     if let Some(command) = cli_command_arg() {
@@ -32,6 +39,12 @@ fn main() -> eframe::Result {
                     )
                 })
             }
+            CliCommand::BenchChannel { path, channel } => benchmark_channel(path, &channel),
+            CliCommand::StressChannel {
+                path,
+                channel,
+                runs,
+            } => stress_channel(path, &channel, runs),
         };
 
         match result {
@@ -59,8 +72,22 @@ fn main() -> eframe::Result {
 }
 
 enum CliCommand {
-    Schema { path: String },
-    LoadChannel { path: String, channel: String },
+    Schema {
+        path: String,
+    },
+    LoadChannel {
+        path: String,
+        channel: String,
+    },
+    BenchChannel {
+        path: String,
+        channel: String,
+    },
+    StressChannel {
+        path: String,
+        channel: String,
+        runs: usize,
+    },
 }
 
 fn cli_command_arg() -> Option<CliCommand> {
@@ -71,6 +98,24 @@ fn cli_command_arg() -> Option<CliCommand> {
             let path = args.next()?;
             let channel = args.next()?;
             Some(CliCommand::LoadChannel { path, channel })
+        }
+        Some("--bench-channel") => {
+            let path = args.next()?;
+            let channel = args.next()?;
+            Some(CliCommand::BenchChannel { path, channel })
+        }
+        Some("--stress-channel") => {
+            let path = args.next()?;
+            let channel = args.next()?;
+            let runs = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(STRESS_RANGE_RUNS);
+            Some(CliCommand::StressChannel {
+                path,
+                channel,
+                runs,
+            })
         }
         _ => None,
     }
@@ -84,6 +129,7 @@ struct PanelYApp {
     schema: Option<parquet_schema::SchemaSummary>,
     waveform: Option<parquet_waveform::WaveformData>,
     envelope: Option<parquet_waveform::MinMaxEnvelope>,
+    view_range: Option<(f64, f64)>,
 }
 
 impl Default for PanelYApp {
@@ -95,6 +141,7 @@ impl Default for PanelYApp {
             schema: None,
             waveform: None,
             envelope: None,
+            view_range: None,
         }
     }
 }
@@ -104,6 +151,262 @@ fn default_parquet_path() -> String {
         .join("../proto_3_1b/data/test_100k.parquet")
         .display()
         .to_string()
+}
+
+fn benchmark_channel(path: String, channel: &str) -> Result<String, String> {
+    let data = parquet_waveform::read_selected_channel(&path, channel)?;
+    let full_range = data
+        .time_range()
+        .ok_or_else(|| "loaded waveform has no time range".to_owned())?;
+    let full_envelope = data.min_max_envelope(FULL_RANGE_ENVELOPE_BUCKETS);
+    let ranges = benchmark_ranges(full_range, BENCH_RANGE_RUNS);
+    let mut range_results = Vec::with_capacity(ranges.len());
+    let started = std::time::Instant::now();
+
+    for (index, range) in ranges.into_iter().enumerate() {
+        let envelope = data.min_max_envelope_for_range(range, BENCH_VISIBLE_ENVELOPE_BUCKETS);
+        range_results.push(BenchmarkRangeResult {
+            index: index + 1,
+            range,
+            source_sample_count: envelope.source_sample_count,
+            bucket_count: envelope.bucket_count(),
+            bucket_size: envelope.bucket_size,
+            draw_point_count: envelope.draw_point_count(),
+            elapsed_sec: envelope.elapsed.as_secs_f64(),
+        });
+    }
+
+    let range_total_sec = started.elapsed().as_secs_f64();
+    let range_max_sec = range_results
+        .iter()
+        .map(|result| result.elapsed_sec)
+        .fold(0.0, f64::max);
+    let range_avg_sec = if range_results.is_empty() {
+        0.0
+    } else {
+        range_results
+            .iter()
+            .map(|result| result.elapsed_sec)
+            .sum::<f64>()
+            / range_results.len() as f64
+    };
+
+    let mut report = String::new();
+    report.push_str(&format!("file: {}\n", data.path.display()));
+    report.push_str(&format!("channel: {}\n", data.channel_name));
+    report.push_str(&format!("channel path: {}\n", data.channel_path));
+    report.push_str(&format!("samples: {}\n", data.sample_count()));
+    report.push_str(&format!(
+        "time range: {}\n",
+        format_range(data.time_range())
+    ));
+    report.push_str(&format!(
+        "projected columns: {:?}\n",
+        data.projected_column_indices
+    ));
+    report.push_str(&format!("read time: {:.3}s\n", data.elapsed.as_secs_f64()));
+    report.push_str(&format!(
+        "array memory: {:.1} MiB\n",
+        bytes_to_mib(data.memory_bytes())
+    ));
+    report.push_str(&format!(
+        "full envelope: {} buckets requested, {} buckets built, bucket size {}, draw points {}, {:.3}s\n",
+        full_envelope.requested_bucket_count,
+        full_envelope.bucket_count(),
+        full_envelope.bucket_size,
+        full_envelope.draw_point_count(),
+        full_envelope.elapsed.as_secs_f64()
+    ));
+    report.push_str(&format!(
+        "visible envelope benchmark: {} runs, {} buckets requested, total {:.3}s, avg {:.4}s, max {:.4}s\n",
+        range_results.len(),
+        BENCH_VISIBLE_ENVELOPE_BUCKETS,
+        range_total_sec,
+        range_avg_sec,
+        range_max_sec
+    ));
+    report.push_str("runs:\n");
+    for result in &range_results {
+        report.push_str(&format!(
+            "  #{:02} {:.6}..{:.6}s samples={} buckets={} bucket={} draw_points={} {:.4}s\n",
+            result.index,
+            result.range.0,
+            result.range.1,
+            result.source_sample_count,
+            result.bucket_count,
+            result.bucket_size,
+            result.draw_point_count,
+            result.elapsed_sec
+        ));
+    }
+
+    Ok(report)
+}
+
+fn stress_channel(path: String, channel: &str, runs: usize) -> Result<String, String> {
+    let runs = runs.max(1);
+    let rss_before_load = process_rss_mib();
+    let data = parquet_waveform::read_selected_channel(&path, channel)?;
+    let rss_after_load = process_rss_mib();
+    let full_range = data
+        .time_range()
+        .ok_or_else(|| "loaded waveform has no time range".to_owned())?;
+    let full_envelope = data.min_max_envelope(FULL_RANGE_ENVELOPE_BUCKETS);
+    let rss_after_full_envelope = process_rss_mib();
+    let ranges = benchmark_ranges(full_range, BENCH_RANGE_RUNS);
+    if ranges.is_empty() {
+        return Err("no benchmark ranges could be built".to_owned());
+    }
+
+    let mut block_results = Vec::with_capacity(STRESS_REPORT_BLOCKS);
+    let block_size = runs.div_ceil(STRESS_REPORT_BLOCKS);
+    let mut total_elapsed_sec = 0.0;
+    let mut max_elapsed_sec: f64 = 0.0;
+    let mut draw_points_total = 0usize;
+    let mut samples_total = 0usize;
+
+    let started = std::time::Instant::now();
+    for index in 0..runs {
+        let range = ranges[index % ranges.len()];
+        let envelope = data.min_max_envelope_for_range(range, BENCH_VISIBLE_ENVELOPE_BUCKETS);
+        let elapsed_sec = envelope.elapsed.as_secs_f64();
+        total_elapsed_sec += elapsed_sec;
+        max_elapsed_sec = max_elapsed_sec.max(elapsed_sec);
+        draw_points_total += envelope.draw_point_count();
+        samples_total += envelope.source_sample_count;
+
+        let completed = index + 1;
+        if completed % block_size == 0 || completed == runs {
+            block_results.push(StressBlockResult {
+                completed_runs: completed,
+                elapsed_wall_sec: started.elapsed().as_secs_f64(),
+                rss_mib: process_rss_mib(),
+            });
+        }
+    }
+
+    let wall_sec = started.elapsed().as_secs_f64();
+    let avg_elapsed_sec = total_elapsed_sec / runs as f64;
+    let rss_after_stress = process_rss_mib();
+
+    let mut report = String::new();
+    report.push_str(&format!("file: {}\n", data.path.display()));
+    report.push_str(&format!("channel: {}\n", data.channel_name));
+    report.push_str(&format!("samples: {}\n", data.sample_count()));
+    report.push_str(&format!(
+        "time range: {}\n",
+        format_range(data.time_range())
+    ));
+    report.push_str(&format!("read time: {:.3}s\n", data.elapsed.as_secs_f64()));
+    report.push_str(&format!(
+        "array memory: {:.1} MiB\n",
+        bytes_to_mib(data.memory_bytes())
+    ));
+    report.push_str(&format!(
+        "full envelope: {} buckets requested, {} buckets built, bucket size {}, draw points {}, {:.3}s\n",
+        full_envelope.requested_bucket_count,
+        full_envelope.bucket_count(),
+        full_envelope.bucket_size,
+        full_envelope.draw_point_count(),
+        full_envelope.elapsed.as_secs_f64()
+    ));
+    report.push_str(&format!(
+        "stress visible envelope: {} runs, {} buckets requested, wall {:.3}s, measured total {:.3}s, avg {:.4}s, max {:.4}s\n",
+        runs,
+        BENCH_VISIBLE_ENVELOPE_BUCKETS,
+        wall_sec,
+        total_elapsed_sec,
+        avg_elapsed_sec,
+        max_elapsed_sec
+    ));
+    report.push_str(&format!(
+        "stress totals: samples={}, draw_points={}\n",
+        samples_total, draw_points_total
+    ));
+    report.push_str(&format!(
+        "rss: before_load={}, after_load={}, after_full_envelope={}, after_stress={}\n",
+        format_optional_mib(rss_before_load),
+        format_optional_mib(rss_after_load),
+        format_optional_mib(rss_after_full_envelope),
+        format_optional_mib(rss_after_stress)
+    ));
+    report.push_str("rss blocks:\n");
+    for block in &block_results {
+        report.push_str(&format!(
+            "  runs={} wall={:.3}s rss={}\n",
+            block.completed_runs,
+            block.elapsed_wall_sec,
+            format_optional_mib(block.rss_mib)
+        ));
+    }
+
+    Ok(report)
+}
+
+#[derive(Debug)]
+struct BenchmarkRangeResult {
+    index: usize,
+    range: (f64, f64),
+    source_sample_count: usize,
+    bucket_count: usize,
+    bucket_size: usize,
+    draw_point_count: usize,
+    elapsed_sec: f64,
+}
+
+#[derive(Debug)]
+struct StressBlockResult {
+    completed_runs: usize,
+    elapsed_wall_sec: f64,
+    rss_mib: Option<f64>,
+}
+
+fn benchmark_ranges(full_range: (f64, f64), run_count: usize) -> Vec<(f64, f64)> {
+    let Some((start, end)) = normalized_range(full_range) else {
+        return Vec::new();
+    };
+    let span = end - start;
+    if span <= 0.0 || run_count == 0 {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::with_capacity(run_count);
+    for index in 0..run_count {
+        let phase = index as f64 / run_count.max(1) as f64;
+        let window_ratio = match index % 4 {
+            0 => 0.50,
+            1 => 0.20,
+            2 => 0.05,
+            _ => 0.01,
+        };
+        let window = (span * window_ratio).max(span * 1.0e-9);
+        let available = (span - window).max(0.0);
+        let left = start + available * phase;
+        ranges.push((left, left + window));
+    }
+
+    ranges
+}
+
+fn process_rss_mib() -> Option<f64> {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let rss_kib = text.trim().parse::<f64>().ok()?;
+    Some(rss_kib / 1024.0)
+}
+
+fn format_optional_mib(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.1} MiB"))
+        .unwrap_or_else(|| "n/a".to_owned())
 }
 
 impl PanelYApp {
@@ -135,12 +438,14 @@ impl PanelYApp {
                 self.schema = Some(summary);
                 self.waveform = None;
                 self.envelope = None;
+                self.view_range = None;
             }
             Err(error) => {
                 self.status = format!("Schema load failed: {error}");
                 self.schema = None;
                 self.waveform = None;
                 self.envelope = None;
+                self.view_range = None;
             }
         }
     }
@@ -153,7 +458,11 @@ impl PanelYApp {
 
         match parquet_waveform::read_selected_channel(&self.parquet_path, &self.selected_channel) {
             Ok(waveform) => {
-                let envelope = waveform.min_max_envelope(FULL_RANGE_ENVELOPE_BUCKETS);
+                let view_range = waveform.time_range();
+                let envelope = view_range.map_or_else(
+                    || waveform.min_max_envelope(FULL_RANGE_ENVELOPE_BUCKETS),
+                    |range| waveform.min_max_envelope_for_range(range, FULL_RANGE_ENVELOPE_BUCKETS),
+                );
                 self.status = format!(
                     "Loaded waveform: {} samples, {}, {:.1} MiB, read {:.3}s, envelope {}/{} buckets {:.3}s",
                     waveform.sample_count(),
@@ -165,13 +474,139 @@ impl PanelYApp {
                     envelope.elapsed.as_secs_f64()
                 );
                 self.envelope = Some(envelope);
+                self.view_range = view_range;
                 self.waveform = Some(waveform);
             }
             Err(error) => {
                 self.status = format!("Waveform load failed: {error}");
                 self.waveform = None;
                 self.envelope = None;
+                self.view_range = None;
             }
+        }
+    }
+
+    fn reset_view_range(&mut self) {
+        self.view_range = self
+            .waveform
+            .as_ref()
+            .and_then(parquet_waveform::WaveformData::time_range);
+        self.envelope = None;
+    }
+
+    fn ensure_visible_envelope(&mut self, requested_bucket_count: usize) {
+        let Some(waveform) = self.waveform.as_ref() else {
+            return;
+        };
+        let Some(full_range) = waveform.time_range() else {
+            self.envelope = None;
+            self.view_range = None;
+            return;
+        };
+
+        let min_span = min_view_span(full_range, waveform.sample_count());
+        let view_range =
+            clamp_view_range(self.view_range.unwrap_or(full_range), full_range, min_span);
+        if self.view_range != Some(view_range) {
+            self.view_range = Some(view_range);
+        }
+
+        let envelope_is_stale = match self.envelope.as_ref() {
+            Some(envelope) => {
+                envelope.time_range != Some(view_range)
+                    || envelope.requested_bucket_count != requested_bucket_count
+            }
+            None => true,
+        };
+
+        if envelope_is_stale {
+            let envelope = waveform.min_max_envelope_for_range(view_range, requested_bucket_count);
+            self.status = format!(
+                "View {:.6}..{:.6}s: {} visible samples, envelope {}/{} buckets, bucket {}, {:.3}s",
+                view_range.0,
+                view_range.1,
+                envelope.source_sample_count,
+                envelope.bucket_count(),
+                envelope.requested_bucket_count,
+                envelope.bucket_size,
+                envelope.elapsed.as_secs_f64()
+            );
+            self.envelope = Some(envelope);
+        }
+    }
+
+    fn handle_plot_interaction(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        plot_rect: egui::Rect,
+    ) {
+        let Some(waveform) = self.waveform.as_ref() else {
+            return;
+        };
+        let Some(full_range) = waveform.time_range() else {
+            return;
+        };
+
+        let min_span = min_view_span(full_range, waveform.sample_count());
+        let mut next_range =
+            clamp_view_range(self.view_range.unwrap_or(full_range), full_range, min_span);
+        let current_range = next_range;
+        let mut changed = false;
+
+        if response.double_clicked() {
+            next_range = full_range;
+            changed = true;
+        }
+
+        if response.dragged_by(egui::PointerButton::Primary) && plot_rect.width() > 1.0 {
+            let delta_x = f64::from(response.drag_delta().x);
+            if delta_x != 0.0 {
+                let span = next_range.1 - next_range.0;
+                let shift = -delta_x / f64::from(plot_rect.width()) * span;
+                next_range = pan_view_range(next_range, full_range, shift, min_span);
+                changed = true;
+            }
+        }
+
+        let (pointer_pos, zoom_delta, scroll_delta) = ui.input(|input| {
+            (
+                input.pointer.latest_pos(),
+                input.zoom_delta(),
+                input.smooth_scroll_delta(),
+            )
+        });
+
+        if let Some(pointer_pos) = pointer_pos
+            && plot_rect.contains(pointer_pos)
+            && plot_rect.width() > 1.0
+        {
+            if scroll_delta.x != 0.0 {
+                let span = next_range.1 - next_range.0;
+                let shift = -f64::from(scroll_delta.x) / f64::from(plot_rect.width()) * span;
+                next_range = pan_view_range(next_range, full_range, shift, min_span);
+                changed = true;
+            }
+
+            let zoom_factor = if zoom_delta != 1.0 {
+                1.0 / f64::from(zoom_delta)
+            } else if scroll_delta.y != 0.0 {
+                (-f64::from(scroll_delta.y) * WHEEL_ZOOM_SENSITIVITY).exp()
+            } else {
+                1.0
+            };
+
+            if zoom_factor.is_finite() && (zoom_factor - 1.0).abs() > f64::EPSILON {
+                let anchor_ratio = ((pointer_pos.x - plot_rect.left()) / plot_rect.width()) as f64;
+                next_range =
+                    zoom_view_range(next_range, full_range, anchor_ratio, zoom_factor, min_span);
+                changed = true;
+            }
+        }
+
+        if changed && next_range != current_range {
+            self.view_range = Some(next_range);
+            self.envelope = None;
         }
     }
 }
@@ -216,15 +651,31 @@ impl eframe::App for PanelYApp {
                 if draw_schema_controls(ui, &mut self.selected_channel, self.schema.as_ref()) {
                     self.waveform = None;
                     self.envelope = None;
+                    self.view_range = None;
                     self.status = format!("Selected channel: {}", self.selected_channel);
+                }
+
+                if self.waveform.is_some() {
+                    ui.add_space(16.0);
+                    ui.heading("View");
+                    if ui.button("Reset X Range").clicked() {
+                        self.reset_view_range();
+                    }
+                    if let Some((start, end)) = self.view_range {
+                        ui.monospace(format!("x: {start:.6} .. {end:.6} s"));
+                    }
                 }
             });
 
         egui::CentralPanel::default_margins().show_inside(ui, |ui| {
             let available = ui.available_size();
-            let (rect, _response) = ui.allocate_exact_size(available, egui::Sense::drag());
+            let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
             let plot_rect = plot_area_rect(rect);
+            let requested_buckets = visible_envelope_bucket_count(plot_rect);
+
+            self.handle_plot_interaction(ui, &response, plot_rect);
+            self.ensure_visible_envelope(requested_buckets);
 
             painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
             draw_plot_frame(&painter, plot_rect, ui.visuals());
@@ -433,6 +884,11 @@ fn draw_waveform_envelope(
     );
 }
 
+fn visible_envelope_bucket_count(rect: egui::Rect) -> usize {
+    (rect.width().round() as usize)
+        .clamp(MIN_VISIBLE_ENVELOPE_BUCKETS, MAX_VISIBLE_ENVELOPE_BUCKETS)
+}
+
 fn draw_axis_labels(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -537,4 +993,99 @@ fn padded_range(min: f64, max: f64) -> (f64, f64) {
 
     let pad = (max - min).abs() * 0.05;
     (min - pad, max + pad)
+}
+
+fn min_view_span(full_range: (f64, f64), sample_count: usize) -> f64 {
+    let full_span = full_range.1 - full_range.0;
+    if !full_span.is_finite() || full_span <= 0.0 {
+        return f64::EPSILON;
+    }
+
+    let sample_span = if sample_count > 1 {
+        full_span / (sample_count - 1) as f64
+    } else {
+        full_span
+    };
+
+    sample_span.max(full_span * 1.0e-9).max(f64::EPSILON)
+}
+
+fn clamp_view_range(range: (f64, f64), full_range: (f64, f64), min_span: f64) -> (f64, f64) {
+    let Some((full_start, full_end)) = normalized_range(full_range) else {
+        return full_range;
+    };
+    let full_span = full_end - full_start;
+    if full_span <= 0.0 {
+        return (full_start, full_end);
+    }
+
+    let (start, end) = normalized_range(range).unwrap_or((full_start, full_end));
+    let span = (end - start).clamp(min_span.min(full_span), full_span);
+    let center = ((start + end) * 0.5).clamp(full_start, full_end);
+    range_with_span_around(center, span, (full_start, full_end))
+}
+
+fn pan_view_range(
+    range: (f64, f64),
+    full_range: (f64, f64),
+    shift: f64,
+    min_span: f64,
+) -> (f64, f64) {
+    let (start, end) = clamp_view_range(range, full_range, min_span);
+    let span = end - start;
+    range_with_start(start + shift, span, full_range)
+}
+
+fn zoom_view_range(
+    range: (f64, f64),
+    full_range: (f64, f64),
+    anchor_ratio: f64,
+    zoom_factor: f64,
+    min_span: f64,
+) -> (f64, f64) {
+    let Some((full_start, full_end)) = normalized_range(full_range) else {
+        return full_range;
+    };
+    let full_span = full_end - full_start;
+    if full_span <= 0.0 {
+        return (full_start, full_end);
+    }
+
+    let (start, end) = clamp_view_range(range, (full_start, full_end), min_span);
+    let span = end - start;
+    let anchor_ratio = anchor_ratio.clamp(0.0, 1.0);
+    let anchor_time = start + span * anchor_ratio;
+    let next_span = (span * zoom_factor).clamp(min_span.min(full_span), full_span);
+    let next_start = anchor_time - next_span * anchor_ratio;
+
+    range_with_start(next_start, next_span, (full_start, full_end))
+}
+
+fn range_with_span_around(center: f64, span: f64, full_range: (f64, f64)) -> (f64, f64) {
+    range_with_start(center - span * 0.5, span, full_range)
+}
+
+fn range_with_start(start: f64, span: f64, full_range: (f64, f64)) -> (f64, f64) {
+    let Some((full_start, full_end)) = normalized_range(full_range) else {
+        return full_range;
+    };
+    let full_span = full_end - full_start;
+    if span >= full_span {
+        return (full_start, full_end);
+    }
+
+    let start = start.clamp(full_start, full_end - span);
+    (start, start + span)
+}
+
+fn normalized_range((start, end): (f64, f64)) -> Option<(f64, f64)> {
+    if !start.is_finite() || !end.is_finite() {
+        return None;
+    }
+
+    match start.partial_cmp(&end)? {
+        std::cmp::Ordering::Less => Some((start, end)),
+        std::cmp::Ordering::Greater => Some((end, start)),
+        std::cmp::Ordering::Equal => None,
+    }
 }
