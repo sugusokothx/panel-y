@@ -14,6 +14,12 @@ const STRESS_RANGE_RUNS: usize = 1_000;
 const STRESS_REPORT_BLOCKS: usize = 5;
 const MIN_WAVEFORM_ROW_HEIGHT: f32 = 180.0;
 const WAVEFORM_ROW_GAP: f32 = 10.0;
+const MAX_EXACT_STEP_SAMPLES: usize = 12_000;
+const MAX_STEP_CHANGE_POINTS: usize = 12_000;
+const DEFAULT_TRACE_LINE_WIDTH: f32 = 1.25;
+const MIN_TRACE_LINE_WIDTH: f32 = 0.5;
+const MAX_TRACE_LINE_WIDTH: f32 = 6.0;
+const MAX_HOVER_READOUT_CHANNELS: usize = 4;
 
 fn main() -> eframe::Result {
     if let Some(command) = cli_command_arg() {
@@ -157,6 +163,7 @@ struct ViewState {
     selected_row_id: Option<u64>,
     next_row_id: u64,
     x_range: Option<(f64, f64)>,
+    hover_x: Option<f64>,
     rows: Vec<PlotRow>,
 }
 
@@ -171,13 +178,38 @@ struct LoadState {
 #[derive(Clone, Debug)]
 struct PlotRow {
     id: u64,
+    y_range: RowYRange,
     channels: Vec<RowChannel>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RowYRange {
+    mode: YRangeMode,
+    min: f64,
+    max: f64,
+    last_auto: Option<(f64, f64)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum YRangeMode {
+    Auto,
+    Manual,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct RowChannel {
     channel_path: String,
     color_index: usize,
+    draw_mode: DrawMode,
+    visible: bool,
+    color_override: Option<egui::Color32>,
+    line_width: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrawMode {
+    Line,
+    Step,
 }
 
 #[derive(Debug, Default)]
@@ -203,19 +235,51 @@ struct EnvelopeKey {
 }
 
 #[derive(Clone, Debug)]
-struct VisibleEnvelope {
+struct VisibleTrace {
     channel_name: String,
     channel_path: String,
     sample_count: usize,
     color: egui::Color32,
-    envelope: parquet_waveform::MinMaxEnvelope,
+    line_width: f32,
+    draw_mode: DrawMode,
+    hover_value: Option<f32>,
+    data: VisibleTraceData,
+}
+
+#[derive(Clone, Debug)]
+enum VisibleTraceData {
+    Envelope(parquet_waveform::MinMaxEnvelope),
+    RawStep(RawStepTrace),
+}
+
+#[derive(Clone, Debug)]
+struct RawStepTrace {
+    samples: Vec<StepSample>,
+    source_sample_count: usize,
+    time_range: Option<(f64, f64)>,
+    value_range: Option<(f64, f64)>,
+    kind: StepTraceKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepTraceKind {
+    RawSamples,
+    ChangePoints,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepSample {
+    time: f64,
+    value: f32,
 }
 
 #[derive(Debug)]
-struct VisibleRowEnvelope {
+struct VisibleRowTrace {
     row_id: u64,
     row_index: usize,
-    envelopes: Vec<VisibleEnvelope>,
+    row_channel_count: usize,
+    y_range: RowYRange,
+    traces: Vec<VisibleTrace>,
 }
 
 impl Default for PanelYApp {
@@ -246,10 +310,8 @@ impl Default for ViewState {
             selected_row_id: Some(0),
             next_row_id: 1,
             x_range: None,
-            rows: vec![PlotRow {
-                id: 0,
-                channels: Vec::new(),
-            }],
+            hover_x: None,
+            rows: vec![PlotRow::new(0)],
         }
     }
 }
@@ -262,6 +324,89 @@ impl Default for LoadState {
             progress: None,
             error: None,
         }
+    }
+}
+
+impl DrawMode {
+    const ALL: [Self; 2] = [Self::Line, Self::Step];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Line => "Line",
+            Self::Step => "Step",
+        }
+    }
+}
+
+impl YRangeMode {
+    const ALL: [Self; 2] = [Self::Auto, Self::Manual];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Manual => "Manual",
+        }
+    }
+}
+
+impl Default for RowYRange {
+    fn default() -> Self {
+        Self {
+            mode: YRangeMode::Auto,
+            min: -1.0,
+            max: 1.0,
+            last_auto: None,
+        }
+    }
+}
+
+impl RowYRange {
+    fn set_last_auto(&mut self, range: (f64, f64)) {
+        if normalized_y_range(range.0, range.1).is_some() {
+            self.last_auto = Some(range);
+        }
+    }
+
+    fn manual_seed_range(&self) -> (f64, f64) {
+        self.last_auto.unwrap_or_else(|| {
+            let default = Self::default();
+            (default.min, default.max)
+        })
+    }
+
+    fn set_manual_from_last_auto(&mut self) {
+        let (min, max) = self.manual_seed_range();
+        self.mode = YRangeMode::Manual;
+        self.min = min;
+        self.max = max;
+    }
+}
+
+impl PlotRow {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            y_range: RowYRange::default(),
+            channels: Vec::new(),
+        }
+    }
+}
+
+impl RowChannel {
+    fn new(channel_path: &str, color_index: usize) -> Self {
+        Self {
+            channel_path: channel_path.to_owned(),
+            color_index,
+            draw_mode: DrawMode::Line,
+            visible: true,
+            color_override: None,
+            line_width: DEFAULT_TRACE_LINE_WIDTH,
+        }
+    }
+
+    fn color(&self, dark_mode: bool) -> egui::Color32 {
+        self.color_override
+            .unwrap_or_else(|| channel_color(self.color_index, dark_mode))
     }
 }
 
@@ -287,31 +432,24 @@ impl ViewState {
         }
 
         self.x_range = None;
+        self.hover_x = None;
         self.selected_row_id = Some(0);
         self.next_row_id = 1;
-        self.rows = vec![PlotRow {
-            id: 0,
-            channels: Vec::new(),
-        }];
+        self.rows = vec![PlotRow::new(0)];
     }
 
     fn reset_empty(&mut self) {
         self.selected_channel.clear();
         self.x_range = None;
+        self.hover_x = None;
         self.selected_row_id = Some(0);
         self.next_row_id = 1;
-        self.rows = vec![PlotRow {
-            id: 0,
-            channels: Vec::new(),
-        }];
+        self.rows = vec![PlotRow::new(0)];
     }
 
     fn ensure_row_state(&mut self) {
         if self.rows.is_empty() {
-            self.rows.push(PlotRow {
-                id: 0,
-                channels: Vec::new(),
-            });
+            self.rows.push(PlotRow::new(0));
         }
 
         let next_row_id = self.rows.iter().map(|row| row.id).max().unwrap_or(0) + 1;
@@ -329,10 +467,7 @@ impl ViewState {
         self.ensure_row_state();
         let id = self.next_row_id;
         self.next_row_id += 1;
-        self.rows.push(PlotRow {
-            id,
-            channels: Vec::new(),
-        });
+        self.rows.push(PlotRow::new(id));
         self.selected_row_id = Some(id);
         id
     }
@@ -379,15 +514,15 @@ impl ViewState {
             return (false, row.id);
         }
 
-        row.channels.push(RowChannel {
-            channel_path: channel_path.to_owned(),
-            color_index: row.channels.len(),
-        });
+        row.channels
+            .push(RowChannel::new(channel_path, row.channels.len()));
         (true, row.id)
     }
 
     fn has_visible_channels(&self) -> bool {
-        self.rows.iter().any(|row| !row.channels.is_empty())
+        self.rows
+            .iter()
+            .any(|row| row.channels.iter().any(|channel| channel.visible))
     }
 }
 
@@ -1073,11 +1208,11 @@ impl PanelYApp {
         self.dataset.loaded_channels.clear_envelope_cache();
     }
 
-    fn visible_row_envelopes(
+    fn visible_row_traces(
         &mut self,
         requested_bucket_count: usize,
         dark_mode: bool,
-    ) -> Vec<VisibleRowEnvelope> {
+    ) -> Vec<VisibleRowTrace> {
         let rows = self.view.rows.clone();
         if rows.is_empty() {
             return Vec::new();
@@ -1087,10 +1222,12 @@ impl PanelYApp {
             return rows
                 .into_iter()
                 .enumerate()
-                .map(|(row_index, row)| VisibleRowEnvelope {
+                .map(|(row_index, row)| VisibleRowTrace {
                     row_id: row.id,
                     row_index,
-                    envelopes: Vec::new(),
+                    row_channel_count: row.channels.len(),
+                    y_range: row.y_range,
+                    traces: Vec::new(),
                 })
                 .collect();
         };
@@ -1100,10 +1237,12 @@ impl PanelYApp {
             return rows
                 .into_iter()
                 .enumerate()
-                .map(|(row_index, row)| VisibleRowEnvelope {
+                .map(|(row_index, row)| VisibleRowTrace {
                     row_id: row.id,
                     row_index,
-                    envelopes: Vec::new(),
+                    row_channel_count: row.channels.len(),
+                    y_range: row.y_range,
+                    traces: Vec::new(),
                 })
                 .collect();
         };
@@ -1120,7 +1259,11 @@ impl PanelYApp {
         }
 
         let mut visible_rows = Vec::with_capacity(rows.len());
+        let mut latest_auto_y_ranges = Vec::with_capacity(rows.len());
         let mut built_count = 0usize;
+        let mut exact_step_count = 0usize;
+        let mut edge_step_count = 0usize;
+        let hover_x = self.view.hover_x;
         {
             let dataset = &mut self.dataset;
             let Some(shared_time) = dataset.shared_time.as_ref() else {
@@ -1131,8 +1274,13 @@ impl PanelYApp {
             loaded_channels.prepare_envelope_context(view_range, requested_bucket_count);
 
             for (row_index, row) in rows.into_iter().enumerate() {
-                let mut envelopes = Vec::with_capacity(row.channels.len());
+                let mut traces = Vec::with_capacity(row.channels.len());
+                let row_channel_count = row.channels.len();
                 for row_channel in row.channels {
+                    if !row_channel.visible {
+                        continue;
+                    }
+
                     let Some((channel_name, channel_path, sample_count)) = loaded_channels
                         .channel(&row_channel.channel_path)
                         .map(|channel| {
@@ -1146,54 +1294,137 @@ impl PanelYApp {
                         continue;
                     };
 
-                    let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
-                        &channel_path,
-                        time_values,
-                        view_range,
-                        requested_bucket_count,
-                    ) else {
-                        continue;
+                    let data = match row_channel.draw_mode {
+                        DrawMode::Line => {
+                            let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
+                                &channel_path,
+                                time_values,
+                                view_range,
+                                requested_bucket_count,
+                            ) else {
+                                continue;
+                            };
+                            if was_built {
+                                built_count += 1;
+                            }
+                            VisibleTraceData::Envelope(envelope)
+                        }
+                        DrawMode::Step => {
+                            if let Some(raw_step) =
+                                loaded_channels.channel(&channel_path).and_then(|channel| {
+                                    build_raw_step_trace(
+                                        time_values,
+                                        &channel.values,
+                                        view_range,
+                                        MAX_EXACT_STEP_SAMPLES,
+                                    )
+                                })
+                            {
+                                exact_step_count += 1;
+                                VisibleTraceData::RawStep(raw_step)
+                            } else if let Some(edge_step) =
+                                loaded_channels.channel(&channel_path).and_then(|channel| {
+                                    build_change_point_step_trace(
+                                        time_values,
+                                        &channel.values,
+                                        view_range,
+                                        MAX_STEP_CHANGE_POINTS,
+                                    )
+                                })
+                            {
+                                edge_step_count += 1;
+                                VisibleTraceData::RawStep(edge_step)
+                            } else {
+                                let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
+                                    &channel_path,
+                                    time_values,
+                                    view_range,
+                                    requested_bucket_count,
+                                ) else {
+                                    continue;
+                                };
+                                if was_built {
+                                    built_count += 1;
+                                }
+                                VisibleTraceData::Envelope(envelope)
+                            }
+                        }
                     };
 
-                    if was_built {
-                        built_count += 1;
-                    }
-                    envelopes.push(VisibleEnvelope {
+                    let hover_value = hover_x.and_then(|hover_x| {
+                        loaded_channels.channel(&channel_path).and_then(|channel| {
+                            hover_value_at_time(
+                                time_values,
+                                &channel.values,
+                                hover_x,
+                                row_channel.draw_mode,
+                            )
+                        })
+                    });
+
+                    traces.push(VisibleTrace {
                         channel_name,
                         channel_path,
                         sample_count,
-                        color: channel_color(row_channel.color_index, dark_mode),
-                        envelope,
+                        color: row_channel.color(dark_mode),
+                        line_width: row_channel
+                            .line_width
+                            .clamp(MIN_TRACE_LINE_WIDTH, MAX_TRACE_LINE_WIDTH),
+                        draw_mode: row_channel.draw_mode,
+                        hover_value,
+                        data,
                     });
                 }
 
-                visible_rows.push(VisibleRowEnvelope {
+                visible_rows.push(VisibleRowTrace {
                     row_id: row.id,
                     row_index,
-                    envelopes,
+                    row_channel_count,
+                    y_range: row.y_range,
+                    traces,
                 });
+
+                if let Some((min, max)) = visible_rows
+                    .last()
+                    .and_then(|row| combined_trace_value_range(&row.traces))
+                {
+                    latest_auto_y_ranges.push((row.id, Some(padded_range(min, max))));
+                } else {
+                    latest_auto_y_ranges.push((row.id, None));
+                }
             }
         }
 
-        if built_count > 0 {
+        for (row_id, auto_y_range) in latest_auto_y_ranges {
+            let Some(auto_y_range) = auto_y_range else {
+                continue;
+            };
+            if let Some(row) = self.view.rows.iter_mut().find(|row| row.id == row_id) {
+                row.y_range.set_last_auto(auto_y_range);
+            }
+        }
+
+        if built_count > 0 || exact_step_count > 0 || edge_step_count > 0 {
             let visible_channel_count = visible_rows
                 .iter()
-                .map(|row| row.envelopes.len())
+                .map(|row| row.traces.len())
                 .sum::<usize>();
             let source_sample_count = visible_rows
                 .iter()
-                .flat_map(|row| row.envelopes.iter())
+                .flat_map(|row| row.traces.iter())
                 .next()
-                .map(|visible| visible.envelope.source_sample_count)
+                .map(trace_source_sample_count)
                 .unwrap_or_default();
             self.load.status = format!(
-                "View {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), cache {}",
+                "View {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, cache {}",
                 view_range.0,
                 view_range.1,
                 visible_rows.len(),
                 visible_channel_count,
                 source_sample_count,
                 built_count,
+                exact_step_count,
+                edge_step_count,
                 self.dataset.loaded_channels.envelope_cache.len()
             );
         }
@@ -1208,9 +1439,11 @@ impl PanelYApp {
         plot_rects: &[egui::Rect],
     ) {
         let Some(shared_time) = self.dataset.shared_time.as_ref() else {
+            self.view.hover_x = None;
             return;
         };
         let Some(full_range) = shared_time.time_range() else {
+            self.view.hover_x = None;
             return;
         };
 
@@ -1236,6 +1469,9 @@ impl PanelYApp {
                 .find(|plot_rect| plot_rect.contains(pointer_pos))
                 .map(|plot_rect| (pointer_pos, plot_rect))
         }) else {
+            if self.view.hover_x.take().is_some() {
+                ui.ctx().request_repaint();
+            }
             return;
         };
 
@@ -1281,6 +1517,12 @@ impl PanelYApp {
         if changed && next_range != current_range {
             self.view.x_range = Some(next_range);
             self.dataset.loaded_channels.clear_envelope_cache();
+        }
+
+        let next_hover_x = time_at_plot_x(pointer_pos.x, plot_rect, next_range);
+        if self.view.hover_x != next_hover_x {
+            self.view.hover_x = next_hover_x;
+            ui.ctx().request_repaint();
         }
     }
 }
@@ -1388,7 +1630,7 @@ impl eframe::App for PanelYApp {
 
                     self.handle_plot_interaction(ui, &response, &plot_rects);
                     let visible_rows =
-                        self.visible_row_envelopes(requested_buckets, ui.visuals().dark_mode);
+                        self.visible_row_traces(requested_buckets, ui.visuals().dark_mode);
 
                     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
                     for (index, row_rect) in row_rects.iter().copied().enumerate() {
@@ -1404,13 +1646,17 @@ impl eframe::App for PanelYApp {
                         draw_plot_frame(&painter, plot_rect, ui.visuals());
 
                         match visible_row {
-                            Some(row) if !row.envelopes.is_empty() => {
-                                draw_waveform_envelopes(
+                            Some(row) if !row.traces.is_empty() => {
+                                draw_waveform_traces(
                                     &painter,
                                     plot_rect,
                                     ui.visuals(),
-                                    &row.envelopes,
+                                    &row.traces,
+                                    row.y_range,
                                 );
+                            }
+                            Some(row) if row.row_channel_count > 0 => {
+                                draw_status_label(&painter, plot_rect, "All channels are hidden");
                             }
                             _ => {
                                 draw_row_placeholder(
@@ -1421,6 +1667,23 @@ impl eframe::App for PanelYApp {
                                     row_index,
                                 );
                             }
+                        }
+
+                        draw_hover_line(
+                            &painter,
+                            plot_rect,
+                            self.view.hover_x,
+                            self.view.x_range,
+                            ui.visuals(),
+                        );
+                        if let Some(row) = visible_row {
+                            draw_hover_readout(
+                                &painter,
+                                plot_rect,
+                                self.view.hover_x,
+                                ui.visuals(),
+                                &row.traces,
+                            );
                         }
                     }
                 });
@@ -1596,21 +1859,88 @@ fn draw_row_controls(
             }
         });
 
+        if draw_y_range_controls(ui, row.id, &mut row.y_range) {
+            changed = true;
+        }
+
         if row.channels.is_empty() {
             ui.label("No channels in row");
             continue;
         }
 
         let mut remove_channel = None;
-        for channel in &row.channels {
-            ui.horizontal(|ui| {
-                let color = channel_color(channel.color_index, ui.visuals().dark_mode);
-                ui.colored_label(color, format!("ch {}", channel.color_index + 1));
-                ui.label(channel_display_name(schema, &channel.channel_path));
-                if ui.small_button("Remove").clicked() {
-                    remove_channel = Some(channel.channel_path.clone());
-                }
-            });
+        for channel in &mut row.channels {
+            ui.push_id(
+                ("channel_style", row.id, channel.channel_path.clone()),
+                |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .checkbox(&mut channel.visible, "")
+                            .on_hover_text("Visible")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        let mut color = channel.color(ui.visuals().dark_mode);
+                        if egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut color,
+                            egui::color_picker::Alpha::Opaque,
+                        )
+                        .changed()
+                        {
+                            channel.color_override = Some(color);
+                            changed = true;
+                        }
+
+                        ui.label(channel_display_name(schema, &channel.channel_path));
+                        egui::ComboBox::from_id_salt("draw_mode")
+                            .selected_text(channel.draw_mode.as_str())
+                            .show_ui(ui, |ui| {
+                                for draw_mode in DrawMode::ALL {
+                                    if ui
+                                        .selectable_value(
+                                            &mut channel.draw_mode,
+                                            draw_mode,
+                                            draw_mode.as_str(),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                }
+                            });
+
+                        let mut line_width = channel.line_width;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut line_width)
+                                    .speed(0.1)
+                                    .range(MIN_TRACE_LINE_WIDTH..=MAX_TRACE_LINE_WIDTH)
+                                    .prefix("w "),
+                            )
+                            .on_hover_text("Line width")
+                            .changed()
+                        {
+                            channel.line_width =
+                                line_width.clamp(MIN_TRACE_LINE_WIDTH, MAX_TRACE_LINE_WIDTH);
+                            changed = true;
+                        }
+
+                        if channel.color_override.is_some()
+                            && ui.small_button("Reset color").clicked()
+                        {
+                            channel.color_override = None;
+                            changed = true;
+                        }
+
+                        if ui.small_button("Remove").clicked() {
+                            remove_channel = Some(channel.channel_path.clone());
+                        }
+                    });
+                },
+            );
         }
 
         if let Some(channel_path) = remove_channel {
@@ -1626,6 +1956,63 @@ fn draw_row_controls(
     {
         changed = true;
     }
+
+    changed
+}
+
+fn draw_y_range_controls(ui: &mut egui::Ui, row_id: u64, y_range: &mut RowYRange) -> bool {
+    let mut changed = false;
+
+    ui.push_id(("row_y_range", row_id), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Y");
+            let mut selected_mode = y_range.mode;
+            egui::ComboBox::from_id_salt("mode")
+                .selected_text(selected_mode.as_str())
+                .show_ui(ui, |ui| {
+                    for mode in YRangeMode::ALL {
+                        if ui
+                            .selectable_value(&mut selected_mode, mode, mode.as_str())
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+                });
+            if selected_mode != y_range.mode {
+                match selected_mode {
+                    YRangeMode::Auto => y_range.mode = YRangeMode::Auto,
+                    YRangeMode::Manual => y_range.set_manual_from_last_auto(),
+                }
+                changed = true;
+            }
+
+            if y_range.mode == YRangeMode::Manual {
+                let mut min = y_range.min;
+                if ui
+                    .add(egui::DragValue::new(&mut min).speed(0.1).prefix("min "))
+                    .changed()
+                {
+                    y_range.min = min;
+                    changed = true;
+                }
+
+                let mut max = y_range.max;
+                if ui
+                    .add(egui::DragValue::new(&mut max).speed(0.1).prefix("max "))
+                    .changed()
+                {
+                    y_range.max = max;
+                    changed = true;
+                }
+
+                if ui.small_button("Reset").clicked() {
+                    y_range.set_manual_from_last_auto();
+                    changed = true;
+                }
+            }
+        });
+    });
 
     changed
 }
@@ -1732,29 +2119,23 @@ fn row_outer_rects(rect: egui::Rect, row_count: usize) -> Vec<egui::Rect> {
     row_rects
 }
 
-fn draw_waveform_envelopes(
+fn draw_waveform_traces(
     painter: &egui::Painter,
     rect: egui::Rect,
     visuals: &egui::Visuals,
-    visible_envelopes: &[VisibleEnvelope],
+    visible_traces: &[VisibleTrace],
+    y_range: RowYRange,
 ) {
-    let Some(first) = visible_envelopes.first() else {
+    let Some(first) = visible_traces.first() else {
         draw_status_label(painter, rect, "No channel loaded");
         return;
     };
-    let Some((time_min, time_max)) = first.envelope.time_range else {
+    let Some((time_min, time_max)) = trace_time_range(first) else {
         draw_status_label(painter, rect, "No time range available");
         return;
     };
 
-    let mut combined_value_range = None;
-    for visible in visible_envelopes {
-        if let Some((min, max)) = visible.envelope.value_range {
-            combined_value_range = extend_range(combined_value_range, min);
-            combined_value_range = extend_range(combined_value_range, max);
-        }
-    }
-    let Some((value_min, value_max)) = combined_value_range else {
+    let Some(auto_value_range) = combined_trace_value_range(visible_traces) else {
         draw_status_label(painter, rect, "No finite values available");
         return;
     };
@@ -1765,7 +2146,10 @@ fn draw_waveform_envelopes(
         return;
     }
 
-    let (value_min, value_max) = padded_range(value_min, value_max);
+    let Some((value_min, value_max)) = display_value_range(auto_value_range, y_range) else {
+        draw_status_label(painter, rect, "Invalid value range");
+        return;
+    };
     let value_span = value_max - value_min;
     if !value_span.is_finite() || value_span <= 0.0 {
         draw_status_label(painter, rect, "Invalid value range");
@@ -1781,33 +2165,160 @@ fn draw_waveform_envelopes(
         )
     };
 
-    for visible in visible_envelopes {
-        let vertical_stroke = egui::Stroke::new(1.0, visible.color.linear_multiply(0.45));
-        let line_stroke = egui::Stroke::new(1.25, visible.color);
-        let mut upper = Vec::with_capacity(visible.envelope.buckets.len());
-        let mut lower = Vec::with_capacity(visible.envelope.buckets.len());
-        for bucket in &visible.envelope.buckets {
-            let min_point = to_screen(bucket.time, f64::from(bucket.min));
-            let max_point = to_screen(bucket.time, f64::from(bucket.max));
-            painter.line_segment([min_point, max_point], vertical_stroke);
-            lower.push(min_point);
-            upper.push(max_point);
-        }
+    let trace_painter = painter.with_clip_rect(rect);
+    for visible in visible_traces {
+        let line_width = visible
+            .line_width
+            .clamp(MIN_TRACE_LINE_WIDTH, MAX_TRACE_LINE_WIDTH);
+        let vertical_stroke = egui::Stroke::new(
+            (line_width * 0.8).max(1.0),
+            visible.color.linear_multiply(0.45),
+        );
+        let line_stroke = egui::Stroke::new(line_width, visible.color);
 
-        if upper.len() >= 2 {
-            painter.line(upper, line_stroke);
-            painter.line(lower, line_stroke);
+        match &visible.data {
+            VisibleTraceData::Envelope(envelope) => {
+                let mut upper = Vec::with_capacity(envelope.buckets.len());
+                let mut lower = Vec::with_capacity(envelope.buckets.len());
+                for bucket in &envelope.buckets {
+                    let min_point = to_screen(bucket.time, f64::from(bucket.min));
+                    let max_point = to_screen(bucket.time, f64::from(bucket.max));
+                    trace_painter.line_segment([min_point, max_point], vertical_stroke);
+                    lower.push(min_point);
+                    upper.push(max_point);
+                }
+
+                if upper.len() >= 2 {
+                    trace_painter.line(upper, line_stroke);
+                    trace_painter.line(lower, line_stroke);
+                }
+            }
+            VisibleTraceData::RawStep(raw_step) => {
+                draw_raw_step_trace(
+                    &trace_painter,
+                    raw_step,
+                    line_stroke,
+                    (time_min, time_max),
+                    to_screen,
+                );
+            }
         }
     }
 
     draw_axis_labels(
         painter,
         rect,
-        visible_envelopes,
+        visible_traces,
         (time_min, time_max),
         (value_min, value_max),
         visuals,
     );
+}
+
+fn draw_raw_step_trace(
+    painter: &egui::Painter,
+    raw_step: &RawStepTrace,
+    stroke: egui::Stroke,
+    time_range: (f64, f64),
+    to_screen: impl Fn(f64, f64) -> egui::Pos2,
+) {
+    let Some(first) = raw_step.samples.first().copied() else {
+        return;
+    };
+
+    let mut points = Vec::with_capacity(raw_step.samples.len().saturating_mul(2).max(2));
+    points.push(to_screen(
+        first.time.max(time_range.0),
+        f64::from(first.value),
+    ));
+
+    let mut previous = first;
+    for current in raw_step.samples.iter().skip(1).copied() {
+        points.push(to_screen(current.time, f64::from(previous.value)));
+        points.push(to_screen(current.time, f64::from(current.value)));
+        previous = current;
+    }
+
+    if time_range.1 > previous.time {
+        points.push(to_screen(time_range.1, f64::from(previous.value)));
+    }
+
+    if points.len() >= 2 {
+        painter.line(points, stroke);
+    }
+}
+
+fn trace_time_range(trace: &VisibleTrace) -> Option<(f64, f64)> {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.time_range,
+        VisibleTraceData::RawStep(raw_step) => raw_step.time_range,
+    }
+}
+
+fn trace_value_range(trace: &VisibleTrace) -> Option<(f64, f64)> {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.value_range,
+        VisibleTraceData::RawStep(raw_step) => raw_step.value_range,
+    }
+}
+
+fn combined_trace_value_range(visible_traces: &[VisibleTrace]) -> Option<(f64, f64)> {
+    let mut combined_value_range = None;
+    for visible in visible_traces {
+        if let Some((min, max)) = trace_value_range(visible) {
+            combined_value_range = extend_range(combined_value_range, min);
+            combined_value_range = extend_range(combined_value_range, max);
+        }
+    }
+
+    combined_value_range
+}
+
+fn display_value_range(auto_value_range: (f64, f64), y_range: RowYRange) -> Option<(f64, f64)> {
+    match y_range.mode {
+        YRangeMode::Auto => Some(padded_range(auto_value_range.0, auto_value_range.1)),
+        YRangeMode::Manual => normalized_y_range(y_range.min, y_range.max),
+    }
+}
+
+fn normalized_y_range(min: f64, max: f64) -> Option<(f64, f64)> {
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+
+    if min == max {
+        return Some(padded_range(min, max));
+    }
+
+    Some((min.min(max), min.max(max)))
+}
+
+fn trace_source_sample_count(trace: &VisibleTrace) -> usize {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.source_sample_count,
+        VisibleTraceData::RawStep(raw_step) => raw_step.source_sample_count,
+    }
+}
+
+fn trace_bucket_count(trace: &VisibleTrace) -> usize {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.bucket_count(),
+        VisibleTraceData::RawStep(_) => 0,
+    }
+}
+
+fn trace_draw_point_count(trace: &VisibleTrace) -> usize {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.draw_point_count(),
+        VisibleTraceData::RawStep(raw_step) => raw_step.samples.len().saturating_mul(2),
+    }
+}
+
+fn trace_step_kind(trace: &VisibleTrace) -> Option<StepTraceKind> {
+    match &trace.data {
+        VisibleTraceData::RawStep(raw_step) => Some(raw_step.kind),
+        VisibleTraceData::Envelope(_) => None,
+    }
 }
 
 fn visible_envelope_bucket_count(rect: egui::Rect) -> usize {
@@ -1845,7 +2356,7 @@ fn channel_color(index: usize, dark_mode: bool) -> egui::Color32 {
 fn draw_axis_labels(
     painter: &egui::Painter,
     rect: egui::Rect,
-    visible_envelopes: &[VisibleEnvelope],
+    visible_traces: &[VisibleTrace],
     time_range: (f64, f64),
     value_range: (f64, f64),
     visuals: &egui::Visuals,
@@ -1853,7 +2364,7 @@ fn draw_axis_labels(
     let text_color = visuals.text_color();
     let weak_color = visuals.weak_text_color();
     let font = egui::FontId::monospace(12.0);
-    let channel_label = visible_envelopes
+    let channel_label = visible_traces
         .iter()
         .take(3)
         .map(|visible| {
@@ -1865,35 +2376,39 @@ fn draw_axis_labels(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let channel_label = if visible_envelopes.len() > 3 {
+    let channel_label = if visible_traces.len() > 3 {
         format!("{channel_label}, ...")
     } else {
         channel_label
     };
-    let source_sample_count = visible_envelopes
+    let source_sample_count = visible_traces
         .first()
-        .map(|visible| visible.envelope.source_sample_count)
+        .map(trace_source_sample_count)
         .unwrap_or_default();
-    let raw_sample_count = visible_envelopes
+    let raw_sample_count = visible_traces
         .first()
         .map(|visible| visible.sample_count)
         .unwrap_or_default();
-    let bucket_count: usize = visible_envelopes
+    let bucket_count: usize = visible_traces.iter().map(trace_bucket_count).sum();
+    let draw_point_count: usize = visible_traces.iter().map(trace_draw_point_count).sum();
+    let step_count = visible_traces
         .iter()
-        .map(|visible| visible.envelope.bucket_count())
-        .sum();
-    let draw_point_count: usize = visible_envelopes
+        .filter(|visible| visible.draw_mode == DrawMode::Step)
+        .count();
+    let edge_step_count = visible_traces
         .iter()
-        .map(|visible| visible.envelope.draw_point_count())
-        .sum();
+        .filter(|visible| trace_step_kind(visible) == Some(StepTraceKind::ChangePoints))
+        .count();
 
     painter.text(
         rect.left_top() + egui::vec2(0.0, -16.0),
         egui::Align2::LEFT_TOP,
         format!(
-            "{}  ch={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
+            "{}  ch={}  step={}  edge={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
             channel_label,
-            visible_envelopes.len(),
+            visible_traces.len(),
+            step_count,
+            edge_step_count,
             source_sample_count,
             raw_sample_count,
             bucket_count,
@@ -1930,6 +2445,153 @@ fn draw_axis_labels(
         font,
         weak_color,
     );
+}
+
+fn draw_hover_line(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    hover_x: Option<f64>,
+    time_range: Option<(f64, f64)>,
+    visuals: &egui::Visuals,
+) {
+    let Some(hover_x) = hover_x else {
+        return;
+    };
+    let Some(time_range) = time_range else {
+        return;
+    };
+    let Some(x) = plot_x_for_time(hover_x, rect, time_range) else {
+        return;
+    };
+
+    let stroke = egui::Stroke::new(1.25, visuals.selection.stroke.color);
+    painter.line_segment(
+        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+        stroke,
+    );
+}
+
+fn draw_hover_readout(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    hover_x: Option<f64>,
+    visuals: &egui::Visuals,
+    visible_traces: &[VisibleTrace],
+) {
+    let Some(hover_x) = hover_x else {
+        return;
+    };
+    let Some(hover_line_x) = visible_traces
+        .first()
+        .and_then(trace_time_range)
+        .and_then(|time_range| plot_x_for_time(hover_x, rect, time_range))
+    else {
+        return;
+    };
+
+    let values = visible_traces
+        .iter()
+        .filter_map(|trace| trace.hover_value.map(|value| (trace, value)))
+        .take(MAX_HOVER_READOUT_CHANNELS)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+
+    let extra_count = visible_traces
+        .iter()
+        .filter(|trace| trace.hover_value.is_some())
+        .count()
+        .saturating_sub(values.len());
+    let mut lines = Vec::with_capacity(values.len() + 2);
+    lines.push(format!("x {:.6} s", hover_x));
+    for (trace, value) in &values {
+        lines.push(format!(
+            "{}  {}",
+            compact_channel_label(trace_label(trace), 24),
+            format_hover_value(*value)
+        ));
+    }
+    if extra_count > 0 {
+        lines.push(format!("+{extra_count} more"));
+    }
+
+    let font = egui::FontId::monospace(11.0);
+    let line_height = 15.0;
+    let max_panel_width = (rect.width() - 8.0).max(64.0).min(340.0);
+    let panel_width = lines
+        .iter()
+        .map(|line| line.chars().count() as f32)
+        .fold(0.0, f32::max)
+        .mul_add(7.2, 18.0)
+        .clamp(64.0, max_panel_width);
+    let panel_height = lines.len() as f32 * line_height + 12.0;
+    let panel_left = if hover_line_x < rect.center().x {
+        rect.right() - panel_width - 8.0
+    } else {
+        rect.left() + 8.0
+    }
+    .max(rect.left() + 4.0)
+    .min(rect.right() - panel_width - 4.0);
+    let panel_top = rect.top() + 8.0;
+    let panel_rect = egui::Rect::from_min_size(
+        egui::pos2(panel_left, panel_top),
+        egui::vec2(panel_width, panel_height),
+    );
+    let fill = if visuals.dark_mode {
+        egui::Color32::from_black_alpha(190)
+    } else {
+        egui::Color32::from_white_alpha(220)
+    };
+    painter.rect_filled(panel_rect, 3.0, fill);
+    painter.rect_stroke(
+        panel_rect,
+        3.0,
+        egui::Stroke::new(1.0, visuals.widgets.noninteractive.fg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+
+    let text_color = visuals.text_color();
+    let mut y = panel_rect.top() + 6.0;
+    painter.text(
+        egui::pos2(panel_rect.left() + 8.0, y),
+        egui::Align2::LEFT_TOP,
+        &lines[0],
+        font.clone(),
+        text_color,
+    );
+    y += line_height;
+
+    for ((trace, _), line) in values.iter().zip(lines.iter().skip(1)) {
+        let swatch_y = y + line_height * 0.5;
+        painter.line_segment(
+            [
+                egui::pos2(panel_rect.left() + 8.0, swatch_y),
+                egui::pos2(panel_rect.left() + 18.0, swatch_y),
+            ],
+            egui::Stroke::new(2.0, trace.color),
+        );
+        painter.text(
+            egui::pos2(panel_rect.left() + 24.0, y),
+            egui::Align2::LEFT_TOP,
+            line,
+            font.clone(),
+            text_color,
+        );
+        y += line_height;
+    }
+
+    if extra_count > 0
+        && let Some(extra_line) = lines.last()
+    {
+        painter.text(
+            egui::pos2(panel_rect.left() + 24.0, y),
+            egui::Align2::LEFT_TOP,
+            extra_line,
+            font,
+            visuals.weak_text_color(),
+        );
+    }
 }
 
 fn draw_row_marker(
@@ -1984,6 +2646,129 @@ fn draw_status_label(painter: &egui::Painter, rect: egui::Rect, label: &str) {
     );
 }
 
+fn hover_value_at_time(
+    time: &[f64],
+    values: &[f32],
+    target_time: f64,
+    draw_mode: DrawMode,
+) -> Option<f32> {
+    match draw_mode {
+        DrawMode::Line => nearest_sample_value(time, values, target_time),
+        DrawMode::Step => step_sample_value_at_time(time, values, target_time),
+    }
+}
+
+fn nearest_sample_value(time: &[f64], values: &[f32], target_time: f64) -> Option<f32> {
+    if !target_time.is_finite() {
+        return None;
+    }
+
+    let sample_count = time.len().min(values.len());
+    if sample_count == 0 {
+        return None;
+    }
+
+    let insertion_index =
+        time[..sample_count].partition_point(|sample_time| *sample_time < target_time);
+    let candidates = [
+        insertion_index.checked_sub(1),
+        (insertion_index < sample_count).then_some(insertion_index),
+    ];
+    let mut best = None;
+
+    for index in candidates.into_iter().flatten() {
+        let sample_time = time[index];
+        let value = values[index];
+        if !sample_time.is_finite() || !value.is_finite() {
+            continue;
+        }
+
+        let distance = (sample_time - target_time).abs();
+        match best {
+            Some((best_distance, _)) if best_distance <= distance => {}
+            _ => best = Some((distance, value)),
+        }
+    }
+
+    best.map(|(_, value)| value)
+}
+
+fn step_sample_value_at_time(time: &[f64], values: &[f32], target_time: f64) -> Option<f32> {
+    if !target_time.is_finite() {
+        return None;
+    }
+
+    let sample_count = time.len().min(values.len());
+    if sample_count == 0 {
+        return None;
+    }
+
+    let index = time[..sample_count]
+        .partition_point(|sample_time| *sample_time <= target_time)
+        .saturating_sub(1)
+        .min(sample_count - 1);
+    let sample_time = time[index];
+    let value = values[index];
+    (sample_time.is_finite() && value.is_finite()).then_some(value)
+}
+
+fn time_at_plot_x(x: f32, rect: egui::Rect, time_range: (f64, f64)) -> Option<f64> {
+    let (start, end) = normalized_range(time_range)?;
+    if rect.width() <= 1.0 {
+        return None;
+    }
+
+    let ratio = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+    Some(start + (end - start) * ratio)
+}
+
+fn plot_x_for_time(time: f64, rect: egui::Rect, time_range: (f64, f64)) -> Option<f32> {
+    let (start, end) = normalized_range(time_range)?;
+    if !time.is_finite() || rect.width() <= 1.0 {
+        return None;
+    }
+
+    let ratio = ((time - start) / (end - start)) as f32;
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return None;
+    }
+
+    Some(egui::lerp(rect.left()..=rect.right(), ratio))
+}
+
+fn trace_label(trace: &VisibleTrace) -> &str {
+    if trace.channel_name.is_empty() {
+        trace.channel_path.as_str()
+    } else {
+        trace.channel_name.as_str()
+    }
+}
+
+fn compact_channel_label(label: &str, max_chars: usize) -> String {
+    let char_count = label.chars().count();
+    if char_count <= max_chars {
+        return label.to_owned();
+    }
+
+    if max_chars <= 3 {
+        return label.chars().take(max_chars).collect();
+    }
+
+    let mut compact = label.chars().take(max_chars - 3).collect::<String>();
+    compact.push_str("...");
+    compact
+}
+
+fn format_hover_value(value: f32) -> String {
+    let value = f64::from(value);
+    let abs = value.abs();
+    if value == 0.0 || (1.0e-3..1.0e5).contains(&abs) {
+        format!("{value:.6}")
+    } else {
+        format!("{value:.6e}")
+    }
+}
+
 fn format_range(range: Option<(f64, f64)>) -> String {
     match range {
         Some((start, end)) => format!("{start:.6} .. {end:.6}"),
@@ -2014,6 +2799,157 @@ fn extend_range(range: Option<(f64, f64)>, value: f64) -> Option<(f64, f64)> {
         Some((min, max)) => Some((min.min(value), max.max(value))),
         None => Some((value, value)),
     }
+}
+
+fn build_raw_step_trace(
+    time: &[f64],
+    values: &[f32],
+    time_range: (f64, f64),
+    max_samples: usize,
+) -> Option<RawStepTrace> {
+    let (range_start, range_end) = normalized_range(time_range)?;
+    let sample_count = time.len().min(values.len());
+    if sample_count == 0 {
+        return None;
+    }
+
+    let start = time
+        .partition_point(|time| *time < range_start)
+        .min(sample_count);
+    let end = time
+        .partition_point(|time| *time <= range_end)
+        .min(sample_count);
+    let context_start = start.saturating_sub(usize::from(start > 0));
+    let source_sample_count = end.saturating_sub(start);
+    let draw_sample_count = end.saturating_sub(context_start);
+    if draw_sample_count == 0 || draw_sample_count > max_samples {
+        return None;
+    }
+
+    let mut samples = Vec::with_capacity(draw_sample_count);
+    let mut value_range = None;
+
+    if context_start < start {
+        let value = values[context_start];
+        if value.is_finite() {
+            samples.push(StepSample {
+                time: range_start,
+                value,
+            });
+            value_range = extend_range(value_range, f64::from(value));
+        }
+    }
+
+    for index in start..end {
+        let sample_time = time[index];
+        let value = values[index];
+        if !sample_time.is_finite() || !value.is_finite() {
+            continue;
+        }
+
+        samples.push(StepSample {
+            time: sample_time.clamp(range_start, range_end),
+            value,
+        });
+        value_range = extend_range(value_range, f64::from(value));
+    }
+
+    if samples.is_empty() || value_range.is_none() {
+        return None;
+    }
+
+    Some(RawStepTrace {
+        samples,
+        source_sample_count,
+        time_range: Some((range_start, range_end)),
+        value_range,
+        kind: StepTraceKind::RawSamples,
+    })
+}
+
+fn build_change_point_step_trace(
+    time: &[f64],
+    values: &[f32],
+    time_range: (f64, f64),
+    max_change_points: usize,
+) -> Option<RawStepTrace> {
+    let (range_start, range_end) = normalized_range(time_range)?;
+    let sample_count = time.len().min(values.len());
+    if sample_count == 0 {
+        return None;
+    }
+
+    let start = time
+        .partition_point(|time| *time < range_start)
+        .min(sample_count);
+    let end = time
+        .partition_point(|time| *time <= range_end)
+        .min(sample_count);
+    let context_start = start.saturating_sub(usize::from(start > 0));
+    let source_sample_count = end.saturating_sub(start);
+    if end.saturating_sub(context_start) == 0 {
+        return None;
+    }
+
+    let mut samples = Vec::new();
+    let mut value_range = None;
+    let mut previous_value = None;
+    let mut change_points = 0usize;
+
+    if context_start < start {
+        let value = values[context_start];
+        if value.is_finite() {
+            samples.push(StepSample {
+                time: range_start,
+                value,
+            });
+            value_range = extend_range(value_range, f64::from(value));
+            previous_value = Some(value);
+        }
+    }
+
+    for index in start..end {
+        let sample_time = time[index];
+        let value = values[index];
+        if !sample_time.is_finite() || !value.is_finite() {
+            continue;
+        }
+
+        value_range = extend_range(value_range, f64::from(value));
+        match previous_value {
+            Some(previous) if previous == value => {}
+            Some(_) => {
+                if change_points >= max_change_points {
+                    return None;
+                }
+                samples.push(StepSample {
+                    time: sample_time.clamp(range_start, range_end),
+                    value,
+                });
+                previous_value = Some(value);
+                change_points += 1;
+            }
+            None => {
+                samples.push(StepSample {
+                    time: sample_time.clamp(range_start, range_end),
+                    value,
+                });
+                previous_value = Some(value);
+            }
+        }
+    }
+
+    if samples.is_empty() || value_range.is_none() {
+        return None;
+    }
+
+    Some(RawStepTrace {
+        samples,
+        source_sample_count,
+        time_range: Some((range_start, range_end)),
+        value_range,
+        kind: StepTraceKind::ChangePoints,
+    })
 }
 
 fn min_view_span(full_range: (f64, f64), sample_count: usize) -> f64 {
@@ -2123,8 +3059,17 @@ mod app_tests {
         assert!(added_first);
         assert_eq!(first_row_id, 0);
         assert_eq!(view.rows[0].channels.len(), 1);
+        assert_eq!(view.rows[0].y_range.mode, YRangeMode::Auto);
+        assert_eq!(view.rows[0].channels[0].draw_mode, DrawMode::Line);
+        assert!(view.rows[0].channels[0].visible);
+        assert_eq!(
+            view.rows[0].channels[0].line_width,
+            DEFAULT_TRACE_LINE_WIDTH
+        );
+        assert_eq!(view.rows[0].channels[0].color_override, None);
 
         let second_row_id = view.add_row();
+        assert_eq!(view.rows[1].y_range, RowYRange::default());
         let (added_second, target_row_id) = view.add_channel_to_selected_row("pwm_1kHz");
         assert!(added_second);
         assert_eq!(target_row_id, second_row_id);
@@ -2152,6 +3097,133 @@ mod app_tests {
         assert!(added_first);
         assert!(!added_duplicate);
         assert_eq!(view.rows[0].channels.len(), 1);
+    }
+
+    #[test]
+    fn hidden_channels_are_not_counted_as_visible() {
+        let mut view = ViewState::default();
+        let (added, _) = view.add_channel_to_selected_row("sine_50Hz");
+        assert!(added);
+        assert!(view.has_visible_channels());
+
+        view.rows[0].channels[0].visible = false;
+
+        assert!(!view.has_visible_channels());
+    }
+
+    #[test]
+    fn converts_plot_x_to_time_with_clamping() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(100.0, 50.0));
+
+        assert_eq!(time_at_plot_x(10.0, rect, (2.0, 12.0)), Some(2.0));
+        assert_eq!(time_at_plot_x(60.0, rect, (2.0, 12.0)), Some(7.0));
+        assert_eq!(time_at_plot_x(120.0, rect, (2.0, 12.0)), Some(12.0));
+    }
+
+    #[test]
+    fn line_hover_uses_nearest_sample_value() {
+        let time = [0.0, 1.0, 2.0, 3.0];
+        let values = [0.0, 10.0, 20.0, 30.0];
+
+        assert_eq!(
+            hover_value_at_time(&time, &values, 1.6, DrawMode::Line),
+            Some(20.0)
+        );
+        assert_eq!(
+            hover_value_at_time(&time, &values, 1.5, DrawMode::Line),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn step_hover_uses_held_sample_value() {
+        let time = [0.0, 1.0, 2.0, 3.0];
+        let values = [0.0, 10.0, 20.0, 30.0];
+
+        assert_eq!(
+            hover_value_at_time(&time, &values, 1.9, DrawMode::Step),
+            Some(10.0)
+        );
+        assert_eq!(
+            hover_value_at_time(&time, &values, 2.0, DrawMode::Step),
+            Some(20.0)
+        );
+    }
+
+    #[test]
+    fn auto_y_range_uses_padded_trace_range() {
+        let range = display_value_range((1.0, 3.0), RowYRange::default()).expect("auto y range");
+
+        assert!((range.0 - 0.9).abs() < 1.0e-12);
+        assert!((range.1 - 3.1).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn manual_y_range_uses_row_values_without_padding() {
+        let range = display_value_range(
+            (-10.0, 10.0),
+            RowYRange {
+                mode: YRangeMode::Manual,
+                min: -2.5,
+                max: 7.5,
+                ..RowYRange::default()
+            },
+        )
+        .expect("manual y range");
+
+        assert_eq!(range, (-2.5, 7.5));
+    }
+
+    #[test]
+    fn manual_y_range_accepts_reversed_inputs() {
+        let range = display_value_range(
+            (-10.0, 10.0),
+            RowYRange {
+                mode: YRangeMode::Manual,
+                min: 5.0,
+                max: -1.0,
+                ..RowYRange::default()
+            },
+        )
+        .expect("manual y range");
+
+        assert_eq!(range, (-1.0, 5.0));
+    }
+
+    #[test]
+    fn manual_y_range_seeds_from_last_auto_range() {
+        let mut y_range = RowYRange::default();
+        y_range.set_last_auto((-2.0, 4.0));
+
+        y_range.set_manual_from_last_auto();
+
+        assert_eq!(y_range.mode, YRangeMode::Manual);
+        assert_eq!((y_range.min, y_range.max), (-2.0, 4.0));
+    }
+
+    #[test]
+    fn manual_y_range_seed_falls_back_to_default_without_auto_range() {
+        let mut y_range = RowYRange::default();
+
+        y_range.set_manual_from_last_auto();
+
+        assert_eq!(y_range.mode, YRangeMode::Manual);
+        assert_eq!((y_range.min, y_range.max), (-1.0, 1.0));
+    }
+
+    #[test]
+    fn manual_y_range_reset_uses_latest_auto_range() {
+        let mut y_range = RowYRange::default();
+        y_range.set_last_auto((-2.0, 4.0));
+        y_range.set_manual_from_last_auto();
+        y_range.min = -10.0;
+        y_range.max = 10.0;
+        y_range.set_last_auto((-0.5, 0.5));
+
+        y_range.set_manual_from_last_auto();
+
+        assert_eq!(y_range.mode, YRangeMode::Manual);
+        assert_eq!((y_range.min, y_range.max), (-0.5, 0.5));
     }
 
     #[test]
@@ -2185,5 +3257,103 @@ mod app_tests {
             assert!(plot.height() > 0.0);
             assert!(outer.contains_rect(row));
         }
+    }
+
+    #[test]
+    fn builds_raw_step_trace_with_previous_state_at_range_start() {
+        let time = [0.0, 1.0, 2.0, 3.0];
+        let values = [0.0, 1.0, 0.0, 1.0];
+
+        let trace = build_raw_step_trace(&time, &values, (1.5, 2.5), 10).expect("raw step trace");
+
+        assert_eq!(trace.source_sample_count, 1);
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 1.5,
+                    value: 1.0,
+                },
+                StepSample {
+                    time: 2.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 1.0)));
+    }
+
+    #[test]
+    fn raw_step_trace_respects_sample_limit() {
+        let time = [0.0, 1.0, 2.0, 3.0];
+        let values = [0.0, 1.0, 0.0, 1.0];
+
+        let trace = build_raw_step_trace(&time, &values, (0.0, 3.0), 2);
+
+        assert!(trace.is_none());
+    }
+
+    #[test]
+    fn change_point_step_trace_preserves_edges_when_sample_count_is_high() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let values = [0.0, 0.0, 0.0, 5.0, 5.0, 0.0, 0.0];
+
+        let trace = build_change_point_step_trace(&time, &values, (0.0, 6.0), 3)
+            .expect("change-point step trace");
+
+        assert_eq!(trace.kind, StepTraceKind::ChangePoints);
+        assert_eq!(trace.source_sample_count, 7);
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 0.0,
+                    value: 0.0,
+                },
+                StepSample {
+                    time: 3.0,
+                    value: 5.0,
+                },
+                StepSample {
+                    time: 5.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 5.0)));
+    }
+
+    #[test]
+    fn change_point_step_trace_carries_previous_state_at_range_start() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 5.0, 5.0, 0.0, 0.0];
+
+        let trace = build_change_point_step_trace(&time, &values, (2.5, 4.0), 3)
+            .expect("change-point step trace");
+
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 2.5,
+                    value: 5.0,
+                },
+                StepSample {
+                    time: 3.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 5.0)));
+    }
+
+    #[test]
+    fn change_point_step_trace_respects_change_limit() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 1.0, 0.0, 1.0, 0.0];
+
+        let trace = build_change_point_step_trace(&time, &values, (0.0, 4.0), 2);
+
+        assert!(trace.is_none());
     }
 }

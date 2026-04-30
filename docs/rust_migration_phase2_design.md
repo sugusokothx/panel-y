@@ -292,6 +292,19 @@ UI実装の優先:
 - 2026-04-30: P2-04/P2-05手動確認完了。複数行にわたるDelete/Remove、pan/zoom/resetの全row同期は軽快で問題なし
 - 2026-04-30: 行数増加時の見切れ対策として、左ペインを縦スクロール化し、波形ペインもrow最小高を維持して縦スクロールできるようにした
 - 2026-04-30: UI改善候補として、波形エリアのX zoomを `Ctrl + ホイール`、波形側の縦移動をホイールのみへ分離する案を記録した。性能検証段階では現仕様のまま進める
+- 2026-04-30: P2-06a実装。`RowChannel` に `Line` / `Step` の表示モードを追加し、row内channelごとに切替UIを追加した。Stepは低密度表示範囲ではraw sampleから正確な階段描画を行い、高密度では既存min/max envelopeへfallbackする
+- 2026-04-30: P2-06a GUI確認。`pwm_1kHz` / `noise` で拡大状態のLine/Step切替はOK。エッジ位置検証用に `step_validation_100k.parquet` 生成スクリプトを追加した
+- 2026-04-30: `step_validation_100k.parquet` の `pwm_1kHz` / `pwm_1kHz_delay_1sample` / `pwm_1kHz_advance_1sample` でLine/Step表示を確認し、1サンプル進み/遅れの相対関係が正確であることを確認した
+- 2026-04-30: P2-06b実装。高密度Stepでも値の変化点数が `MAX_STEP_CHANGE_POINTS` 以下なら change-point Step として正確なエッジ時刻を保持し、変化点が多すぎる場合だけmin/max envelopeへfallbackするようにした。`gate_pwm` / `pwm_10kHz` では中域ズームで変化点保持が必要なことを確認した
+- 2026-04-30: P2-06b GUI確認。`gate_pwm` のStep表示で、change-point Step対象範囲とmin/max envelope fallback範囲のどちらも見え方に違和感がないことを確認した
+- 2026-04-30: P2-07実装。row内channelごとにvisible、color override、line widthを編集できるようにし、hidden channelは描画・Y auto range・表示ステータス集計から外れるようにした
+- 2026-04-30: P2-07 GUI確認。visible ON/OFF、line width即時反映、custom color / resetが期待通り動作することを確認した
+- 2026-04-30: P2-09実装。hover X位置を `ViewState` で共有し、全rowへの縦ライン表示とvisible channelの値readoutを追加した。Lineはnearest sample、Stepはsample-and-hold値を表示する
+- 2026-04-30: P2-09 GUI確認完了。`test_100k.parquet` / `panely_large_10s_1mhz_9ch.parquet` で複数row hover、Line/Step値表示、hidden channel除外、plot外hover clear、左右readout位置切替、更新レスポンスが期待通り動作することを確認した
+- 2026-04-30: P2-08実装。`PlotRow` にAuto/ManualのY軸範囲設定を追加し、rowごとのmin/max入力とmanual range描画に対応した。Manual時はplot rectでtraceをclipする
+- 2026-04-30: P2-08 GUI確認完了。Manual min/max反映、初期値/Reset時の `-1..1` 復帰、Manual設定中にchannelをhiddenにしてもplot min/maxがmanual設定を保持することを確認した
+- 2026-04-30: P2-08改善。Manual切替時とManual Reset時のmin/maxを固定 `-1..1` ではなく直近のAuto表示Y範囲から初期化するように変更した。Auto範囲が未取得の場合だけ `-1..1` にfallbackする
+- 2026-04-30: P2-08改善GUI確認完了。Manual切替時の初期値とReset時に直近Auto範囲へ戻る動きが問題ないことを確認した
 
 ---
 

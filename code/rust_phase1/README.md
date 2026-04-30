@@ -66,6 +66,26 @@ The large-data target is:
 ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet
 ```
 
+For Step rendering edge-position checks, generate:
+
+```bash
+../.venv/bin/python ../proto_3_1b/generate_step_validation_data.py
+```
+
+Then load:
+
+```text
+../proto_3_1b/data/step_validation_100k.parquet
+```
+
+Channels:
+
+```text
+pwm_1kHz
+pwm_1kHz_delay_1sample
+pwm_1kHz_advance_1sample
+```
+
 ## Current State
 
 - `eframe` app shell is in place.
@@ -77,3 +97,7 @@ The large-data target is:
 - Full-range min/max envelope drawing is in place for the selected channel.
 - X-axis pan/zoom is in place for the selected channel.
 - The visible X range is re-extracted into a min/max envelope sized to the current plot width.
+- Step mode uses exact raw samples at low density, exact change points when sample density is high but edge count is still bounded, and min/max envelope only when there are too many changes to draw directly.
+- Row channels can be hidden and styled with per-row color overrides and line widths.
+- Hover X is synchronized across rows, with a vertical hover line and visible-channel value readout.
+- Rows support auto or manual Y ranges with per-row min/max controls seeded from the latest auto range.
