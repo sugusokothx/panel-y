@@ -104,8 +104,45 @@ impl WaveformData {
     }
 
     pub fn min_max_envelope(&self, requested_bucket_count: usize) -> MinMaxEnvelope {
+        self.min_max_envelope_for_indices(
+            0,
+            self.sample_count(),
+            requested_bucket_count,
+            self.time_range(),
+        )
+    }
+
+    pub fn min_max_envelope_for_range(
+        &self,
+        time_range: (f64, f64),
+        requested_bucket_count: usize,
+    ) -> MinMaxEnvelope {
+        let Some((range_start, range_end)) = normalized_time_range(time_range) else {
+            return empty_envelope(requested_bucket_count, None, Instant::now());
+        };
+
+        let start = self.time.partition_point(|time| *time < range_start);
+        let end = self.time.partition_point(|time| *time <= range_end);
+
+        self.min_max_envelope_for_indices(
+            start.min(self.sample_count()),
+            end.min(self.sample_count()),
+            requested_bucket_count,
+            Some((range_start, range_end)),
+        )
+    }
+
+    fn min_max_envelope_for_indices(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        requested_bucket_count: usize,
+        time_range: Option<(f64, f64)>,
+    ) -> MinMaxEnvelope {
         let started = Instant::now();
-        let source_sample_count = self.sample_count();
+        let start_index = start_index.min(self.sample_count());
+        let end_index = end_index.min(self.sample_count()).max(start_index);
+        let source_sample_count = end_index - start_index;
         let target_bucket_count = requested_bucket_count
             .max(1)
             .min(source_sample_count.max(1));
@@ -113,9 +150,9 @@ impl WaveformData {
         let mut buckets = Vec::with_capacity(target_bucket_count);
         let mut value_range = None;
 
-        let mut start = 0;
-        while start < source_sample_count {
-            let end = (start + bucket_size).min(source_sample_count);
+        let mut start = start_index;
+        while start < end_index {
+            let end = (start + bucket_size).min(end_index);
             if let Some(bucket) = self.envelope_bucket(start, end) {
                 value_range = update_range(value_range, f64::from(bucket.min));
                 value_range = update_range(value_range, f64::from(bucket.max));
@@ -129,7 +166,7 @@ impl WaveformData {
             source_sample_count,
             requested_bucket_count,
             bucket_size,
-            time_range: self.time_range(),
+            time_range,
             value_range,
             elapsed: started.elapsed(),
         }
@@ -161,6 +198,34 @@ impl WaveformData {
         }
 
         Some(EnvelopeBucket { time, min, max })
+    }
+}
+
+fn normalized_time_range((start, end): (f64, f64)) -> Option<(f64, f64)> {
+    if !start.is_finite() || !end.is_finite() {
+        return None;
+    }
+
+    match start.partial_cmp(&end)? {
+        std::cmp::Ordering::Less => Some((start, end)),
+        std::cmp::Ordering::Greater => Some((end, start)),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+fn empty_envelope(
+    requested_bucket_count: usize,
+    time_range: Option<(f64, f64)>,
+    started: Instant,
+) -> MinMaxEnvelope {
+    MinMaxEnvelope {
+        buckets: Vec::new(),
+        source_sample_count: 0,
+        requested_bucket_count,
+        bucket_size: 1,
+        time_range,
+        value_range: None,
+        elapsed: started.elapsed(),
     }
 }
 
@@ -417,5 +482,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn builds_time_range_min_max_envelope() {
+        let data = WaveformData {
+            path: PathBuf::new(),
+            channel_name: "ch".to_owned(),
+            channel_path: "ch".to_owned(),
+            time: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            values: vec![1.0, 3.0, -1.0, 4.0, 2.0, 5.0, 0.0],
+            projected_column_indices: [0, 1],
+            elapsed: Duration::ZERO,
+        };
+
+        let envelope = data.min_max_envelope_for_range((1.5, 4.5), 2);
+
+        assert_eq!(envelope.time_range, Some((1.5, 4.5)));
+        assert_eq!(envelope.source_sample_count, 3);
+        assert_eq!(envelope.bucket_size, 2);
+        assert_eq!(envelope.bucket_count(), 2);
+        assert_eq!(envelope.value_range, Some((-1.0, 4.0)));
+        assert_eq!(
+            envelope.buckets,
+            vec![
+                EnvelopeBucket {
+                    time: 2.5,
+                    min: -1.0,
+                    max: 4.0,
+                },
+                EnvelopeBucket {
+                    time: 4.0,
+                    min: 2.0,
+                    max: 2.0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_reversed_time_range_for_envelope() {
+        let data = WaveformData {
+            path: PathBuf::new(),
+            channel_name: "ch".to_owned(),
+            channel_path: "ch".to_owned(),
+            time: vec![0.0, 1.0, 2.0],
+            values: vec![1.0, 2.0, 3.0],
+            projected_column_indices: [0, 1],
+            elapsed: Duration::ZERO,
+        };
+
+        let envelope = data.min_max_envelope_for_range((2.0, 0.0), 8);
+
+        assert_eq!(envelope.time_range, Some((0.0, 2.0)));
+        assert_eq!(envelope.source_sample_count, 3);
+        assert_eq!(envelope.bucket_count(), 3);
     }
 }
