@@ -3,8 +3,8 @@ project: Panel_y
 doc_type: 移植計画書
 target: Rust版 波形ビューア
 created: "2026-04-27"
-updated: "2026-04-27"
-status: 計画中
+updated: "2026-04-30"
+status: Phase 2準備
 source_proto: "code/proto_3_1b"
 ---
 
@@ -157,7 +157,11 @@ Analysis Layer
 
 ### Phase 1: Rust縦切りプロトタイプ
 
+状態: Phase 2移行可
+
 目的: 技術リスクが最も高い「大容量データ読み込み + 描画 + ズーム」を先に検証する。
+
+評価結果: [rust_migration_phase1_evaluation.md](rust_migration_phase1_evaluation.md)
 
 最小機能:
 
@@ -194,7 +198,11 @@ Analysis Layer
 
 ### Phase 2: 波形ビューア基本機能の移植
 
+状態: 着手前
+
 目的: `proto_3_1b` のビューアとしての主要操作をRust版に移す。
+
+設計方針: [rust_migration_phase2_design.md](rust_migration_phase2_design.md)
 
 移植対象:
 
