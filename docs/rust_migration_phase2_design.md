@@ -292,6 +292,9 @@ UI実装の優先:
 - 2026-04-30: P2-04/P2-05手動確認完了。複数行にわたるDelete/Remove、pan/zoom/resetの全row同期は軽快で問題なし
 - 2026-04-30: 行数増加時の見切れ対策として、左ペインを縦スクロール化し、波形ペインもrow最小高を維持して縦スクロールできるようにした
 - 2026-04-30: UI改善候補として、波形エリアのX zoomを `Ctrl + ホイール`、波形側の縦移動をホイールのみへ分離する案を記録した。性能検証段階では現仕様のまま進める
+- 2026-04-30: P2-06a実装。`RowChannel` に `Line` / `Step` の表示モードを追加し、row内channelごとに切替UIを追加した。Stepは低密度表示範囲ではraw sampleから正確な階段描画を行い、高密度では既存min/max envelopeへfallbackする
+- 2026-04-30: P2-06a GUI確認。`pwm_1kHz` / `noise` で拡大状態のLine/Step切替はOK。エッジ位置検証用に `step_validation_100k.parquet` 生成スクリプトを追加した
+- 2026-04-30: `step_validation_100k.parquet` の `pwm_1kHz` / `pwm_1kHz_delay_1sample` / `pwm_1kHz_advance_1sample` でLine/Step表示を確認し、1サンプル進み/遅れの相対関係が正確であることを確認した
 
 ---
 

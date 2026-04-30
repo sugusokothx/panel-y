@@ -14,6 +14,7 @@ const STRESS_RANGE_RUNS: usize = 1_000;
 const STRESS_REPORT_BLOCKS: usize = 5;
 const MIN_WAVEFORM_ROW_HEIGHT: f32 = 180.0;
 const WAVEFORM_ROW_GAP: f32 = 10.0;
+const MAX_EXACT_STEP_SAMPLES: usize = 12_000;
 
 fn main() -> eframe::Result {
     if let Some(command) = cli_command_arg() {
@@ -178,6 +179,13 @@ struct PlotRow {
 struct RowChannel {
     channel_path: String,
     color_index: usize,
+    draw_mode: DrawMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrawMode {
+    Line,
+    Step,
 }
 
 #[derive(Debug, Default)]
@@ -203,19 +211,40 @@ struct EnvelopeKey {
 }
 
 #[derive(Clone, Debug)]
-struct VisibleEnvelope {
+struct VisibleTrace {
     channel_name: String,
     channel_path: String,
     sample_count: usize,
     color: egui::Color32,
-    envelope: parquet_waveform::MinMaxEnvelope,
+    draw_mode: DrawMode,
+    data: VisibleTraceData,
+}
+
+#[derive(Clone, Debug)]
+enum VisibleTraceData {
+    Envelope(parquet_waveform::MinMaxEnvelope),
+    RawStep(RawStepTrace),
+}
+
+#[derive(Clone, Debug)]
+struct RawStepTrace {
+    samples: Vec<StepSample>,
+    source_sample_count: usize,
+    time_range: Option<(f64, f64)>,
+    value_range: Option<(f64, f64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepSample {
+    time: f64,
+    value: f32,
 }
 
 #[derive(Debug)]
-struct VisibleRowEnvelope {
+struct VisibleRowTrace {
     row_id: u64,
     row_index: usize,
-    envelopes: Vec<VisibleEnvelope>,
+    traces: Vec<VisibleTrace>,
 }
 
 impl Default for PanelYApp {
@@ -261,6 +290,17 @@ impl Default for LoadState {
             pending_jobs: 0,
             progress: None,
             error: None,
+        }
+    }
+}
+
+impl DrawMode {
+    const ALL: [Self; 2] = [Self::Line, Self::Step];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Line => "Line",
+            Self::Step => "Step",
         }
     }
 }
@@ -382,6 +422,7 @@ impl ViewState {
         row.channels.push(RowChannel {
             channel_path: channel_path.to_owned(),
             color_index: row.channels.len(),
+            draw_mode: DrawMode::Line,
         });
         (true, row.id)
     }
@@ -1073,11 +1114,11 @@ impl PanelYApp {
         self.dataset.loaded_channels.clear_envelope_cache();
     }
 
-    fn visible_row_envelopes(
+    fn visible_row_traces(
         &mut self,
         requested_bucket_count: usize,
         dark_mode: bool,
-    ) -> Vec<VisibleRowEnvelope> {
+    ) -> Vec<VisibleRowTrace> {
         let rows = self.view.rows.clone();
         if rows.is_empty() {
             return Vec::new();
@@ -1087,10 +1128,10 @@ impl PanelYApp {
             return rows
                 .into_iter()
                 .enumerate()
-                .map(|(row_index, row)| VisibleRowEnvelope {
+                .map(|(row_index, row)| VisibleRowTrace {
                     row_id: row.id,
                     row_index,
-                    envelopes: Vec::new(),
+                    traces: Vec::new(),
                 })
                 .collect();
         };
@@ -1100,10 +1141,10 @@ impl PanelYApp {
             return rows
                 .into_iter()
                 .enumerate()
-                .map(|(row_index, row)| VisibleRowEnvelope {
+                .map(|(row_index, row)| VisibleRowTrace {
                     row_id: row.id,
                     row_index,
-                    envelopes: Vec::new(),
+                    traces: Vec::new(),
                 })
                 .collect();
         };
@@ -1121,6 +1162,7 @@ impl PanelYApp {
 
         let mut visible_rows = Vec::with_capacity(rows.len());
         let mut built_count = 0usize;
+        let mut exact_step_count = 0usize;
         {
             let dataset = &mut self.dataset;
             let Some(shared_time) = dataset.shared_time.as_ref() else {
@@ -1131,7 +1173,7 @@ impl PanelYApp {
             loaded_channels.prepare_envelope_context(view_range, requested_bucket_count);
 
             for (row_index, row) in rows.into_iter().enumerate() {
-                let mut envelopes = Vec::with_capacity(row.channels.len());
+                let mut traces = Vec::with_capacity(row.channels.len());
                 for row_channel in row.channels {
                     let Some((channel_name, channel_path, sample_count)) = loaded_channels
                         .channel(&row_channel.channel_path)
@@ -1146,54 +1188,89 @@ impl PanelYApp {
                         continue;
                     };
 
-                    let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
-                        &channel_path,
-                        time_values,
-                        view_range,
-                        requested_bucket_count,
-                    ) else {
-                        continue;
+                    let data = match row_channel.draw_mode {
+                        DrawMode::Line => {
+                            let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
+                                &channel_path,
+                                time_values,
+                                view_range,
+                                requested_bucket_count,
+                            ) else {
+                                continue;
+                            };
+                            if was_built {
+                                built_count += 1;
+                            }
+                            VisibleTraceData::Envelope(envelope)
+                        }
+                        DrawMode::Step => {
+                            if let Some(raw_step) =
+                                loaded_channels.channel(&channel_path).and_then(|channel| {
+                                    build_raw_step_trace(
+                                        time_values,
+                                        &channel.values,
+                                        view_range,
+                                        MAX_EXACT_STEP_SAMPLES,
+                                    )
+                                })
+                            {
+                                exact_step_count += 1;
+                                VisibleTraceData::RawStep(raw_step)
+                            } else {
+                                let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
+                                    &channel_path,
+                                    time_values,
+                                    view_range,
+                                    requested_bucket_count,
+                                ) else {
+                                    continue;
+                                };
+                                if was_built {
+                                    built_count += 1;
+                                }
+                                VisibleTraceData::Envelope(envelope)
+                            }
+                        }
                     };
 
-                    if was_built {
-                        built_count += 1;
-                    }
-                    envelopes.push(VisibleEnvelope {
+                    traces.push(VisibleTrace {
                         channel_name,
                         channel_path,
                         sample_count,
                         color: channel_color(row_channel.color_index, dark_mode),
-                        envelope,
+                        draw_mode: row_channel.draw_mode,
+                        data,
                     });
                 }
 
-                visible_rows.push(VisibleRowEnvelope {
+                visible_rows.push(VisibleRowTrace {
                     row_id: row.id,
                     row_index,
-                    envelopes,
+                    traces,
                 });
             }
         }
 
-        if built_count > 0 {
+        if built_count > 0 || exact_step_count > 0 {
             let visible_channel_count = visible_rows
                 .iter()
-                .map(|row| row.envelopes.len())
+                .map(|row| row.traces.len())
                 .sum::<usize>();
             let source_sample_count = visible_rows
                 .iter()
-                .flat_map(|row| row.envelopes.iter())
+                .flat_map(|row| row.traces.iter())
                 .next()
-                .map(|visible| visible.envelope.source_sample_count)
+                .map(trace_source_sample_count)
                 .unwrap_or_default();
             self.load.status = format!(
-                "View {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), cache {}",
+                "View {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), exact step {}, cache {}",
                 view_range.0,
                 view_range.1,
                 visible_rows.len(),
                 visible_channel_count,
                 source_sample_count,
                 built_count,
+                exact_step_count,
                 self.dataset.loaded_channels.envelope_cache.len()
             );
         }
@@ -1388,7 +1465,7 @@ impl eframe::App for PanelYApp {
 
                     self.handle_plot_interaction(ui, &response, &plot_rects);
                     let visible_rows =
-                        self.visible_row_envelopes(requested_buckets, ui.visuals().dark_mode);
+                        self.visible_row_traces(requested_buckets, ui.visuals().dark_mode);
 
                     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
                     for (index, row_rect) in row_rects.iter().copied().enumerate() {
@@ -1404,12 +1481,12 @@ impl eframe::App for PanelYApp {
                         draw_plot_frame(&painter, plot_rect, ui.visuals());
 
                         match visible_row {
-                            Some(row) if !row.envelopes.is_empty() => {
-                                draw_waveform_envelopes(
+                            Some(row) if !row.traces.is_empty() => {
+                                draw_waveform_traces(
                                     &painter,
                                     plot_rect,
                                     ui.visuals(),
-                                    &row.envelopes,
+                                    &row.traces,
                                 );
                             }
                             _ => {
@@ -1602,11 +1679,27 @@ fn draw_row_controls(
         }
 
         let mut remove_channel = None;
-        for channel in &row.channels {
+        for channel in &mut row.channels {
             ui.horizontal(|ui| {
                 let color = channel_color(channel.color_index, ui.visuals().dark_mode);
                 ui.colored_label(color, format!("ch {}", channel.color_index + 1));
                 ui.label(channel_display_name(schema, &channel.channel_path));
+                egui::ComboBox::from_id_salt(("draw_mode", row.id, channel.channel_path.as_str()))
+                    .selected_text(channel.draw_mode.as_str())
+                    .show_ui(ui, |ui| {
+                        for draw_mode in DrawMode::ALL {
+                            if ui
+                                .selectable_value(
+                                    &mut channel.draw_mode,
+                                    draw_mode,
+                                    draw_mode.as_str(),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
                 if ui.small_button("Remove").clicked() {
                     remove_channel = Some(channel.channel_path.clone());
                 }
@@ -1732,24 +1825,24 @@ fn row_outer_rects(rect: egui::Rect, row_count: usize) -> Vec<egui::Rect> {
     row_rects
 }
 
-fn draw_waveform_envelopes(
+fn draw_waveform_traces(
     painter: &egui::Painter,
     rect: egui::Rect,
     visuals: &egui::Visuals,
-    visible_envelopes: &[VisibleEnvelope],
+    visible_traces: &[VisibleTrace],
 ) {
-    let Some(first) = visible_envelopes.first() else {
+    let Some(first) = visible_traces.first() else {
         draw_status_label(painter, rect, "No channel loaded");
         return;
     };
-    let Some((time_min, time_max)) = first.envelope.time_range else {
+    let Some((time_min, time_max)) = trace_time_range(first) else {
         draw_status_label(painter, rect, "No time range available");
         return;
     };
 
     let mut combined_value_range = None;
-    for visible in visible_envelopes {
-        if let Some((min, max)) = visible.envelope.value_range {
+    for visible in visible_traces {
+        if let Some((min, max)) = trace_value_range(visible) {
             combined_value_range = extend_range(combined_value_range, min);
             combined_value_range = extend_range(combined_value_range, max);
         }
@@ -1781,33 +1874,115 @@ fn draw_waveform_envelopes(
         )
     };
 
-    for visible in visible_envelopes {
+    for visible in visible_traces {
         let vertical_stroke = egui::Stroke::new(1.0, visible.color.linear_multiply(0.45));
         let line_stroke = egui::Stroke::new(1.25, visible.color);
-        let mut upper = Vec::with_capacity(visible.envelope.buckets.len());
-        let mut lower = Vec::with_capacity(visible.envelope.buckets.len());
-        for bucket in &visible.envelope.buckets {
-            let min_point = to_screen(bucket.time, f64::from(bucket.min));
-            let max_point = to_screen(bucket.time, f64::from(bucket.max));
-            painter.line_segment([min_point, max_point], vertical_stroke);
-            lower.push(min_point);
-            upper.push(max_point);
-        }
 
-        if upper.len() >= 2 {
-            painter.line(upper, line_stroke);
-            painter.line(lower, line_stroke);
+        match &visible.data {
+            VisibleTraceData::Envelope(envelope) => {
+                let mut upper = Vec::with_capacity(envelope.buckets.len());
+                let mut lower = Vec::with_capacity(envelope.buckets.len());
+                for bucket in &envelope.buckets {
+                    let min_point = to_screen(bucket.time, f64::from(bucket.min));
+                    let max_point = to_screen(bucket.time, f64::from(bucket.max));
+                    painter.line_segment([min_point, max_point], vertical_stroke);
+                    lower.push(min_point);
+                    upper.push(max_point);
+                }
+
+                if upper.len() >= 2 {
+                    painter.line(upper, line_stroke);
+                    painter.line(lower, line_stroke);
+                }
+            }
+            VisibleTraceData::RawStep(raw_step) => {
+                draw_raw_step_trace(
+                    painter,
+                    raw_step,
+                    line_stroke,
+                    (time_min, time_max),
+                    to_screen,
+                );
+            }
         }
     }
 
     draw_axis_labels(
         painter,
         rect,
-        visible_envelopes,
+        visible_traces,
         (time_min, time_max),
         (value_min, value_max),
         visuals,
     );
+}
+
+fn draw_raw_step_trace(
+    painter: &egui::Painter,
+    raw_step: &RawStepTrace,
+    stroke: egui::Stroke,
+    time_range: (f64, f64),
+    to_screen: impl Fn(f64, f64) -> egui::Pos2,
+) {
+    let Some(first) = raw_step.samples.first().copied() else {
+        return;
+    };
+
+    let mut points = Vec::with_capacity(raw_step.samples.len().saturating_mul(2).max(2));
+    points.push(to_screen(
+        first.time.max(time_range.0),
+        f64::from(first.value),
+    ));
+
+    let mut previous = first;
+    for current in raw_step.samples.iter().skip(1).copied() {
+        points.push(to_screen(current.time, f64::from(previous.value)));
+        points.push(to_screen(current.time, f64::from(current.value)));
+        previous = current;
+    }
+
+    if time_range.1 > previous.time {
+        points.push(to_screen(time_range.1, f64::from(previous.value)));
+    }
+
+    if points.len() >= 2 {
+        painter.line(points, stroke);
+    }
+}
+
+fn trace_time_range(trace: &VisibleTrace) -> Option<(f64, f64)> {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.time_range,
+        VisibleTraceData::RawStep(raw_step) => raw_step.time_range,
+    }
+}
+
+fn trace_value_range(trace: &VisibleTrace) -> Option<(f64, f64)> {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.value_range,
+        VisibleTraceData::RawStep(raw_step) => raw_step.value_range,
+    }
+}
+
+fn trace_source_sample_count(trace: &VisibleTrace) -> usize {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.source_sample_count,
+        VisibleTraceData::RawStep(raw_step) => raw_step.source_sample_count,
+    }
+}
+
+fn trace_bucket_count(trace: &VisibleTrace) -> usize {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.bucket_count(),
+        VisibleTraceData::RawStep(_) => 0,
+    }
+}
+
+fn trace_draw_point_count(trace: &VisibleTrace) -> usize {
+    match &trace.data {
+        VisibleTraceData::Envelope(envelope) => envelope.draw_point_count(),
+        VisibleTraceData::RawStep(raw_step) => raw_step.samples.len().saturating_mul(2),
+    }
 }
 
 fn visible_envelope_bucket_count(rect: egui::Rect) -> usize {
@@ -1845,7 +2020,7 @@ fn channel_color(index: usize, dark_mode: bool) -> egui::Color32 {
 fn draw_axis_labels(
     painter: &egui::Painter,
     rect: egui::Rect,
-    visible_envelopes: &[VisibleEnvelope],
+    visible_traces: &[VisibleTrace],
     time_range: (f64, f64),
     value_range: (f64, f64),
     visuals: &egui::Visuals,
@@ -1853,7 +2028,7 @@ fn draw_axis_labels(
     let text_color = visuals.text_color();
     let weak_color = visuals.weak_text_color();
     let font = egui::FontId::monospace(12.0);
-    let channel_label = visible_envelopes
+    let channel_label = visible_traces
         .iter()
         .take(3)
         .map(|visible| {
@@ -1865,35 +2040,34 @@ fn draw_axis_labels(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let channel_label = if visible_envelopes.len() > 3 {
+    let channel_label = if visible_traces.len() > 3 {
         format!("{channel_label}, ...")
     } else {
         channel_label
     };
-    let source_sample_count = visible_envelopes
+    let source_sample_count = visible_traces
         .first()
-        .map(|visible| visible.envelope.source_sample_count)
+        .map(trace_source_sample_count)
         .unwrap_or_default();
-    let raw_sample_count = visible_envelopes
+    let raw_sample_count = visible_traces
         .first()
         .map(|visible| visible.sample_count)
         .unwrap_or_default();
-    let bucket_count: usize = visible_envelopes
+    let bucket_count: usize = visible_traces.iter().map(trace_bucket_count).sum();
+    let draw_point_count: usize = visible_traces.iter().map(trace_draw_point_count).sum();
+    let step_count = visible_traces
         .iter()
-        .map(|visible| visible.envelope.bucket_count())
-        .sum();
-    let draw_point_count: usize = visible_envelopes
-        .iter()
-        .map(|visible| visible.envelope.draw_point_count())
-        .sum();
+        .filter(|visible| visible.draw_mode == DrawMode::Step)
+        .count();
 
     painter.text(
         rect.left_top() + egui::vec2(0.0, -16.0),
         egui::Align2::LEFT_TOP,
         format!(
-            "{}  ch={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
+            "{}  ch={}  step={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
             channel_label,
-            visible_envelopes.len(),
+            visible_traces.len(),
+            step_count,
             source_sample_count,
             raw_sample_count,
             bucket_count,
@@ -2016,6 +2190,71 @@ fn extend_range(range: Option<(f64, f64)>, value: f64) -> Option<(f64, f64)> {
     }
 }
 
+fn build_raw_step_trace(
+    time: &[f64],
+    values: &[f32],
+    time_range: (f64, f64),
+    max_samples: usize,
+) -> Option<RawStepTrace> {
+    let (range_start, range_end) = normalized_range(time_range)?;
+    let sample_count = time.len().min(values.len());
+    if sample_count == 0 {
+        return None;
+    }
+
+    let start = time
+        .partition_point(|time| *time < range_start)
+        .min(sample_count);
+    let end = time
+        .partition_point(|time| *time <= range_end)
+        .min(sample_count);
+    let context_start = start.saturating_sub(usize::from(start > 0));
+    let source_sample_count = end.saturating_sub(start);
+    let draw_sample_count = end.saturating_sub(context_start);
+    if draw_sample_count == 0 || draw_sample_count > max_samples {
+        return None;
+    }
+
+    let mut samples = Vec::with_capacity(draw_sample_count);
+    let mut value_range = None;
+
+    if context_start < start {
+        let value = values[context_start];
+        if value.is_finite() {
+            samples.push(StepSample {
+                time: range_start,
+                value,
+            });
+            value_range = extend_range(value_range, f64::from(value));
+        }
+    }
+
+    for index in start..end {
+        let sample_time = time[index];
+        let value = values[index];
+        if !sample_time.is_finite() || !value.is_finite() {
+            continue;
+        }
+
+        samples.push(StepSample {
+            time: sample_time.clamp(range_start, range_end),
+            value,
+        });
+        value_range = extend_range(value_range, f64::from(value));
+    }
+
+    if samples.is_empty() || value_range.is_none() {
+        return None;
+    }
+
+    Some(RawStepTrace {
+        samples,
+        source_sample_count,
+        time_range: Some((range_start, range_end)),
+        value_range,
+    })
+}
+
 fn min_view_span(full_range: (f64, f64), sample_count: usize) -> f64 {
     let full_span = full_range.1 - full_range.0;
     if !full_span.is_finite() || full_span <= 0.0 {
@@ -2123,6 +2362,7 @@ mod app_tests {
         assert!(added_first);
         assert_eq!(first_row_id, 0);
         assert_eq!(view.rows[0].channels.len(), 1);
+        assert_eq!(view.rows[0].channels[0].draw_mode, DrawMode::Line);
 
         let second_row_id = view.add_row();
         let (added_second, target_row_id) = view.add_channel_to_selected_row("pwm_1kHz");
@@ -2185,5 +2425,39 @@ mod app_tests {
             assert!(plot.height() > 0.0);
             assert!(outer.contains_rect(row));
         }
+    }
+
+    #[test]
+    fn builds_raw_step_trace_with_previous_state_at_range_start() {
+        let time = [0.0, 1.0, 2.0, 3.0];
+        let values = [0.0, 1.0, 0.0, 1.0];
+
+        let trace = build_raw_step_trace(&time, &values, (1.5, 2.5), 10).expect("raw step trace");
+
+        assert_eq!(trace.source_sample_count, 1);
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 1.5,
+                    value: 1.0,
+                },
+                StepSample {
+                    time: 2.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 1.0)));
+    }
+
+    #[test]
+    fn raw_step_trace_respects_sample_limit() {
+        let time = [0.0, 1.0, 2.0, 3.0];
+        let values = [0.0, 1.0, 0.0, 1.0];
+
+        let trace = build_raw_step_trace(&time, &values, (0.0, 3.0), 2);
+
+        assert!(trace.is_none());
     }
 }

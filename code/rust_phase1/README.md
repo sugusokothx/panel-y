@@ -66,6 +66,26 @@ The large-data target is:
 ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet
 ```
 
+For Step rendering edge-position checks, generate:
+
+```bash
+../.venv/bin/python ../proto_3_1b/generate_step_validation_data.py
+```
+
+Then load:
+
+```text
+../proto_3_1b/data/step_validation_100k.parquet
+```
+
+Channels:
+
+```text
+pwm_1kHz
+pwm_1kHz_delay_1sample
+pwm_1kHz_advance_1sample
+```
+
 ## Current State
 
 - `eframe` app shell is in place.
