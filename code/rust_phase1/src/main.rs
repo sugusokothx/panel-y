@@ -11,6 +11,7 @@ const MAX_VISIBLE_ENVELOPE_BUCKETS: usize = 8_192;
 const WHEEL_ZOOM_SENSITIVITY: f64 = 0.0015;
 const BENCH_VISIBLE_ENVELOPE_BUCKETS: usize = 1_200;
 const BENCH_RANGE_RUNS: usize = 24;
+const BENCH_HOVER_RUNS: usize = 1_000;
 const STRESS_RANGE_RUNS: usize = 1_000;
 const STRESS_REPORT_BLOCKS: usize = 5;
 const MIN_WAVEFORM_ROW_HEIGHT: f32 = 180.0;
@@ -58,6 +59,7 @@ fn main() -> eframe::Result {
             CliCommand::BenchMultiChannel { path, channels } => {
                 benchmark_multi_channel(path, channels)
             }
+            CliCommand::BenchPhase2 { path, channels } => benchmark_phase2_view(path, channels),
         };
 
         match result {
@@ -105,6 +107,10 @@ enum CliCommand {
         path: String,
         channels: Vec<String>,
     },
+    BenchPhase2 {
+        path: String,
+        channels: Vec<String>,
+    },
 }
 
 fn cli_command_arg() -> Option<CliCommand> {
@@ -138,6 +144,11 @@ fn cli_command_arg() -> Option<CliCommand> {
             let path = args.next()?;
             let channels = args.collect();
             Some(CliCommand::BenchMultiChannel { path, channels })
+        }
+        Some("--bench-phase2") => {
+            let path = args.next()?;
+            let channels = args.collect();
+            Some(CliCommand::BenchPhase2 { path, channels })
         }
         _ => None,
     }
@@ -1067,6 +1078,355 @@ fn benchmark_multi_channel(path: String, channels: Vec<String>) -> Result<String
     Ok(report)
 }
 
+fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, String> {
+    let rss_before_schema = process_rss_mib();
+    let schema = parquet_schema::read_schema_summary(&path)?;
+    let rss_after_schema = process_rss_mib();
+    if schema.time_column.is_none() {
+        return Err("time column not found".to_owned());
+    }
+
+    let selected_channels = if channels.is_empty() {
+        schema
+            .channels
+            .iter()
+            .map(|channel| channel.path.clone())
+            .collect::<Vec<_>>()
+    } else {
+        channels
+    };
+    if selected_channels.is_empty() {
+        return Err("no channels selected".to_owned());
+    }
+
+    let time = parquet_waveform::read_time_column(&path, &schema)?;
+    let rss_after_time = process_rss_mib();
+    let full_range = time
+        .time_range()
+        .ok_or_else(|| "loaded time column has no time range".to_owned())?;
+    let mut store = ChannelStore::default();
+    let mut channel_results = Vec::with_capacity(selected_channels.len());
+
+    for channel_name in &selected_channels {
+        let channel = parquet_waveform::read_channel_values(&path, &schema, channel_name)?;
+        if channel.sample_count() != time.sample_count() {
+            return Err(format!(
+                "time/value length mismatch for {}: {} vs {}",
+                channel.channel_path,
+                time.sample_count(),
+                channel.sample_count()
+            ));
+        }
+
+        let result = MultiChannelLoadResult {
+            channel_name: channel.channel_name.clone(),
+            channel_path: channel.channel_path.clone(),
+            sample_count: channel.sample_count(),
+            read_sec: channel.elapsed.as_secs_f64(),
+            memory_bytes: channel.memory_bytes(),
+            rss_after_load: process_rss_mib(),
+        };
+        store.insert_channel(channel);
+        channel_results.push(result);
+    }
+    let rss_after_all_channels = process_rss_mib();
+
+    let rows = phase2_benchmark_rows(&selected_channels);
+    let (line_channel_count, step_channel_count) = phase2_benchmark_mode_counts(&rows);
+    let mut app = PanelYApp::default();
+    app.dataset.parquet_path = path;
+    app.dataset.schema = Some(schema);
+    app.dataset.shared_time = Some(time);
+    app.dataset.loaded_channels = store;
+    app.view.rows = rows;
+    app.view.selected_row_id = app.view.rows.first().map(|row| row.id);
+    app.view.next_row_id = app.view.rows.iter().map(|row| row.id).max().unwrap_or(0) + 1;
+    app.view.x_range = Some(full_range);
+
+    let ranges = benchmark_ranges(full_range, BENCH_RANGE_RUNS);
+    let mut visible_results = Vec::with_capacity(ranges.len());
+    for (index, range) in ranges.into_iter().enumerate() {
+        app.view.x_range = Some(range);
+        app.view.hover_x = Some((range.0 + range.1) * 0.5);
+        let started = std::time::Instant::now();
+        let visible_rows = app.visible_row_traces(BENCH_VISIBLE_ENVELOPE_BUCKETS, true);
+        let elapsed_sec = started.elapsed().as_secs_f64();
+
+        let mut visible_channel_count = 0usize;
+        let mut envelope_trace_count = 0usize;
+        let mut raw_step_trace_count = 0usize;
+        let mut edge_step_trace_count = 0usize;
+        let mut raw_step_sample_count = 0usize;
+        let mut draw_point_count = 0usize;
+        let mut source_sample_count = 0usize;
+        let mut hover_value_count = 0usize;
+
+        for row in &visible_rows {
+            for trace in &row.traces {
+                visible_channel_count += 1;
+                draw_point_count += trace_draw_point_count(trace);
+                source_sample_count = source_sample_count.max(trace_source_sample_count(trace));
+                if trace.hover_value.is_some() {
+                    hover_value_count += 1;
+                }
+
+                match &trace.data {
+                    VisibleTraceData::Envelope(_) => {
+                        envelope_trace_count += 1;
+                    }
+                    VisibleTraceData::RawStep(raw_step) => {
+                        raw_step_trace_count += 1;
+                        raw_step_sample_count += raw_step.samples.len();
+                        if raw_step.kind == StepTraceKind::ChangePoints {
+                            edge_step_trace_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        visible_results.push(Phase2VisibleRunResult {
+            index: index + 1,
+            range,
+            elapsed_sec,
+            row_count: visible_rows.len(),
+            visible_channel_count,
+            envelope_trace_count,
+            raw_step_trace_count,
+            edge_step_trace_count,
+            raw_step_sample_count,
+            draw_point_count,
+            source_sample_count,
+            hover_value_count,
+        });
+    }
+    let rss_after_visible_benchmark = process_rss_mib();
+
+    let hover_result = benchmark_phase2_hover(&app, full_range);
+    let rss_after_hover_benchmark = process_rss_mib();
+
+    let raw_memory_bytes = app
+        .dataset
+        .shared_time
+        .as_ref()
+        .map_or(0, parquet_waveform::TimeData::memory_bytes)
+        + app.dataset.loaded_channels.raw_memory_bytes();
+    let channel_memory_bytes = channel_results
+        .iter()
+        .map(|result| result.memory_bytes)
+        .sum::<usize>();
+    let visible_total_sec = visible_results
+        .iter()
+        .map(|result| result.elapsed_sec)
+        .sum::<f64>();
+    let visible_avg_sec = if visible_results.is_empty() {
+        0.0
+    } else {
+        visible_total_sec / visible_results.len() as f64
+    };
+    let visible_max_sec = visible_results
+        .iter()
+        .map(|result| result.elapsed_sec)
+        .fold(0.0, f64::max);
+    let max_draw_points = visible_results
+        .iter()
+        .map(|result| result.draw_point_count)
+        .max()
+        .unwrap_or(0);
+    let max_raw_step_samples = visible_results
+        .iter()
+        .map(|result| result.raw_step_sample_count)
+        .max()
+        .unwrap_or(0);
+
+    let schema = app.dataset.schema.as_ref().expect("schema is set");
+    let shared_time = app.dataset.shared_time.as_ref().expect("time is set");
+
+    let mut report = String::new();
+    report.push_str(&format!("file: {}\n", schema.path.display()));
+    report.push_str(&format!("rows: {}\n", schema.row_count));
+    report.push_str(&format!("channels selected: {}\n", selected_channels.len()));
+    report.push_str(&format!("channel list: {}\n", selected_channels.join(", ")));
+    report.push_str(&format!(
+        "layout: {} rows, line channels {}, step channels {}\n",
+        app.view.rows.len(),
+        line_channel_count,
+        step_channel_count
+    ));
+    report.push_str(&format!(
+        "time: {} samples, {:.1} MiB, read {:.3}s\n",
+        shared_time.sample_count(),
+        bytes_to_mib(shared_time.memory_bytes()),
+        shared_time.elapsed.as_secs_f64()
+    ));
+    report.push_str(&format!(
+        "channel arrays: {:.1} MiB\n",
+        bytes_to_mib(channel_memory_bytes)
+    ));
+    report.push_str(&format!(
+        "raw cache memory: {:.1} MiB\n",
+        bytes_to_mib(raw_memory_bytes)
+    ));
+    report.push_str(&format!(
+        "visible trace benchmark: {} ranges, {} buckets requested, total {:.3}s, avg {:.4}s, max {:.4}s, max draw points {}, max raw step samples {}\n",
+        visible_results.len(),
+        BENCH_VISIBLE_ENVELOPE_BUCKETS,
+        visible_total_sec,
+        visible_avg_sec,
+        visible_max_sec,
+        max_draw_points,
+        max_raw_step_samples
+    ));
+    report.push_str(&format!(
+        "hover benchmark: {} positions, {} lookups, {} hits, total {:.4}s, avg {:.3} us/lookup\n",
+        hover_result.positions,
+        hover_result.lookups,
+        hover_result.hits,
+        hover_result.elapsed_sec,
+        hover_result.avg_lookup_us()
+    ));
+    report.push_str(&format!(
+        "rss: before_schema={}, after_schema={}, after_time={}, after_all_channels={}, after_visible_benchmark={}, after_hover_benchmark={}\n",
+        format_optional_mib(rss_before_schema),
+        format_optional_mib(rss_after_schema),
+        format_optional_mib(rss_after_time),
+        format_optional_mib(rss_after_all_channels),
+        format_optional_mib(rss_after_visible_benchmark),
+        format_optional_mib(rss_after_hover_benchmark)
+    ));
+    report.push_str("channel loads:\n");
+    for (index, result) in channel_results.iter().enumerate() {
+        report.push_str(&format!(
+            "  #{:02} {} ({}) samples={} array={:.1} MiB read={:.3}s rss={}\n",
+            index + 1,
+            result.channel_name,
+            result.channel_path,
+            result.sample_count,
+            bytes_to_mib(result.memory_bytes),
+            result.read_sec,
+            format_optional_mib(result.rss_after_load)
+        ));
+    }
+    report.push_str("visible runs:\n");
+    for result in &visible_results {
+        report.push_str(&format!(
+            "  #{:02} {:.6}..{:.6}s {:.4}s rows={} ch={} samples={} env={} step={} edge={} step_samples={} draw_points={} hover_values={}\n",
+            result.index,
+            result.range.0,
+            result.range.1,
+            result.elapsed_sec,
+            result.row_count,
+            result.visible_channel_count,
+            result.source_sample_count,
+            result.envelope_trace_count,
+            result.raw_step_trace_count,
+            result.edge_step_trace_count,
+            result.raw_step_sample_count,
+            result.draw_point_count,
+            result.hover_value_count
+        ));
+    }
+
+    Ok(report)
+}
+
+fn phase2_benchmark_rows(selected_channels: &[String]) -> Vec<PlotRow> {
+    if selected_channels.is_empty() {
+        return vec![PlotRow::new(0)];
+    }
+
+    selected_channels
+        .chunks(3)
+        .enumerate()
+        .map(|(row_index, channels)| {
+            let mut row = PlotRow::new(row_index as u64);
+            row.channels = channels
+                .iter()
+                .enumerate()
+                .map(|(channel_index, channel_path)| {
+                    let mut row_channel = RowChannel::new(channel_path, channel_index);
+                    row_channel.draw_mode = phase2_benchmark_draw_mode(channel_path);
+                    row_channel
+                })
+                .collect();
+            row
+        })
+        .collect()
+}
+
+fn phase2_benchmark_draw_mode(channel_path: &str) -> DrawMode {
+    let lower = channel_path.to_ascii_lowercase();
+    if lower.contains("pwm") || lower.contains("gate") || lower.contains("step") {
+        DrawMode::Step
+    } else {
+        DrawMode::Line
+    }
+}
+
+fn phase2_benchmark_mode_counts(rows: &[PlotRow]) -> (usize, usize) {
+    rows.iter().flat_map(|row| row.channels.iter()).fold(
+        (0usize, 0usize),
+        |(line, step), channel| match channel.draw_mode {
+            DrawMode::Line => (line + 1, step),
+            DrawMode::Step => (line, step + 1),
+        },
+    )
+}
+
+fn benchmark_phase2_hover(app: &PanelYApp, full_range: (f64, f64)) -> Phase2HoverBenchmarkResult {
+    let Some(shared_time) = app.dataset.shared_time.as_ref() else {
+        return Phase2HoverBenchmarkResult::empty();
+    };
+    let Some((range_start, range_end)) = normalized_range(full_range) else {
+        return Phase2HoverBenchmarkResult::empty();
+    };
+    let span = range_end - range_start;
+    if span <= 0.0 {
+        return Phase2HoverBenchmarkResult::empty();
+    }
+
+    let started = std::time::Instant::now();
+    let mut lookups = 0usize;
+    let mut hits = 0usize;
+    for index in 0..BENCH_HOVER_RUNS {
+        let ratio = if BENCH_HOVER_RUNS <= 1 {
+            0.5
+        } else {
+            index as f64 / (BENCH_HOVER_RUNS - 1) as f64
+        };
+        let target_time = range_start + span * ratio;
+        for row in &app.view.rows {
+            for row_channel in row.channels.iter().filter(|channel| channel.visible) {
+                let Some(channel) = app
+                    .dataset
+                    .loaded_channels
+                    .channel(&row_channel.channel_path)
+                else {
+                    continue;
+                };
+                lookups += 1;
+                if hover_value_at_time(
+                    &shared_time.time,
+                    &channel.values,
+                    target_time,
+                    row_channel.draw_mode,
+                )
+                .is_some()
+                {
+                    hits += 1;
+                }
+            }
+        }
+    }
+
+    Phase2HoverBenchmarkResult {
+        positions: BENCH_HOVER_RUNS,
+        lookups,
+        hits,
+        elapsed_sec: started.elapsed().as_secs_f64(),
+    }
+}
+
 #[derive(Debug)]
 struct BenchmarkRangeResult {
     index: usize,
@@ -1103,6 +1463,49 @@ struct MultiChannelEnvelopeResult {
     bucket_size: usize,
     draw_point_count: usize,
     elapsed_sec: f64,
+}
+
+#[derive(Debug)]
+struct Phase2VisibleRunResult {
+    index: usize,
+    range: (f64, f64),
+    elapsed_sec: f64,
+    row_count: usize,
+    visible_channel_count: usize,
+    envelope_trace_count: usize,
+    raw_step_trace_count: usize,
+    edge_step_trace_count: usize,
+    raw_step_sample_count: usize,
+    draw_point_count: usize,
+    source_sample_count: usize,
+    hover_value_count: usize,
+}
+
+#[derive(Debug)]
+struct Phase2HoverBenchmarkResult {
+    positions: usize,
+    lookups: usize,
+    hits: usize,
+    elapsed_sec: f64,
+}
+
+impl Phase2HoverBenchmarkResult {
+    fn empty() -> Self {
+        Self {
+            positions: 0,
+            lookups: 0,
+            hits: 0,
+            elapsed_sec: 0.0,
+        }
+    }
+
+    fn avg_lookup_us(&self) -> f64 {
+        if self.lookups == 0 {
+            0.0
+        } else {
+            self.elapsed_sec * 1_000_000.0 / self.lookups as f64
+        }
+    }
 }
 
 fn benchmark_ranges(full_range: (f64, f64), run_count: usize) -> Vec<(f64, f64)> {

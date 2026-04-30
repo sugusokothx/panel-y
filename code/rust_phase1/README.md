@@ -46,6 +46,12 @@ To benchmark Phase 2 shared-time multi-channel cache memory:
 cargo run --release -- --bench-multi-channel ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet
 ```
 
+To benchmark Phase 2 multi-row visible trace generation and hover lookup:
+
+```bash
+cargo run --release -- --bench-phase2 ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet
+```
+
 ## Reference Data
 
 Use the Phase 0 datasets under:

@@ -4,7 +4,7 @@ doc_type: Phase 2設計方針
 target: Rust移植 Phase 2
 created: "2026-04-30"
 updated: "2026-04-30"
-status: 実装中
+status: P2-12測定完了
 source_proto: "code/proto_3_1b"
 base_implementation: "code/rust_phase1"
 ---
@@ -306,6 +306,7 @@ UI実装の優先:
 - 2026-04-30: P2-08 GUI確認完了。Manual min/max反映、初期値/Reset時の `-1..1` 復帰、Manual設定中にchannelをhiddenにしてもplot min/maxがmanual設定を保持することを確認した
 - 2026-04-30: P2-08改善。Manual切替時とManual Reset時のmin/maxを固定 `-1..1` ではなく直近のAuto表示Y範囲から初期化するように変更した。Auto範囲が未取得の場合だけ `-1..1` にfallbackする
 - 2026-04-30: P2-08改善GUI確認完了。Manual切替時の初期値とReset時に直近Auto範囲へ戻る動きが問題ないことを確認した
+- 2026-04-30: P2-12測定完了。`--bench-phase2` を追加し、中データ全8ch、大データ全9ch、大データ代表4chで複数row表示データ生成・hover・RSSを測定した。大データ全9chではvisible trace生成 avg 31.3 ms / max 92.5 ms、RSS after bench 435.4 MiB。結果は [rust_migration_phase2_benchmark_results.md](rust_migration_phase2_benchmark_results.md) に記録した
 
 ---
 
@@ -341,6 +342,7 @@ Phase 2は以下を満たしたら完了とする。
 
 - [Rust移植 Phase 1 評価メモ](rust_migration_phase1_evaluation.md)
 - [Rust移植 Phase 1 ベンチマーク結果](rust_migration_phase1_benchmark_results.md)
+- [Rust移植 Phase 2 性能測定結果](rust_migration_phase2_benchmark_results.md)
 - [Rust移植 Phase 0 UI仕様](rust_migration_phase0_ui_spec.md)
 - [Rust移植 Phase 0 作図設定仕様](rust_migration_phase0_plotconfig_spec.md)
 - [Rust移植計画書](rust_migration_plan.md)

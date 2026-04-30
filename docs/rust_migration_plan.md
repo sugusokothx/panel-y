@@ -4,7 +4,7 @@ doc_type: 移植計画書
 target: Rust版 波形ビューア
 created: "2026-04-27"
 updated: "2026-04-30"
-status: Phase 2着手中
+status: Phase 2 P2-12測定完了
 source_proto: "code/proto_3_1b"
 ---
 
@@ -198,11 +198,13 @@ Analysis Layer
 
 ### Phase 2: 波形ビューア基本機能の移植
 
-状態: 着手中
+状態: P2-12測定完了
 
 目的: `proto_3_1b` のビューアとしての主要操作をRust版に移す。
 
 設計方針: [rust_migration_phase2_design.md](rust_migration_phase2_design.md)
+
+性能測定: [rust_migration_phase2_benchmark_results.md](rust_migration_phase2_benchmark_results.md)
 
 移植対象:
 
