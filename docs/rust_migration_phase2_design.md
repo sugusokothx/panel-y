@@ -301,6 +301,10 @@ UI実装の優先:
 - 2026-04-30: P2-07 GUI確認。visible ON/OFF、line width即時反映、custom color / resetが期待通り動作することを確認した
 - 2026-04-30: P2-09実装。hover X位置を `ViewState` で共有し、全rowへの縦ライン表示とvisible channelの値readoutを追加した。Lineはnearest sample、Stepはsample-and-hold値を表示する
 - 2026-04-30: P2-09 GUI確認完了。`test_100k.parquet` / `panely_large_10s_1mhz_9ch.parquet` で複数row hover、Line/Step値表示、hidden channel除外、plot外hover clear、左右readout位置切替、更新レスポンスが期待通り動作することを確認した
+- 2026-04-30: P2-08実装。`PlotRow` にAuto/ManualのY軸範囲設定を追加し、rowごとのmin/max入力とmanual range描画に対応した。Manual時はplot rectでtraceをclipする
+- 2026-04-30: P2-08 GUI確認完了。Manual min/max反映、初期値/Reset時の `-1..1` 復帰、Manual設定中にchannelをhiddenにしてもplot min/maxがmanual設定を保持することを確認した
+- 2026-04-30: P2-08改善。Manual切替時とManual Reset時のmin/maxを固定 `-1..1` ではなく直近のAuto表示Y範囲から初期化するように変更した。Auto範囲が未取得の場合だけ `-1..1` にfallbackする
+- 2026-04-30: P2-08改善GUI確認完了。Manual切替時の初期値とReset時に直近Auto範囲へ戻る動きが問題ないことを確認した
 
 ---
 

@@ -178,7 +178,22 @@ struct LoadState {
 #[derive(Clone, Debug)]
 struct PlotRow {
     id: u64,
+    y_range: RowYRange,
     channels: Vec<RowChannel>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RowYRange {
+    mode: YRangeMode,
+    min: f64,
+    max: f64,
+    last_auto: Option<(f64, f64)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum YRangeMode {
+    Auto,
+    Manual,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -263,6 +278,7 @@ struct VisibleRowTrace {
     row_id: u64,
     row_index: usize,
     row_channel_count: usize,
+    y_range: RowYRange,
     traces: Vec<VisibleTrace>,
 }
 
@@ -295,10 +311,7 @@ impl Default for ViewState {
             next_row_id: 1,
             x_range: None,
             hover_x: None,
-            rows: vec![PlotRow {
-                id: 0,
-                channels: Vec::new(),
-            }],
+            rows: vec![PlotRow::new(0)],
         }
     }
 }
@@ -321,6 +334,60 @@ impl DrawMode {
         match self {
             Self::Line => "Line",
             Self::Step => "Step",
+        }
+    }
+}
+
+impl YRangeMode {
+    const ALL: [Self; 2] = [Self::Auto, Self::Manual];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Manual => "Manual",
+        }
+    }
+}
+
+impl Default for RowYRange {
+    fn default() -> Self {
+        Self {
+            mode: YRangeMode::Auto,
+            min: -1.0,
+            max: 1.0,
+            last_auto: None,
+        }
+    }
+}
+
+impl RowYRange {
+    fn set_last_auto(&mut self, range: (f64, f64)) {
+        if normalized_y_range(range.0, range.1).is_some() {
+            self.last_auto = Some(range);
+        }
+    }
+
+    fn manual_seed_range(&self) -> (f64, f64) {
+        self.last_auto.unwrap_or_else(|| {
+            let default = Self::default();
+            (default.min, default.max)
+        })
+    }
+
+    fn set_manual_from_last_auto(&mut self) {
+        let (min, max) = self.manual_seed_range();
+        self.mode = YRangeMode::Manual;
+        self.min = min;
+        self.max = max;
+    }
+}
+
+impl PlotRow {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            y_range: RowYRange::default(),
+            channels: Vec::new(),
         }
     }
 }
@@ -368,10 +435,7 @@ impl ViewState {
         self.hover_x = None;
         self.selected_row_id = Some(0);
         self.next_row_id = 1;
-        self.rows = vec![PlotRow {
-            id: 0,
-            channels: Vec::new(),
-        }];
+        self.rows = vec![PlotRow::new(0)];
     }
 
     fn reset_empty(&mut self) {
@@ -380,18 +444,12 @@ impl ViewState {
         self.hover_x = None;
         self.selected_row_id = Some(0);
         self.next_row_id = 1;
-        self.rows = vec![PlotRow {
-            id: 0,
-            channels: Vec::new(),
-        }];
+        self.rows = vec![PlotRow::new(0)];
     }
 
     fn ensure_row_state(&mut self) {
         if self.rows.is_empty() {
-            self.rows.push(PlotRow {
-                id: 0,
-                channels: Vec::new(),
-            });
+            self.rows.push(PlotRow::new(0));
         }
 
         let next_row_id = self.rows.iter().map(|row| row.id).max().unwrap_or(0) + 1;
@@ -409,10 +467,7 @@ impl ViewState {
         self.ensure_row_state();
         let id = self.next_row_id;
         self.next_row_id += 1;
-        self.rows.push(PlotRow {
-            id,
-            channels: Vec::new(),
-        });
+        self.rows.push(PlotRow::new(id));
         self.selected_row_id = Some(id);
         id
     }
@@ -1171,6 +1226,7 @@ impl PanelYApp {
                     row_id: row.id,
                     row_index,
                     row_channel_count: row.channels.len(),
+                    y_range: row.y_range,
                     traces: Vec::new(),
                 })
                 .collect();
@@ -1185,6 +1241,7 @@ impl PanelYApp {
                     row_id: row.id,
                     row_index,
                     row_channel_count: row.channels.len(),
+                    y_range: row.y_range,
                     traces: Vec::new(),
                 })
                 .collect();
@@ -1202,6 +1259,7 @@ impl PanelYApp {
         }
 
         let mut visible_rows = Vec::with_capacity(rows.len());
+        let mut latest_auto_y_ranges = Vec::with_capacity(rows.len());
         let mut built_count = 0usize;
         let mut exact_step_count = 0usize;
         let mut edge_step_count = 0usize;
@@ -1322,8 +1380,27 @@ impl PanelYApp {
                     row_id: row.id,
                     row_index,
                     row_channel_count,
+                    y_range: row.y_range,
                     traces,
                 });
+
+                if let Some((min, max)) = visible_rows
+                    .last()
+                    .and_then(|row| combined_trace_value_range(&row.traces))
+                {
+                    latest_auto_y_ranges.push((row.id, Some(padded_range(min, max))));
+                } else {
+                    latest_auto_y_ranges.push((row.id, None));
+                }
+            }
+        }
+
+        for (row_id, auto_y_range) in latest_auto_y_ranges {
+            let Some(auto_y_range) = auto_y_range else {
+                continue;
+            };
+            if let Some(row) = self.view.rows.iter_mut().find(|row| row.id == row_id) {
+                row.y_range.set_last_auto(auto_y_range);
             }
         }
 
@@ -1575,6 +1652,7 @@ impl eframe::App for PanelYApp {
                                     plot_rect,
                                     ui.visuals(),
                                     &row.traces,
+                                    row.y_range,
                                 );
                             }
                             Some(row) if row.row_channel_count > 0 => {
@@ -1781,6 +1859,10 @@ fn draw_row_controls(
             }
         });
 
+        if draw_y_range_controls(ui, row.id, &mut row.y_range) {
+            changed = true;
+        }
+
         if row.channels.is_empty() {
             ui.label("No channels in row");
             continue;
@@ -1874,6 +1956,63 @@ fn draw_row_controls(
     {
         changed = true;
     }
+
+    changed
+}
+
+fn draw_y_range_controls(ui: &mut egui::Ui, row_id: u64, y_range: &mut RowYRange) -> bool {
+    let mut changed = false;
+
+    ui.push_id(("row_y_range", row_id), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Y");
+            let mut selected_mode = y_range.mode;
+            egui::ComboBox::from_id_salt("mode")
+                .selected_text(selected_mode.as_str())
+                .show_ui(ui, |ui| {
+                    for mode in YRangeMode::ALL {
+                        if ui
+                            .selectable_value(&mut selected_mode, mode, mode.as_str())
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+                });
+            if selected_mode != y_range.mode {
+                match selected_mode {
+                    YRangeMode::Auto => y_range.mode = YRangeMode::Auto,
+                    YRangeMode::Manual => y_range.set_manual_from_last_auto(),
+                }
+                changed = true;
+            }
+
+            if y_range.mode == YRangeMode::Manual {
+                let mut min = y_range.min;
+                if ui
+                    .add(egui::DragValue::new(&mut min).speed(0.1).prefix("min "))
+                    .changed()
+                {
+                    y_range.min = min;
+                    changed = true;
+                }
+
+                let mut max = y_range.max;
+                if ui
+                    .add(egui::DragValue::new(&mut max).speed(0.1).prefix("max "))
+                    .changed()
+                {
+                    y_range.max = max;
+                    changed = true;
+                }
+
+                if ui.small_button("Reset").clicked() {
+                    y_range.set_manual_from_last_auto();
+                    changed = true;
+                }
+            }
+        });
+    });
 
     changed
 }
@@ -1985,6 +2124,7 @@ fn draw_waveform_traces(
     rect: egui::Rect,
     visuals: &egui::Visuals,
     visible_traces: &[VisibleTrace],
+    y_range: RowYRange,
 ) {
     let Some(first) = visible_traces.first() else {
         draw_status_label(painter, rect, "No channel loaded");
@@ -1995,14 +2135,7 @@ fn draw_waveform_traces(
         return;
     };
 
-    let mut combined_value_range = None;
-    for visible in visible_traces {
-        if let Some((min, max)) = trace_value_range(visible) {
-            combined_value_range = extend_range(combined_value_range, min);
-            combined_value_range = extend_range(combined_value_range, max);
-        }
-    }
-    let Some((value_min, value_max)) = combined_value_range else {
+    let Some(auto_value_range) = combined_trace_value_range(visible_traces) else {
         draw_status_label(painter, rect, "No finite values available");
         return;
     };
@@ -2013,7 +2146,10 @@ fn draw_waveform_traces(
         return;
     }
 
-    let (value_min, value_max) = padded_range(value_min, value_max);
+    let Some((value_min, value_max)) = display_value_range(auto_value_range, y_range) else {
+        draw_status_label(painter, rect, "Invalid value range");
+        return;
+    };
     let value_span = value_max - value_min;
     if !value_span.is_finite() || value_span <= 0.0 {
         draw_status_label(painter, rect, "Invalid value range");
@@ -2029,6 +2165,7 @@ fn draw_waveform_traces(
         )
     };
 
+    let trace_painter = painter.with_clip_rect(rect);
     for visible in visible_traces {
         let line_width = visible
             .line_width
@@ -2046,19 +2183,19 @@ fn draw_waveform_traces(
                 for bucket in &envelope.buckets {
                     let min_point = to_screen(bucket.time, f64::from(bucket.min));
                     let max_point = to_screen(bucket.time, f64::from(bucket.max));
-                    painter.line_segment([min_point, max_point], vertical_stroke);
+                    trace_painter.line_segment([min_point, max_point], vertical_stroke);
                     lower.push(min_point);
                     upper.push(max_point);
                 }
 
                 if upper.len() >= 2 {
-                    painter.line(upper, line_stroke);
-                    painter.line(lower, line_stroke);
+                    trace_painter.line(upper, line_stroke);
+                    trace_painter.line(lower, line_stroke);
                 }
             }
             VisibleTraceData::RawStep(raw_step) => {
                 draw_raw_step_trace(
-                    painter,
+                    &trace_painter,
                     raw_step,
                     line_stroke,
                     (time_min, time_max),
@@ -2123,6 +2260,37 @@ fn trace_value_range(trace: &VisibleTrace) -> Option<(f64, f64)> {
         VisibleTraceData::Envelope(envelope) => envelope.value_range,
         VisibleTraceData::RawStep(raw_step) => raw_step.value_range,
     }
+}
+
+fn combined_trace_value_range(visible_traces: &[VisibleTrace]) -> Option<(f64, f64)> {
+    let mut combined_value_range = None;
+    for visible in visible_traces {
+        if let Some((min, max)) = trace_value_range(visible) {
+            combined_value_range = extend_range(combined_value_range, min);
+            combined_value_range = extend_range(combined_value_range, max);
+        }
+    }
+
+    combined_value_range
+}
+
+fn display_value_range(auto_value_range: (f64, f64), y_range: RowYRange) -> Option<(f64, f64)> {
+    match y_range.mode {
+        YRangeMode::Auto => Some(padded_range(auto_value_range.0, auto_value_range.1)),
+        YRangeMode::Manual => normalized_y_range(y_range.min, y_range.max),
+    }
+}
+
+fn normalized_y_range(min: f64, max: f64) -> Option<(f64, f64)> {
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+
+    if min == max {
+        return Some(padded_range(min, max));
+    }
+
+    Some((min.min(max), min.max(max)))
 }
 
 fn trace_source_sample_count(trace: &VisibleTrace) -> usize {
@@ -2891,6 +3059,7 @@ mod app_tests {
         assert!(added_first);
         assert_eq!(first_row_id, 0);
         assert_eq!(view.rows[0].channels.len(), 1);
+        assert_eq!(view.rows[0].y_range.mode, YRangeMode::Auto);
         assert_eq!(view.rows[0].channels[0].draw_mode, DrawMode::Line);
         assert!(view.rows[0].channels[0].visible);
         assert_eq!(
@@ -2900,6 +3069,7 @@ mod app_tests {
         assert_eq!(view.rows[0].channels[0].color_override, None);
 
         let second_row_id = view.add_row();
+        assert_eq!(view.rows[1].y_range, RowYRange::default());
         let (added_second, target_row_id) = view.add_channel_to_selected_row("pwm_1kHz");
         assert!(added_second);
         assert_eq!(target_row_id, second_row_id);
@@ -2978,6 +3148,82 @@ mod app_tests {
             hover_value_at_time(&time, &values, 2.0, DrawMode::Step),
             Some(20.0)
         );
+    }
+
+    #[test]
+    fn auto_y_range_uses_padded_trace_range() {
+        let range = display_value_range((1.0, 3.0), RowYRange::default()).expect("auto y range");
+
+        assert!((range.0 - 0.9).abs() < 1.0e-12);
+        assert!((range.1 - 3.1).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn manual_y_range_uses_row_values_without_padding() {
+        let range = display_value_range(
+            (-10.0, 10.0),
+            RowYRange {
+                mode: YRangeMode::Manual,
+                min: -2.5,
+                max: 7.5,
+                ..RowYRange::default()
+            },
+        )
+        .expect("manual y range");
+
+        assert_eq!(range, (-2.5, 7.5));
+    }
+
+    #[test]
+    fn manual_y_range_accepts_reversed_inputs() {
+        let range = display_value_range(
+            (-10.0, 10.0),
+            RowYRange {
+                mode: YRangeMode::Manual,
+                min: 5.0,
+                max: -1.0,
+                ..RowYRange::default()
+            },
+        )
+        .expect("manual y range");
+
+        assert_eq!(range, (-1.0, 5.0));
+    }
+
+    #[test]
+    fn manual_y_range_seeds_from_last_auto_range() {
+        let mut y_range = RowYRange::default();
+        y_range.set_last_auto((-2.0, 4.0));
+
+        y_range.set_manual_from_last_auto();
+
+        assert_eq!(y_range.mode, YRangeMode::Manual);
+        assert_eq!((y_range.min, y_range.max), (-2.0, 4.0));
+    }
+
+    #[test]
+    fn manual_y_range_seed_falls_back_to_default_without_auto_range() {
+        let mut y_range = RowYRange::default();
+
+        y_range.set_manual_from_last_auto();
+
+        assert_eq!(y_range.mode, YRangeMode::Manual);
+        assert_eq!((y_range.min, y_range.max), (-1.0, 1.0));
+    }
+
+    #[test]
+    fn manual_y_range_reset_uses_latest_auto_range() {
+        let mut y_range = RowYRange::default();
+        y_range.set_last_auto((-2.0, 4.0));
+        y_range.set_manual_from_last_auto();
+        y_range.min = -10.0;
+        y_range.max = 10.0;
+        y_range.set_last_auto((-0.5, 0.5));
+
+        y_range.set_manual_from_last_auto();
+
+        assert_eq!(y_range.mode, YRangeMode::Manual);
+        assert_eq!((y_range.min, y_range.max), (-0.5, 0.5));
     }
 
     #[test]
