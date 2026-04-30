@@ -1,5 +1,6 @@
 use eframe::egui;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc;
 
 mod parquet_schema;
 mod parquet_waveform;
@@ -142,11 +143,13 @@ fn cli_command_arg() -> Option<CliCommand> {
     }
 }
 
-#[derive(Debug)]
 struct PanelYApp {
     dataset: DatasetState,
     view: ViewState,
     load: LoadState,
+    load_result_tx: mpsc::Sender<LoadJobResult>,
+    load_result_rx: mpsc::Receiver<LoadJobResult>,
+    next_load_job_id: u64,
 }
 
 #[derive(Debug)]
@@ -173,6 +176,32 @@ struct LoadState {
     pending_jobs: usize,
     progress: Option<String>,
     error: Option<String>,
+    active_jobs: BTreeMap<u64, ActiveLoadJob>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveLoadJob {
+    channel_path: String,
+    channel_name: String,
+    target_row_id: u64,
+    target_row_label: String,
+    time_was_cached: bool,
+    channel_was_cached: bool,
+    started: std::time::Instant,
+}
+
+#[derive(Debug)]
+struct LoadJobResult {
+    job_id: u64,
+    parquet_path: String,
+    channel_path: String,
+    result: Result<LoadedChannelData, String>,
+}
+
+#[derive(Debug)]
+struct LoadedChannelData {
+    time: Option<parquet_waveform::TimeData>,
+    channel: Option<parquet_waveform::ChannelData>,
 }
 
 #[derive(Clone, Debug)]
@@ -278,16 +307,22 @@ struct VisibleRowTrace {
     row_id: u64,
     row_index: usize,
     row_channel_count: usize,
+    loading_channel_count: usize,
+    unloaded_channel_count: usize,
     y_range: RowYRange,
     traces: Vec<VisibleTrace>,
 }
 
 impl Default for PanelYApp {
     fn default() -> Self {
+        let (load_result_tx, load_result_rx) = mpsc::channel();
         Self {
             dataset: DatasetState::default(),
             view: ViewState::default(),
             load: LoadState::default(),
+            load_result_tx,
+            load_result_rx,
+            next_load_job_id: 1,
         }
     }
 }
@@ -323,7 +358,42 @@ impl Default for LoadState {
             pending_jobs: 0,
             progress: None,
             error: None,
+            active_jobs: BTreeMap::new(),
         }
+    }
+}
+
+impl LoadState {
+    fn is_busy(&self) -> bool {
+        !self.active_jobs.is_empty()
+    }
+
+    fn is_channel_loading(&self, channel_path: &str) -> bool {
+        self.active_jobs
+            .values()
+            .any(|job| job.channel_path == channel_path)
+    }
+
+    fn loading_channel_paths(&self) -> BTreeSet<String> {
+        self.active_jobs
+            .values()
+            .map(|job| job.channel_path.clone())
+            .collect()
+    }
+
+    fn refresh_progress(&mut self) {
+        self.pending_jobs = self.active_jobs.len();
+        self.progress = if self.active_jobs.is_empty() {
+            None
+        } else {
+            let labels = self
+                .active_jobs
+                .values()
+                .map(|job| format!("{} -> {}", job.channel_name, job.target_row_label))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("loading: {labels}"))
+        };
     }
 }
 
@@ -502,21 +572,41 @@ impl ViewState {
             .unwrap_or_else(|| "Row -".to_owned())
     }
 
-    fn add_channel_to_selected_row(&mut self, channel_path: &str) -> (bool, u64) {
+    fn row_display_name(&self, row_id: u64) -> String {
+        self.rows
+            .iter()
+            .position(|row| row.id == row_id)
+            .map(|index| format!("Row {}", index + 1))
+            .unwrap_or_else(|| "Row -".to_owned())
+    }
+
+    fn selected_row_id_or_first(&mut self) -> Option<u64> {
         self.ensure_row_state();
-        let row_index = self.selected_row_index().unwrap_or(0);
-        let row = &mut self.rows[row_index];
+        self.selected_row_id
+            .or_else(|| self.rows.first().map(|row| row.id))
+    }
+
+    fn add_channel_to_row(&mut self, row_id: u64, channel_path: &str) -> Option<(bool, u64)> {
+        self.ensure_row_state();
+        let row = self.rows.iter_mut().find(|row| row.id == row_id)?;
         if row
             .channels
             .iter()
             .any(|channel| channel.channel_path == channel_path)
         {
-            return (false, row.id);
+            return Some((false, row.id));
         }
 
         row.channels
             .push(RowChannel::new(channel_path, row.channels.len()));
-        (true, row.id)
+        Some((true, row.id))
+    }
+
+    #[cfg(test)]
+    fn add_channel_to_selected_row(&mut self, channel_path: &str) -> (bool, u64) {
+        let row_id = self.selected_row_id_or_first().unwrap_or(0);
+        self.add_channel_to_row(row_id, channel_path)
+            .unwrap_or((false, row_id))
     }
 
     fn has_visible_channels(&self) -> bool {
@@ -524,6 +614,25 @@ impl ViewState {
             .iter()
             .any(|row| row.channels.iter().any(|channel| channel.visible))
     }
+}
+
+fn row_missing_channel_counts(
+    row: &PlotRow,
+    loaded_channels: Option<&ChannelStore>,
+    loading_channel_paths: &BTreeSet<String>,
+) -> (usize, usize) {
+    row.channels.iter().filter(|channel| channel.visible).fold(
+        (0usize, 0usize),
+        |(loading, unloaded), channel| {
+            if loaded_channels.is_some_and(|store| store.has_channel(&channel.channel_path)) {
+                (loading, unloaded)
+            } else if loading_channel_paths.contains(&channel.channel_path) {
+                (loading + 1, unloaded)
+            } else {
+                (loading, unloaded + 1)
+            }
+        },
+    )
 }
 
 impl ChannelStore {
@@ -1044,8 +1153,70 @@ fn format_optional_mib(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".to_owned())
 }
 
+fn load_channel_data(
+    path: &str,
+    summary: &parquet_schema::SchemaSummary,
+    channel_path: &str,
+    needs_time: bool,
+    needs_channel: bool,
+) -> Result<LoadedChannelData, String> {
+    let time = if needs_time {
+        Some(parquet_waveform::read_time_column(path, summary)?)
+    } else {
+        None
+    };
+    let channel = if needs_channel {
+        Some(parquet_waveform::read_channel_values(
+            path,
+            summary,
+            channel_path,
+        )?)
+    } else {
+        None
+    };
+
+    if let (Some(time), Some(channel)) = (&time, &channel)
+        && time.sample_count() != channel.sample_count()
+    {
+        return Err(format!(
+            "time/value length mismatch: {} vs {}",
+            time.sample_count(),
+            channel.sample_count()
+        ));
+    }
+
+    Ok(LoadedChannelData { time, channel })
+}
+
+fn spawn_load_channel_job(
+    tx: mpsc::Sender<LoadJobResult>,
+    ctx: egui::Context,
+    job_id: u64,
+    path: String,
+    summary: parquet_schema::SchemaSummary,
+    channel_path: String,
+    needs_time: bool,
+    needs_channel: bool,
+) {
+    std::thread::spawn(move || {
+        let result = load_channel_data(&path, &summary, &channel_path, needs_time, needs_channel);
+        let _ = tx.send(LoadJobResult {
+            job_id,
+            parquet_path: path,
+            channel_path,
+            result,
+        });
+        ctx.request_repaint();
+    });
+}
+
 impl PanelYApp {
     fn load_schema(&mut self) {
+        if self.load.is_busy() {
+            self.load.status = "Wait for active load jobs before loading schema".to_owned();
+            return;
+        }
+
         match parquet_schema::read_schema_summary(&self.dataset.parquet_path) {
             Ok(summary) => {
                 let time_status = if summary.time_column.is_some() {
@@ -1076,7 +1247,7 @@ impl PanelYApp {
         }
     }
 
-    fn load_selected_channel(&mut self) {
+    fn load_selected_channel(&mut self, ctx: &egui::Context) {
         if self.view.selected_channel.is_empty() {
             self.load.status = "Select a channel before loading waveform data".to_owned();
             return;
@@ -1091,73 +1262,94 @@ impl PanelYApp {
             return;
         }
 
-        self.load.pending_jobs = 1;
-        let path = self.dataset.parquet_path.clone();
-        let selected_channel = self.view.selected_channel.clone();
-        let time_was_cached = self.dataset.shared_time.is_some();
-
-        if !time_was_cached {
-            match parquet_waveform::read_time_column(&path, &summary) {
-                Ok(time) => {
-                    self.dataset.shared_time = Some(time);
-                }
-                Err(error) => {
-                    self.load.pending_jobs = 0;
-                    self.load.error = Some(error.clone());
-                    self.load.status = format!("Time load failed: {error}");
-                    return;
-                }
-            }
-        }
-
-        let Some(shared_time) = self.dataset.shared_time.as_ref() else {
-            self.load.pending_jobs = 0;
-            self.load.status = "Time data is not available".to_owned();
+        let Some(target_row_id) = self.view.selected_row_id_or_first() else {
+            self.load.status = "Select a row before loading waveform data".to_owned();
             return;
         };
-        let time_sample_count = shared_time.sample_count();
-        let time_read_sec = shared_time.elapsed.as_secs_f64();
-
+        let path = self.dataset.parquet_path.clone();
+        let selected_channel = self.view.selected_channel.clone();
+        let channel_name = summary
+            .channels
+            .iter()
+            .find(|channel| channel.path == selected_channel)
+            .map(|channel| channel.display_name().to_owned())
+            .unwrap_or_else(|| selected_channel.clone());
+        let target_row_label = self.view.row_display_name(target_row_id);
+        let (row_added, row_id) = self
+            .view
+            .add_channel_to_row(target_row_id, &selected_channel)
+            .unwrap_or((false, target_row_id));
+        let time_was_cached = self.dataset.shared_time.is_some();
         let channel_was_cached = self.dataset.loaded_channels.has_channel(&selected_channel);
-        let channel_path = if channel_was_cached {
-            selected_channel.clone()
-        } else {
-            match parquet_waveform::read_channel_values(&path, &summary, &selected_channel) {
-                Ok(channel) => {
-                    if channel.sample_count() != time_sample_count {
-                        self.load.pending_jobs = 0;
-                        self.load.status = format!(
-                            "Waveform load failed: time/value length mismatch: {} vs {}",
-                            time_sample_count,
-                            channel.sample_count()
-                        );
-                        return;
-                    }
-                    let channel_path = channel.channel_path.clone();
-                    self.dataset.loaded_channels.insert_channel(channel);
-                    channel_path
-                }
-                Err(error) => {
-                    self.load.pending_jobs = 0;
-                    self.load.error = Some(error.clone());
-                    self.load.status = format!("Waveform load failed: {error}");
-                    return;
-                }
-            }
-        };
 
-        let Some(channel) = self.dataset.loaded_channels.channel(&channel_path) else {
-            self.load.pending_jobs = 0;
+        if time_was_cached && channel_was_cached {
+            self.finish_cached_channel_add(
+                &selected_channel,
+                &target_row_label,
+                row_added,
+                row_id,
+                true,
+            );
+            return;
+        }
+
+        if self.load.is_channel_loading(&selected_channel) {
+            let row_note = if row_added {
+                format!("queued display in {target_row_label}")
+            } else {
+                format!("already queued in {target_row_label}")
+            };
+            self.load.status = format!("Already loading: {channel_name}, {row_note}");
+            return;
+        }
+
+        let needs_time = !time_was_cached;
+        let needs_channel = !channel_was_cached;
+        let job_id = self.next_load_job_id;
+        self.next_load_job_id = self.next_load_job_id.saturating_add(1);
+        self.load.active_jobs.insert(
+            job_id,
+            ActiveLoadJob {
+                channel_path: selected_channel.clone(),
+                channel_name: channel_name.clone(),
+                target_row_id,
+                target_row_label: target_row_label.clone(),
+                time_was_cached,
+                channel_was_cached,
+                started: std::time::Instant::now(),
+            },
+        );
+        self.load.error = None;
+        self.load.status = format!("Loading: {channel_name} -> {target_row_label}");
+        self.load.refresh_progress();
+
+        spawn_load_channel_job(
+            self.load_result_tx.clone(),
+            ctx.clone(),
+            job_id,
+            path,
+            summary,
+            selected_channel,
+            needs_time,
+            needs_channel,
+        );
+    }
+
+    fn finish_cached_channel_add(
+        &mut self,
+        channel_path: &str,
+        target_row_label: &str,
+        row_added: bool,
+        row_id: u64,
+        time_was_cached: bool,
+    ) {
+        let Some(channel) = self.dataset.loaded_channels.channel(channel_path) else {
             self.load.status = format!("Loaded channel is missing from cache: {channel_path}");
             return;
         };
-
         let channel_name = channel.channel_name.clone();
-        let channel_read_sec = channel.elapsed.as_secs_f64();
         let channel_sample_count = channel.sample_count();
         let channel_memory = channel.memory_bytes();
-        let target_row_label = self.view.selected_row_display_name();
-        let (row_added, row_id) = self.view.add_channel_to_selected_row(&channel_path);
         if self.view.x_range.is_none() {
             self.view.x_range = self
                 .dataset
@@ -1165,14 +1357,7 @@ impl PanelYApp {
                 .as_ref()
                 .and_then(parquet_waveform::TimeData::time_range);
         }
-
-        self.load.pending_jobs = 0;
         self.load.error = None;
-        let cache_note = if channel_was_cached {
-            "reused cached"
-        } else {
-            "loaded"
-        };
         let row_note = if row_added {
             format!("added to {target_row_label}")
         } else {
@@ -1190,12 +1375,142 @@ impl PanelYApp {
             .map_or(0, parquet_waveform::TimeData::memory_bytes)
             + self.dataset.loaded_channels.raw_memory_bytes();
         self.load.status = format!(
-            "{cache_note}: {channel_name} ({channel_sample_count} samples, {:.1} MiB, read {:.3}s), {row_note} (id {row_id}); {time_note} {:.3}s; cache {} ch, total {:.1} MiB",
+            "reused cached: {channel_name} ({channel_sample_count} samples, {:.1} MiB), {row_note} (id {row_id}); {time_note}; cache {} ch, total {:.1} MiB",
             bytes_to_mib(channel_memory),
-            channel_read_sec,
-            time_read_sec,
             self.dataset.loaded_channels.raw_by_channel.len(),
             bytes_to_mib(total_memory)
+        );
+    }
+
+    fn drain_load_results(&mut self) {
+        while let Ok(result) = self.load_result_rx.try_recv() {
+            self.apply_load_result(result);
+        }
+    }
+
+    fn apply_load_result(&mut self, result: LoadJobResult) {
+        let Some(job) = self.load.active_jobs.remove(&result.job_id) else {
+            self.load.refresh_progress();
+            return;
+        };
+        self.load.refresh_progress();
+
+        if result.parquet_path != self.dataset.parquet_path {
+            self.load.status = format!(
+                "Ignored stale load result for {} from {}",
+                job.channel_name, result.parquet_path
+            );
+            return;
+        }
+        if result.channel_path != job.channel_path {
+            self.load.status = format!(
+                "Ignored mismatched load result: expected {}, got {}",
+                job.channel_path, result.channel_path
+            );
+            return;
+        }
+
+        match result.result {
+            Ok(loaded) => self.apply_loaded_channel(job, loaded),
+            Err(error) => {
+                self.load.error = Some(error.clone());
+                self.load.status = format!("Waveform load failed: {}: {error}", job.channel_name);
+            }
+        }
+    }
+
+    fn apply_loaded_channel(&mut self, job: ActiveLoadJob, loaded: LoadedChannelData) {
+        if let Some(time) = loaded.time {
+            if let Some(existing_time) = &self.dataset.shared_time
+                && existing_time.sample_count() != time.sample_count()
+            {
+                self.load.status = format!(
+                    "Time load failed: sample count changed: {} vs {}",
+                    existing_time.sample_count(),
+                    time.sample_count()
+                );
+                self.load.error = Some(self.load.status.clone());
+                return;
+            }
+            self.dataset.shared_time = Some(time);
+        }
+
+        let Some(shared_time) = self.dataset.shared_time.as_ref() else {
+            self.load.status = "Time data is not available".to_owned();
+            self.load.error = Some(self.load.status.clone());
+            return;
+        };
+        let time_sample_count = shared_time.sample_count();
+        let time_read_sec = shared_time.elapsed.as_secs_f64();
+
+        if let Some(channel) = loaded.channel {
+            if channel.sample_count() != time_sample_count {
+                self.load.status = format!(
+                    "Waveform load failed: time/value length mismatch: {} vs {}",
+                    time_sample_count,
+                    channel.sample_count()
+                );
+                self.load.error = Some(self.load.status.clone());
+                return;
+            }
+            if !self
+                .dataset
+                .loaded_channels
+                .has_channel(&channel.channel_path)
+            {
+                self.dataset.loaded_channels.insert_channel(channel);
+            }
+        }
+
+        let Some(channel) = self.dataset.loaded_channels.channel(&job.channel_path) else {
+            self.load.status =
+                format!("Loaded channel is missing from cache: {}", job.channel_path);
+            self.load.error = Some(self.load.status.clone());
+            return;
+        };
+
+        let channel_name = channel.channel_name.clone();
+        let channel_read_sec = channel.elapsed.as_secs_f64();
+        let channel_sample_count = channel.sample_count();
+        let channel_memory = channel.memory_bytes();
+        let (row_added, row_id) = self
+            .view
+            .add_channel_to_row(job.target_row_id, &job.channel_path)
+            .unwrap_or((false, job.target_row_id));
+        if self.view.x_range.is_none() {
+            self.view.x_range = shared_time.time_range();
+        }
+
+        self.load.error = None;
+        let cache_note = if job.channel_was_cached {
+            "reused cached"
+        } else {
+            "loaded"
+        };
+        let row_note = if row_added {
+            format!("added to {}", job.target_row_label)
+        } else {
+            format!("already in {}", job.target_row_label)
+        };
+        let time_note = if job.time_was_cached {
+            "time cached".to_owned()
+        } else {
+            format!("time loaded {:.3}s", time_read_sec)
+        };
+        let total_memory = self
+            .dataset
+            .shared_time
+            .as_ref()
+            .map_or(0, parquet_waveform::TimeData::memory_bytes)
+            + self.dataset.loaded_channels.raw_memory_bytes();
+        let elapsed_sec = job.started.elapsed().as_secs_f64();
+        self.load.status = format!(
+            "{cache_note}: {channel_name} ({channel_sample_count} samples, {:.1} MiB, read {:.3}s), {row_note} (id {row_id}); {time_note}; cache {} ch, total {:.1} MiB; background {:.3}s",
+            bytes_to_mib(channel_memory),
+            channel_read_sec,
+            self.dataset.loaded_channels.raw_by_channel.len(),
+            bytes_to_mib(total_memory),
+            elapsed_sec
         );
     }
 
@@ -1214,6 +1529,7 @@ impl PanelYApp {
         dark_mode: bool,
     ) -> Vec<VisibleRowTrace> {
         let rows = self.view.rows.clone();
+        let loading_channel_paths = self.load.loading_channel_paths();
         if rows.is_empty() {
             return Vec::new();
         }
@@ -1226,6 +1542,18 @@ impl PanelYApp {
                     row_id: row.id,
                     row_index,
                     row_channel_count: row.channels.len(),
+                    loading_channel_count: row_missing_channel_counts(
+                        &row,
+                        None,
+                        &loading_channel_paths,
+                    )
+                    .0,
+                    unloaded_channel_count: row_missing_channel_counts(
+                        &row,
+                        None,
+                        &loading_channel_paths,
+                    )
+                    .1,
                     y_range: row.y_range,
                     traces: Vec::new(),
                 })
@@ -1241,6 +1569,18 @@ impl PanelYApp {
                     row_id: row.id,
                     row_index,
                     row_channel_count: row.channels.len(),
+                    loading_channel_count: row_missing_channel_counts(
+                        &row,
+                        Some(&self.dataset.loaded_channels),
+                        &loading_channel_paths,
+                    )
+                    .0,
+                    unloaded_channel_count: row_missing_channel_counts(
+                        &row,
+                        Some(&self.dataset.loaded_channels),
+                        &loading_channel_paths,
+                    )
+                    .1,
                     y_range: row.y_range,
                     traces: Vec::new(),
                 })
@@ -1276,6 +1616,8 @@ impl PanelYApp {
             for (row_index, row) in rows.into_iter().enumerate() {
                 let mut traces = Vec::with_capacity(row.channels.len());
                 let row_channel_count = row.channels.len();
+                let mut loading_channel_count = 0usize;
+                let mut unloaded_channel_count = 0usize;
                 for row_channel in row.channels {
                     if !row_channel.visible {
                         continue;
@@ -1291,6 +1633,11 @@ impl PanelYApp {
                             )
                         })
                     else {
+                        if loading_channel_paths.contains(&row_channel.channel_path) {
+                            loading_channel_count += 1;
+                        } else {
+                            unloaded_channel_count += 1;
+                        }
                         continue;
                     };
 
@@ -1380,6 +1727,8 @@ impl PanelYApp {
                     row_id: row.id,
                     row_index,
                     row_channel_count,
+                    loading_channel_count,
+                    unloaded_channel_count,
                     y_range: row.y_range,
                     traces,
                 });
@@ -1529,6 +1878,10 @@ impl PanelYApp {
 
 impl eframe::App for PanelYApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.drain_load_results();
+        let load_active = self.load.is_busy();
+        let loading_channel_paths = self.load.loading_channel_paths();
+
         egui::Panel::top("top_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Panel_y Rust Phase 2");
@@ -1536,7 +1889,12 @@ impl eframe::App for PanelYApp {
                 ui.label(&self.load.status);
                 if self.load.pending_jobs > 0 {
                     ui.separator();
+                    ui.add(egui::Spinner::new());
                     ui.label(format!("jobs: {}", self.load.pending_jobs));
+                }
+                if let Some(progress) = &self.load.progress {
+                    ui.separator();
+                    ui.label(progress);
                 }
             });
         });
@@ -1551,10 +1909,16 @@ impl eframe::App for PanelYApp {
                     .show(ui, |ui| {
                         ui.heading("Dataset");
                         ui.label("Parquet path");
-                        ui.text_edit_singleline(&mut self.dataset.parquet_path);
+                        ui.add_enabled(
+                            !load_active,
+                            egui::TextEdit::singleline(&mut self.dataset.parquet_path),
+                        );
 
                         ui.add_space(12.0);
-                        if ui.button("Load Schema").clicked() {
+                        if ui
+                            .add_enabled(!load_active, egui::Button::new("Load Schema"))
+                            .clicked()
+                        {
                             self.load_schema();
                         }
 
@@ -1568,7 +1932,7 @@ impl eframe::App for PanelYApp {
                             .add_enabled(can_load_waveform, egui::Button::new(add_channel_label))
                             .clicked()
                         {
-                            self.load_selected_channel();
+                            self.load_selected_channel(ui.ctx());
                         }
 
                         ui.add_space(16.0);
@@ -1593,7 +1957,12 @@ impl eframe::App for PanelYApp {
                         }
 
                         draw_channel_cache_controls(ui, &self.dataset);
-                        if draw_row_controls(ui, &mut self.view, self.dataset.schema.as_ref()) {
+                        if draw_row_controls(
+                            ui,
+                            &mut self.view,
+                            self.dataset.schema.as_ref(),
+                            &loading_channel_paths,
+                        ) {
                             self.dataset.loaded_channels.clear_envelope_cache();
                         }
                     });
@@ -1653,6 +2022,16 @@ impl eframe::App for PanelYApp {
                                     ui.visuals(),
                                     &row.traces,
                                     row.y_range,
+                                );
+                            }
+                            Some(row) if row.loading_channel_count > 0 => {
+                                draw_status_label(&painter, plot_rect, "Loading waveform data...");
+                            }
+                            Some(row) if row.unloaded_channel_count > 0 => {
+                                draw_status_label(
+                                    &painter,
+                                    plot_rect,
+                                    "Waveform data is not loaded",
                                 );
                             }
                             Some(row) if row.row_channel_count > 0 => {
@@ -1822,6 +2201,7 @@ fn draw_row_controls(
     ui: &mut egui::Ui,
     view: &mut ViewState,
     schema: Option<&parquet_schema::SchemaSummary>,
+    loading_channel_paths: &BTreeSet<String>,
 ) -> bool {
     ui.add_space(16.0);
     ui.heading("Rows");
@@ -1843,6 +2223,10 @@ fn draw_row_controls(
 
     for (row_index, row) in view.rows.iter_mut().enumerate() {
         ui.separator();
+        let row_has_loading_channel = row
+            .channels
+            .iter()
+            .any(|channel| loading_channel_paths.contains(&channel.channel_path));
         ui.horizontal(|ui| {
             let row_label = format!("Row {}", row_index + 1);
             if ui
@@ -1852,7 +2236,10 @@ fn draw_row_controls(
                 selected_row_id = Some(row.id);
             }
             if ui
-                .add_enabled(can_delete_row, egui::Button::new("Delete"))
+                .add_enabled(
+                    can_delete_row && !row_has_loading_channel,
+                    egui::Button::new("Delete"),
+                )
                 .clicked()
             {
                 remove_row_id = Some(row.id);
@@ -1874,6 +2261,7 @@ fn draw_row_controls(
                 ("channel_style", row.id, channel.channel_path.clone()),
                 |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        let channel_loading = loading_channel_paths.contains(&channel.channel_path);
                         if ui
                             .checkbox(&mut channel.visible, "")
                             .on_hover_text("Visible")
@@ -1894,7 +2282,15 @@ fn draw_row_controls(
                             changed = true;
                         }
 
-                        ui.label(channel_display_name(schema, &channel.channel_path));
+                        let label = if channel_loading {
+                            format!(
+                                "{} (loading)",
+                                channel_display_name(schema, &channel.channel_path)
+                            )
+                        } else {
+                            channel_display_name(schema, &channel.channel_path)
+                        };
+                        ui.label(label);
                         egui::ComboBox::from_id_salt("draw_mode")
                             .selected_text(channel.draw_mode.as_str())
                             .show_ui(ui, |ui| {
@@ -1935,7 +2331,10 @@ fn draw_row_controls(
                             changed = true;
                         }
 
-                        if ui.small_button("Remove").clicked() {
+                        if ui
+                            .add_enabled(!channel_loading, egui::Button::new("Remove"))
+                            .clicked()
+                        {
                             remove_channel = Some(channel.channel_path.clone());
                         }
                     });

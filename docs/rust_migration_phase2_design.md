@@ -288,6 +288,7 @@ UI実装の優先:
 - 2026-04-30: P2-02完了。dataset単位の共有timeとchannel単位のraw cache、表示range単位のenvelope cacheを追加した
 - 2026-04-30: P2-03一部完了。1行目へ複数channelを追加し、重ね表示できるようにした。行追加・削除とstyle編集は未実装
 - 2026-04-30: P2-04実装。row追加・削除、選択rowへのchannel追加、rowごとの描画rect分割に対応した
+- 2026-04-30: P2-10実装・GUI確認。channel/time読み込みをworker thread化し、完了時だけUI stateへ反映するようにした
 - 2026-04-30: P2-05の実装土台を確認。`ViewState::x_range` は1つだけ保持し、pan/zoom/resetは全row共通rangeへ反映する。複数行GUIの手動操作確認は次回継続
 - 2026-04-30: P2-04/P2-05手動確認完了。複数行にわたるDelete/Remove、pan/zoom/resetの全row同期は軽快で問題なし
 - 2026-04-30: 行数増加時の見切れ対策として、左ペインを縦スクロール化し、波形ペインもrow最小高を維持して縦スクロールできるようにした
