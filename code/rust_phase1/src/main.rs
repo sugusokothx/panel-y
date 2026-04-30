@@ -12,6 +12,8 @@ const BENCH_VISIBLE_ENVELOPE_BUCKETS: usize = 1_200;
 const BENCH_RANGE_RUNS: usize = 24;
 const STRESS_RANGE_RUNS: usize = 1_000;
 const STRESS_REPORT_BLOCKS: usize = 5;
+const MIN_WAVEFORM_ROW_HEIGHT: f32 = 180.0;
+const WAVEFORM_ROW_GAP: f32 = 10.0;
 
 fn main() -> eframe::Result {
     if let Some(command) = cli_command_arg() {
@@ -152,6 +154,8 @@ struct DatasetState {
 #[derive(Debug)]
 struct ViewState {
     selected_channel: String,
+    selected_row_id: Option<u64>,
+    next_row_id: u64,
     x_range: Option<(f64, f64)>,
     rows: Vec<PlotRow>,
 }
@@ -207,6 +211,13 @@ struct VisibleEnvelope {
     envelope: parquet_waveform::MinMaxEnvelope,
 }
 
+#[derive(Debug)]
+struct VisibleRowEnvelope {
+    row_id: u64,
+    row_index: usize,
+    envelopes: Vec<VisibleEnvelope>,
+}
+
 impl Default for PanelYApp {
     fn default() -> Self {
         Self {
@@ -232,6 +243,8 @@ impl Default for ViewState {
     fn default() -> Self {
         Self {
             selected_channel: String::new(),
+            selected_row_id: Some(0),
+            next_row_id: 1,
             x_range: None,
             rows: vec![PlotRow {
                 id: 0,
@@ -274,6 +287,8 @@ impl ViewState {
         }
 
         self.x_range = None;
+        self.selected_row_id = Some(0);
+        self.next_row_id = 1;
         self.rows = vec![PlotRow {
             id: 0,
             channels: Vec::new(),
@@ -283,13 +298,15 @@ impl ViewState {
     fn reset_empty(&mut self) {
         self.selected_channel.clear();
         self.x_range = None;
+        self.selected_row_id = Some(0);
+        self.next_row_id = 1;
         self.rows = vec![PlotRow {
             id: 0,
             channels: Vec::new(),
         }];
     }
 
-    fn add_channel_to_first_row(&mut self, channel_path: &str) -> bool {
+    fn ensure_row_state(&mut self) {
         if self.rows.is_empty() {
             self.rows.push(PlotRow {
                 id: 0,
@@ -297,27 +314,76 @@ impl ViewState {
             });
         }
 
-        let row = &mut self.rows[0];
+        let next_row_id = self.rows.iter().map(|row| row.id).max().unwrap_or(0) + 1;
+        self.next_row_id = self.next_row_id.max(next_row_id);
+
+        let selected_row_exists = self
+            .selected_row_id
+            .is_some_and(|selected_id| self.rows.iter().any(|row| row.id == selected_id));
+        if !selected_row_exists {
+            self.selected_row_id = self.rows.first().map(|row| row.id);
+        }
+    }
+
+    fn add_row(&mut self) -> u64 {
+        self.ensure_row_state();
+        let id = self.next_row_id;
+        self.next_row_id += 1;
+        self.rows.push(PlotRow {
+            id,
+            channels: Vec::new(),
+        });
+        self.selected_row_id = Some(id);
+        id
+    }
+
+    fn remove_row(&mut self, row_id: u64) -> bool {
+        self.ensure_row_state();
+        if self.rows.len() <= 1 {
+            return false;
+        }
+
+        let Some(remove_index) = self.rows.iter().position(|row| row.id == row_id) else {
+            return false;
+        };
+
+        self.rows.remove(remove_index);
+        if self.selected_row_id == Some(row_id) {
+            let next_index = remove_index.min(self.rows.len().saturating_sub(1));
+            self.selected_row_id = self.rows.get(next_index).map(|row| row.id);
+        }
+        self.ensure_row_state();
+        true
+    }
+
+    fn selected_row_index(&self) -> Option<usize> {
+        let selected_row_id = self.selected_row_id?;
+        self.rows.iter().position(|row| row.id == selected_row_id)
+    }
+
+    fn selected_row_display_name(&self) -> String {
+        self.selected_row_index()
+            .map(|index| format!("Row {}", index + 1))
+            .unwrap_or_else(|| "Row -".to_owned())
+    }
+
+    fn add_channel_to_selected_row(&mut self, channel_path: &str) -> (bool, u64) {
+        self.ensure_row_state();
+        let row_index = self.selected_row_index().unwrap_or(0);
+        let row = &mut self.rows[row_index];
         if row
             .channels
             .iter()
             .any(|channel| channel.channel_path == channel_path)
         {
-            return false;
+            return (false, row.id);
         }
 
         row.channels.push(RowChannel {
             channel_path: channel_path.to_owned(),
             color_index: row.channels.len(),
         });
-        true
-    }
-
-    fn visible_channels(&self) -> Vec<RowChannel> {
-        self.rows
-            .iter()
-            .flat_map(|row| row.channels.iter().cloned())
-            .collect()
+        (true, row.id)
     }
 
     fn has_visible_channels(&self) -> bool {
@@ -955,7 +1021,8 @@ impl PanelYApp {
         let channel_read_sec = channel.elapsed.as_secs_f64();
         let channel_sample_count = channel.sample_count();
         let channel_memory = channel.memory_bytes();
-        let row_added = self.view.add_channel_to_first_row(&channel_path);
+        let target_row_label = self.view.selected_row_display_name();
+        let (row_added, row_id) = self.view.add_channel_to_selected_row(&channel_path);
         if self.view.x_range.is_none() {
             self.view.x_range = self
                 .dataset
@@ -972,9 +1039,9 @@ impl PanelYApp {
             "loaded"
         };
         let row_note = if row_added {
-            "added to row"
+            format!("added to {target_row_label}")
         } else {
-            "already in row"
+            format!("already in {target_row_label}")
         };
         let time_note = if time_was_cached {
             "time cached"
@@ -988,7 +1055,7 @@ impl PanelYApp {
             .map_or(0, parquet_waveform::TimeData::memory_bytes)
             + self.dataset.loaded_channels.raw_memory_bytes();
         self.load.status = format!(
-            "{cache_note}: {channel_name} ({channel_sample_count} samples, {:.1} MiB, read {:.3}s), {row_note}; {time_note} {:.3}s; cache {} ch, total {:.1} MiB",
+            "{cache_note}: {channel_name} ({channel_sample_count} samples, {:.1} MiB, read {:.3}s), {row_note} (id {row_id}); {time_note} {:.3}s; cache {} ch, total {:.1} MiB",
             bytes_to_mib(channel_memory),
             channel_read_sec,
             time_read_sec,
@@ -1006,23 +1073,39 @@ impl PanelYApp {
         self.dataset.loaded_channels.clear_envelope_cache();
     }
 
-    fn visible_envelopes(
+    fn visible_row_envelopes(
         &mut self,
         requested_bucket_count: usize,
         dark_mode: bool,
-    ) -> Vec<VisibleEnvelope> {
-        let visible_channels = self.view.visible_channels();
-        if visible_channels.is_empty() {
+    ) -> Vec<VisibleRowEnvelope> {
+        let rows = self.view.rows.clone();
+        if rows.is_empty() {
             return Vec::new();
         }
 
         let Some(shared_time) = self.dataset.shared_time.as_ref() else {
-            return Vec::new();
+            return rows
+                .into_iter()
+                .enumerate()
+                .map(|(row_index, row)| VisibleRowEnvelope {
+                    row_id: row.id,
+                    row_index,
+                    envelopes: Vec::new(),
+                })
+                .collect();
         };
         let Some(full_range) = shared_time.time_range() else {
             self.view.x_range = None;
             self.dataset.loaded_channels.clear_envelope_cache();
-            return Vec::new();
+            return rows
+                .into_iter()
+                .enumerate()
+                .map(|(row_index, row)| VisibleRowEnvelope {
+                    row_id: row.id,
+                    row_index,
+                    envelopes: Vec::new(),
+                })
+                .collect();
         };
 
         let min_span = min_view_span(full_range, shared_time.sample_count());
@@ -1036,77 +1119,93 @@ impl PanelYApp {
             self.dataset.loaded_channels.clear_envelope_cache();
         }
 
-        let mut envelopes = Vec::with_capacity(visible_channels.len());
+        let mut visible_rows = Vec::with_capacity(rows.len());
         let mut built_count = 0usize;
         {
             let dataset = &mut self.dataset;
             let Some(shared_time) = dataset.shared_time.as_ref() else {
-                return envelopes;
+                return visible_rows;
             };
             let time_values = &shared_time.time;
             let loaded_channels = &mut dataset.loaded_channels;
             loaded_channels.prepare_envelope_context(view_range, requested_bucket_count);
 
-            for row_channel in visible_channels {
-                let Some((channel_name, channel_path, sample_count)) = loaded_channels
-                    .channel(&row_channel.channel_path)
-                    .map(|channel| {
-                        (
-                            channel.channel_name.clone(),
-                            channel.channel_path.clone(),
-                            channel.sample_count(),
-                        )
-                    })
-                else {
-                    continue;
-                };
+            for (row_index, row) in rows.into_iter().enumerate() {
+                let mut envelopes = Vec::with_capacity(row.channels.len());
+                for row_channel in row.channels {
+                    let Some((channel_name, channel_path, sample_count)) = loaded_channels
+                        .channel(&row_channel.channel_path)
+                        .map(|channel| {
+                            (
+                                channel.channel_name.clone(),
+                                channel.channel_path.clone(),
+                                channel.sample_count(),
+                            )
+                        })
+                    else {
+                        continue;
+                    };
 
-                let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
-                    &channel_path,
-                    time_values,
-                    view_range,
-                    requested_bucket_count,
-                ) else {
-                    continue;
-                };
+                    let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
+                        &channel_path,
+                        time_values,
+                        view_range,
+                        requested_bucket_count,
+                    ) else {
+                        continue;
+                    };
 
-                if was_built {
-                    built_count += 1;
+                    if was_built {
+                        built_count += 1;
+                    }
+                    envelopes.push(VisibleEnvelope {
+                        channel_name,
+                        channel_path,
+                        sample_count,
+                        color: channel_color(row_channel.color_index, dark_mode),
+                        envelope,
+                    });
                 }
-                envelopes.push(VisibleEnvelope {
-                    channel_name,
-                    channel_path,
-                    sample_count,
-                    color: channel_color(row_channel.color_index, dark_mode),
-                    envelope,
+
+                visible_rows.push(VisibleRowEnvelope {
+                    row_id: row.id,
+                    row_index,
+                    envelopes,
                 });
             }
         }
 
         if built_count > 0 {
-            let source_sample_count = envelopes
-                .first()
+            let visible_channel_count = visible_rows
+                .iter()
+                .map(|row| row.envelopes.len())
+                .sum::<usize>();
+            let source_sample_count = visible_rows
+                .iter()
+                .flat_map(|row| row.envelopes.iter())
+                .next()
                 .map(|visible| visible.envelope.source_sample_count)
                 .unwrap_or_default();
             self.load.status = format!(
-                "View {:.6}..{:.6}s: {} ch, {} visible samples, built {} envelope(s), cache {}",
+                "View {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), cache {}",
                 view_range.0,
                 view_range.1,
-                envelopes.len(),
+                visible_rows.len(),
+                visible_channel_count,
                 source_sample_count,
                 built_count,
                 self.dataset.loaded_channels.envelope_cache.len()
             );
         }
 
-        envelopes
+        visible_rows
     }
 
     fn handle_plot_interaction(
         &mut self,
         ui: &egui::Ui,
         response: &egui::Response,
-        plot_rect: egui::Rect,
+        plot_rects: &[egui::Rect],
     ) {
         let Some(shared_time) = self.dataset.shared_time.as_ref() else {
             return;
@@ -1123,6 +1222,22 @@ impl PanelYApp {
         );
         let current_range = next_range;
         let mut changed = false;
+        let (pointer_pos, zoom_delta, scroll_delta) = ui.input(|input| {
+            (
+                input.pointer.latest_pos(),
+                input.zoom_delta(),
+                input.smooth_scroll_delta(),
+            )
+        });
+        let Some((pointer_pos, plot_rect)) = pointer_pos.and_then(|pointer_pos| {
+            plot_rects
+                .iter()
+                .copied()
+                .find(|plot_rect| plot_rect.contains(pointer_pos))
+                .map(|plot_rect| (pointer_pos, plot_rect))
+        }) else {
+            return;
+        };
 
         if response.double_clicked() {
             next_range = full_range;
@@ -1139,18 +1254,7 @@ impl PanelYApp {
             }
         }
 
-        let (pointer_pos, zoom_delta, scroll_delta) = ui.input(|input| {
-            (
-                input.pointer.latest_pos(),
-                input.zoom_delta(),
-                input.smooth_scroll_delta(),
-            )
-        });
-
-        if let Some(pointer_pos) = pointer_pos
-            && plot_rect.contains(pointer_pos)
-            && plot_rect.width() > 1.0
-        {
+        if plot_rect.width() > 1.0 {
             if scroll_delta.x != 0.0 {
                 let span = next_range.1 - next_range.0;
                 let shift = -f64::from(scroll_delta.x) / f64::from(plot_rect.width()) * span;
@@ -1199,75 +1303,127 @@ impl eframe::App for PanelYApp {
             .resizable(false)
             .default_size(320.0)
             .show_inside(ui, |ui| {
-                ui.heading("Dataset");
-                ui.label("Parquet path");
-                ui.text_edit_singleline(&mut self.dataset.parquet_path);
+                egui::ScrollArea::vertical()
+                    .id_salt("controls_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.heading("Dataset");
+                        ui.label("Parquet path");
+                        ui.text_edit_singleline(&mut self.dataset.parquet_path);
 
-                ui.add_space(12.0);
-                if ui.button("Load Schema").clicked() {
-                    self.load_schema();
-                }
+                        ui.add_space(12.0);
+                        if ui.button("Load Schema").clicked() {
+                            self.load_schema();
+                        }
 
-                let can_load_waveform = self.dataset.schema.as_ref().is_some_and(|schema| {
-                    schema.time_column.is_some() && !schema.channels.is_empty()
-                }) && !self.view.selected_channel.is_empty();
-                if ui
-                    .add_enabled(can_load_waveform, egui::Button::new("Load / Add Channel"))
-                    .clicked()
-                {
-                    self.load_selected_channel();
-                }
+                        let can_load_waveform =
+                            self.dataset.schema.as_ref().is_some_and(|schema| {
+                                schema.time_column.is_some() && !schema.channels.is_empty()
+                            }) && !self.view.selected_channel.is_empty();
+                        let add_channel_label =
+                            format!("Load / Add to {}", self.view.selected_row_display_name());
+                        if ui
+                            .add_enabled(can_load_waveform, egui::Button::new(add_channel_label))
+                            .clicked()
+                        {
+                            self.load_selected_channel();
+                        }
 
-                ui.add_space(16.0);
-                if draw_schema_controls(
-                    ui,
-                    &mut self.view.selected_channel,
-                    self.dataset.schema.as_ref(),
-                ) {
-                    self.load.status = format!("Selected channel: {}", self.view.selected_channel);
-                }
+                        ui.add_space(16.0);
+                        if draw_schema_controls(
+                            ui,
+                            &mut self.view.selected_channel,
+                            self.dataset.schema.as_ref(),
+                        ) {
+                            self.load.status =
+                                format!("Selected channel: {}", self.view.selected_channel);
+                        }
 
-                if self.dataset.shared_time.is_some() || self.view.has_visible_channels() {
-                    ui.add_space(16.0);
-                    ui.heading("View");
-                    if ui.button("Reset X Range").clicked() {
-                        self.reset_view_range();
-                    }
-                    if let Some((start, end)) = self.view.x_range {
-                        ui.monospace(format!("x: {start:.6} .. {end:.6} s"));
-                    }
-                }
+                        if self.dataset.shared_time.is_some() || self.view.has_visible_channels() {
+                            ui.add_space(16.0);
+                            ui.heading("View");
+                            if ui.button("Reset X Range").clicked() {
+                                self.reset_view_range();
+                            }
+                            if let Some((start, end)) = self.view.x_range {
+                                ui.monospace(format!("x: {start:.6} .. {end:.6} s"));
+                            }
+                        }
 
-                draw_channel_cache_controls(ui, &self.dataset);
-                if draw_row_controls(ui, &mut self.view, self.dataset.schema.as_ref()) {
-                    self.dataset.loaded_channels.clear_envelope_cache();
-                }
+                        draw_channel_cache_controls(ui, &self.dataset);
+                        if draw_row_controls(ui, &mut self.view, self.dataset.schema.as_ref()) {
+                            self.dataset.loaded_channels.clear_envelope_cache();
+                        }
+                    });
             });
 
         egui::CentralPanel::default_margins().show_inside(ui, |ui| {
-            let available = ui.available_size();
-            let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
-            let painter = ui.painter_at(rect);
-            let plot_rect = plot_area_rect(rect);
-            let requested_buckets = visible_envelope_bucket_count(plot_rect);
+            let viewport_size = ui.available_size();
+            egui::ScrollArea::vertical()
+                .id_salt("waveform_scroll")
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(
+                    egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                )
+                .scroll_source(egui::containers::scroll_area::ScrollSource::SCROLL_BAR)
+                .show(ui, |ui| {
+                    let row_count = self.view.rows.len().max(1);
+                    let content_height = waveform_content_height(viewport_size.y, row_count);
+                    let content_size =
+                        egui::vec2(viewport_size.x.max(1.0), content_height.max(1.0));
+                    let (rect, response) =
+                        ui.allocate_exact_size(content_size, egui::Sense::click_and_drag());
+                    let painter = ui.painter_at(rect);
+                    let row_rects = row_outer_rects(rect, row_count);
+                    let plot_rects = row_rects
+                        .iter()
+                        .copied()
+                        .map(plot_area_rect)
+                        .collect::<Vec<_>>();
+                    let requested_buckets = plot_rects
+                        .first()
+                        .copied()
+                        .map(visible_envelope_bucket_count)
+                        .unwrap_or(MIN_VISIBLE_ENVELOPE_BUCKETS);
 
-            self.handle_plot_interaction(ui, &response, plot_rect);
-            let visible_envelopes =
-                self.visible_envelopes(requested_buckets, ui.visuals().dark_mode);
+                    self.handle_plot_interaction(ui, &response, &plot_rects);
+                    let visible_rows =
+                        self.visible_row_envelopes(requested_buckets, ui.visuals().dark_mode);
 
-            painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
-            draw_plot_frame(&painter, plot_rect, ui.visuals());
+                    painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+                    for (index, row_rect) in row_rects.iter().copied().enumerate() {
+                        let Some(plot_rect) = plot_rects.get(index).copied() else {
+                            continue;
+                        };
+                        let visible_row = visible_rows.get(index);
+                        let row_id = visible_row.map(|row| row.row_id).unwrap_or(index as u64);
+                        let row_index = visible_row.map(|row| row.row_index).unwrap_or(index);
+                        let selected = self.view.selected_row_id == Some(row_id);
 
-            if visible_envelopes.is_empty() {
-                draw_plot_placeholder(
-                    &painter,
-                    plot_rect,
-                    self.dataset.schema.as_ref(),
-                    &self.view.selected_channel,
-                );
-            } else {
-                draw_waveform_envelopes(&painter, plot_rect, ui.visuals(), &visible_envelopes);
-            }
+                        draw_row_marker(&painter, row_rect, row_index, selected, ui.visuals());
+                        draw_plot_frame(&painter, plot_rect, ui.visuals());
+
+                        match visible_row {
+                            Some(row) if !row.envelopes.is_empty() => {
+                                draw_waveform_envelopes(
+                                    &painter,
+                                    plot_rect,
+                                    ui.visuals(),
+                                    &row.envelopes,
+                                );
+                            }
+                            _ => {
+                                draw_row_placeholder(
+                                    &painter,
+                                    plot_rect,
+                                    self.dataset.schema.as_ref(),
+                                    &self.view.selected_channel,
+                                    row_index,
+                                );
+                            }
+                        }
+                    }
+                });
         });
     }
 }
@@ -1406,10 +1562,40 @@ fn draw_row_controls(
 ) -> bool {
     ui.add_space(16.0);
     ui.heading("Rows");
+    view.ensure_row_state();
 
     let mut changed = false;
-    for row in &mut view.rows {
-        ui.label(format!("Row {}", row.id + 1));
+    ui.horizontal(|ui| {
+        if ui.button("Add Row").clicked() {
+            view.add_row();
+            changed = true;
+        }
+    });
+
+    ui.label(format!("Load target: {}", view.selected_row_display_name()));
+
+    let can_delete_row = view.rows.len() > 1;
+    let mut selected_row_id = view.selected_row_id;
+    let mut remove_row_id = None;
+
+    for (row_index, row) in view.rows.iter_mut().enumerate() {
+        ui.separator();
+        ui.horizontal(|ui| {
+            let row_label = format!("Row {}", row_index + 1);
+            if ui
+                .selectable_label(selected_row_id == Some(row.id), row_label)
+                .clicked()
+            {
+                selected_row_id = Some(row.id);
+            }
+            if ui
+                .add_enabled(can_delete_row, egui::Button::new("Delete"))
+                .clicked()
+            {
+                remove_row_id = Some(row.id);
+            }
+        });
+
         if row.channels.is_empty() {
             ui.label("No channels in row");
             continue;
@@ -1432,6 +1618,13 @@ fn draw_row_controls(
                 .retain(|channel| channel.channel_path != channel_path);
             changed = true;
         }
+    }
+
+    view.selected_row_id = selected_row_id;
+    if let Some(row_id) = remove_row_id
+        && view.remove_row(row_id)
+    {
+        changed = true;
     }
 
     changed
@@ -1475,15 +1668,68 @@ fn draw_plot_frame(painter: &egui::Painter, rect: egui::Rect, visuals: &egui::Vi
 }
 
 fn plot_area_rect(rect: egui::Rect) -> egui::Rect {
-    let left = if rect.width() > 180.0 { 58.0 } else { 12.0 };
-    let bottom = if rect.height() > 120.0 { 36.0 } else { 12.0 };
-    let top = 20.0;
-    let right = 18.0;
+    let left = if rect.width() > 180.0 {
+        58.0_f32
+    } else {
+        12.0_f32
+    }
+    .min(rect.width() * 0.4);
+    let bottom = if rect.height() > 120.0 {
+        36.0_f32
+    } else {
+        12.0_f32
+    }
+    .min(rect.height() * 0.3);
+    let top = 20.0_f32.min(rect.height() * 0.3);
+    let right = 18.0_f32.min(rect.width() * 0.2);
 
     egui::Rect::from_min_max(
         egui::pos2(rect.left() + left, rect.top() + top),
         egui::pos2(rect.right() - right, rect.bottom() - bottom),
     )
+}
+
+fn waveform_content_height(viewport_height: f32, row_count: usize) -> f32 {
+    let row_count = row_count.max(1);
+    let total_gap = if row_count > 1 {
+        WAVEFORM_ROW_GAP * row_count.saturating_sub(1) as f32
+    } else {
+        0.0
+    };
+    let minimum_height = MIN_WAVEFORM_ROW_HEIGHT * row_count as f32 + total_gap;
+
+    viewport_height.max(minimum_height)
+}
+
+fn row_outer_rects(rect: egui::Rect, row_count: usize) -> Vec<egui::Rect> {
+    if row_count == 0 || rect.height() <= 0.0 || rect.width() <= 0.0 {
+        return Vec::new();
+    }
+
+    let gap = if row_count > 1 {
+        WAVEFORM_ROW_GAP.min(rect.height() / row_count as f32 * 0.2)
+    } else {
+        0.0
+    };
+    let total_gap = gap * row_count.saturating_sub(1) as f32;
+    let row_height = ((rect.height() - total_gap).max(1.0) / row_count as f32).max(1.0);
+    let mut row_rects = Vec::with_capacity(row_count);
+    let mut top = rect.top();
+
+    for index in 0..row_count {
+        let bottom = if index + 1 == row_count {
+            rect.bottom()
+        } else {
+            (top + row_height).min(rect.bottom())
+        };
+        row_rects.push(egui::Rect::from_min_max(
+            egui::pos2(rect.left(), top),
+            egui::pos2(rect.right(), bottom),
+        ));
+        top = bottom + gap;
+    }
+
+    row_rects
 }
 
 fn draw_waveform_envelopes(
@@ -1686,15 +1932,40 @@ fn draw_axis_labels(
     );
 }
 
-fn draw_plot_placeholder(
+fn draw_row_marker(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    row_index: usize,
+    selected: bool,
+    visuals: &egui::Visuals,
+) {
+    let color = if selected {
+        visuals.selection.stroke.color
+    } else {
+        visuals.weak_text_color()
+    };
+    painter.text(
+        rect.right_top() + egui::vec2(-4.0, 4.0),
+        egui::Align2::RIGHT_TOP,
+        format!("Row {}", row_index + 1),
+        egui::FontId::monospace(12.0),
+        color,
+    );
+}
+
+fn draw_row_placeholder(
     painter: &egui::Painter,
     rect: egui::Rect,
     schema: Option<&parquet_schema::SchemaSummary>,
     selected_channel: &str,
+    row_index: usize,
 ) {
     let label = match schema {
         Some(schema) if schema.time_column.is_some() && !selected_channel.is_empty() => {
-            format!("Schema loaded. Ready to read time + {selected_channel}.")
+            format!(
+                "Row {} is empty. Load time + {selected_channel} into the selected row.",
+                row_index + 1
+            )
         }
         Some(_) => "Schema loaded. Selectable waveform data is not ready yet.".to_owned(),
         None => "Load a Parquet schema to detect time and channel columns.".to_owned(),
@@ -1837,5 +2108,82 @@ fn normalized_range((start, end): (f64, f64)) -> Option<(f64, f64)> {
         std::cmp::Ordering::Less => Some((start, end)),
         std::cmp::Ordering::Greater => Some((end, start)),
         std::cmp::Ordering::Equal => None,
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn adds_channels_to_the_selected_row() {
+        let mut view = ViewState::default();
+
+        let (added_first, first_row_id) = view.add_channel_to_selected_row("sine_50Hz");
+        assert!(added_first);
+        assert_eq!(first_row_id, 0);
+        assert_eq!(view.rows[0].channels.len(), 1);
+
+        let second_row_id = view.add_row();
+        let (added_second, target_row_id) = view.add_channel_to_selected_row("pwm_1kHz");
+        assert!(added_second);
+        assert_eq!(target_row_id, second_row_id);
+        assert!(
+            view.rows[0]
+                .channels
+                .iter()
+                .any(|ch| ch.channel_path == "sine_50Hz")
+        );
+        assert!(
+            view.rows[1]
+                .channels
+                .iter()
+                .any(|ch| ch.channel_path == "pwm_1kHz")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_channels_within_a_row() {
+        let mut view = ViewState::default();
+
+        let (added_first, _) = view.add_channel_to_selected_row("sine_50Hz");
+        let (added_duplicate, _) = view.add_channel_to_selected_row("sine_50Hz");
+
+        assert!(added_first);
+        assert!(!added_duplicate);
+        assert_eq!(view.rows[0].channels.len(), 1);
+    }
+
+    #[test]
+    fn deleting_selected_row_moves_selection_to_an_existing_row() {
+        let mut view = ViewState::default();
+        view.add_row();
+        view.add_row();
+        let selected_before_delete = view.selected_row_id.expect("selected row");
+
+        assert!(view.remove_row(selected_before_delete));
+        assert_eq!(view.rows.len(), 2);
+        assert!(
+            view.selected_row_id
+                .is_some_and(|row_id| view.rows.iter().any(|row| row.id == row_id))
+        );
+    }
+
+    #[test]
+    fn row_plot_rects_remain_valid_for_many_rows() {
+        let content_height = waveform_content_height(160.0, 8);
+        assert!(content_height >= MIN_WAVEFORM_ROW_HEIGHT * 8.0);
+
+        let outer =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, content_height));
+        let rows = row_outer_rects(outer, 8);
+
+        assert_eq!(rows.len(), 8);
+        for row in rows {
+            let plot = plot_area_rect(row);
+            assert!(plot.width() > 0.0);
+            assert!(plot.height() > 0.0);
+            assert!(outer.contains_rect(row));
+        }
     }
 }
