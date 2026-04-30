@@ -62,6 +62,26 @@ pub struct WaveformData {
 }
 
 #[derive(Clone, Debug)]
+pub struct TimeData {
+    pub path: PathBuf,
+    pub column_name: String,
+    pub column_path: String,
+    pub time: Vec<f64>,
+    pub projected_column_index: usize,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelData {
+    pub path: PathBuf,
+    pub channel_name: String,
+    pub channel_path: String,
+    pub values: Vec<f32>,
+    pub projected_column_index: usize,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Debug)]
 pub struct MinMaxEnvelope {
     pub buckets: Vec<EnvelopeBucket>,
     pub source_sample_count: usize,
@@ -104,12 +124,7 @@ impl WaveformData {
     }
 
     pub fn min_max_envelope(&self, requested_bucket_count: usize) -> MinMaxEnvelope {
-        self.min_max_envelope_for_indices(
-            0,
-            self.sample_count(),
-            requested_bucket_count,
-            self.time_range(),
-        )
+        min_max_envelope(&self.time, &self.values, requested_bucket_count)
     }
 
     pub fn min_max_envelope_for_range(
@@ -117,88 +132,159 @@ impl WaveformData {
         time_range: (f64, f64),
         requested_bucket_count: usize,
     ) -> MinMaxEnvelope {
-        let Some((range_start, range_end)) = normalized_time_range(time_range) else {
-            return empty_envelope(requested_bucket_count, None, Instant::now());
-        };
+        min_max_envelope_for_range(&self.time, &self.values, time_range, requested_bucket_count)
+    }
+}
 
-        let start = self.time.partition_point(|time| *time < range_start);
-        let end = self.time.partition_point(|time| *time <= range_end);
-
-        self.min_max_envelope_for_indices(
-            start.min(self.sample_count()),
-            end.min(self.sample_count()),
-            requested_bucket_count,
-            Some((range_start, range_end)),
-        )
+impl TimeData {
+    pub fn sample_count(&self) -> usize {
+        self.time.len()
     }
 
-    fn min_max_envelope_for_indices(
+    pub fn memory_bytes(&self) -> usize {
+        self.time.len() * std::mem::size_of::<f64>()
+    }
+
+    pub fn time_range(&self) -> Option<(f64, f64)> {
+        Some((*self.time.first()?, *self.time.last()?))
+    }
+}
+
+impl ChannelData {
+    pub fn sample_count(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.values.len() * std::mem::size_of::<f32>()
+    }
+
+    pub fn min_max_envelope_for_range(
         &self,
-        start_index: usize,
-        end_index: usize,
+        time: &[f64],
+        time_range: (f64, f64),
         requested_bucket_count: usize,
-        time_range: Option<(f64, f64)>,
     ) -> MinMaxEnvelope {
-        let started = Instant::now();
-        let start_index = start_index.min(self.sample_count());
-        let end_index = end_index.min(self.sample_count()).max(start_index);
-        let source_sample_count = end_index - start_index;
-        let target_bucket_count = requested_bucket_count
-            .max(1)
-            .min(source_sample_count.max(1));
-        let bucket_size = source_sample_count.div_ceil(target_bucket_count).max(1);
-        let mut buckets = Vec::with_capacity(target_bucket_count);
-        let mut value_range = None;
+        min_max_envelope_for_range(time, &self.values, time_range, requested_bucket_count)
+    }
+}
 
-        let mut start = start_index;
-        while start < end_index {
-            let end = (start + bucket_size).min(end_index);
-            if let Some(bucket) = self.envelope_bucket(start, end) {
-                value_range = update_range(value_range, f64::from(bucket.min));
-                value_range = update_range(value_range, f64::from(bucket.max));
-                buckets.push(bucket);
-            }
-            start = end;
+pub fn min_max_envelope(
+    time: &[f64],
+    values: &[f32],
+    requested_bucket_count: usize,
+) -> MinMaxEnvelope {
+    min_max_envelope_for_indices(
+        time,
+        values,
+        0,
+        time.len().min(values.len()),
+        requested_bucket_count,
+        time_range(time),
+    )
+}
+
+pub fn min_max_envelope_for_range(
+    time: &[f64],
+    values: &[f32],
+    time_range: (f64, f64),
+    requested_bucket_count: usize,
+) -> MinMaxEnvelope {
+    let Some((range_start, range_end)) = normalized_time_range(time_range) else {
+        return empty_envelope(requested_bucket_count, None, Instant::now());
+    };
+
+    let sample_count = time.len().min(values.len());
+    let start = time.partition_point(|time| *time < range_start);
+    let end = time.partition_point(|time| *time <= range_end);
+
+    min_max_envelope_for_indices(
+        time,
+        values,
+        start.min(sample_count),
+        end.min(sample_count),
+        requested_bucket_count,
+        Some((range_start, range_end)),
+    )
+}
+
+fn min_max_envelope_for_indices(
+    time: &[f64],
+    values: &[f32],
+    start_index: usize,
+    end_index: usize,
+    requested_bucket_count: usize,
+    time_range: Option<(f64, f64)>,
+) -> MinMaxEnvelope {
+    let started = Instant::now();
+    let sample_count = time.len().min(values.len());
+    let start_index = start_index.min(sample_count);
+    let end_index = end_index.min(sample_count).max(start_index);
+    let source_sample_count = end_index - start_index;
+    let target_bucket_count = requested_bucket_count
+        .max(1)
+        .min(source_sample_count.max(1));
+    let bucket_size = source_sample_count.div_ceil(target_bucket_count).max(1);
+    let mut buckets = Vec::with_capacity(target_bucket_count);
+    let mut value_range = None;
+
+    let mut start = start_index;
+    while start < end_index {
+        let end = (start + bucket_size).min(end_index);
+        if let Some(bucket) = envelope_bucket(time, values, start, end) {
+            value_range = update_range(value_range, f64::from(bucket.min));
+            value_range = update_range(value_range, f64::from(bucket.max));
+            buckets.push(bucket);
         }
+        start = end;
+    }
 
-        MinMaxEnvelope {
-            buckets,
-            source_sample_count,
-            requested_bucket_count,
-            bucket_size,
-            time_range,
-            value_range,
-            elapsed: started.elapsed(),
+    MinMaxEnvelope {
+        buckets,
+        source_sample_count,
+        requested_bucket_count,
+        bucket_size,
+        time_range,
+        value_range,
+        elapsed: started.elapsed(),
+    }
+}
+
+fn envelope_bucket(
+    time_values: &[f64],
+    channel_values: &[f32],
+    start: usize,
+    end: usize,
+) -> Option<EnvelopeBucket> {
+    if start >= end {
+        return None;
+    }
+
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for value in &channel_values[start..end] {
+        if value.is_finite() {
+            min = min.min(*value);
+            max = max.max(*value);
         }
     }
 
-    fn envelope_bucket(&self, start: usize, end: usize) -> Option<EnvelopeBucket> {
-        if start >= end {
-            return None;
-        }
-
-        let mut min = f32::INFINITY;
-        let mut max = f32::NEG_INFINITY;
-        for value in &self.values[start..end] {
-            if value.is_finite() {
-                min = min.min(*value);
-                max = max.max(*value);
-            }
-        }
-
-        if !min.is_finite() || !max.is_finite() {
-            return None;
-        }
-
-        let time_start = *self.time.get(start)?;
-        let time_end = *self.time.get(end - 1)?;
-        let time = (time_start + time_end) * 0.5;
-        if !time.is_finite() {
-            return None;
-        }
-
-        Some(EnvelopeBucket { time, min, max })
+    if !min.is_finite() || !max.is_finite() {
+        return None;
     }
+
+    let time_start = *time_values.get(start)?;
+    let time_end = *time_values.get(end - 1)?;
+    let time = (time_start + time_end) * 0.5;
+    if !time.is_finite() {
+        return None;
+    }
+
+    Some(EnvelopeBucket { time, min, max })
+}
+
+pub fn time_range(time: &[f64]) -> Option<(f64, f64)> {
+    Some((*time.first()?, *time.last()?))
 }
 
 fn normalized_time_range((start, end): (f64, f64)) -> Option<(f64, f64)> {
@@ -290,6 +376,92 @@ pub fn read_selected_channel(
         time,
         values,
         projected_column_indices,
+        elapsed: started.elapsed(),
+    })
+}
+
+pub fn read_time_column(
+    path: impl AsRef<Path>,
+    summary: &parquet_schema::SchemaSummary,
+) -> Result<TimeData, String> {
+    let path = path.as_ref();
+    let time_column = summary
+        .time_column
+        .as_ref()
+        .ok_or_else(|| "time column not found".to_owned())?;
+
+    let started = Instant::now();
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| error.to_string())?;
+    let projection = ProjectionMask::leaves(builder.parquet_schema(), [time_column.index]);
+    let mut reader = builder
+        .with_projection(projection)
+        .with_batch_size(BATCH_SIZE)
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    let capacity = usize::try_from(summary.row_count).unwrap_or(0);
+    let mut time = Vec::with_capacity(capacity);
+
+    for batch in &mut reader {
+        let batch = batch.map_err(|error| error.to_string())?;
+        append_numeric_as_f64(
+            batch.column(0).as_ref(),
+            &mut time,
+            time_column.display_name(),
+            NullPolicy::Reject,
+        )?;
+    }
+
+    Ok(TimeData {
+        path: path.to_path_buf(),
+        column_name: time_column.display_name().to_owned(),
+        column_path: time_column.path.clone(),
+        time,
+        projected_column_index: time_column.index,
+        elapsed: started.elapsed(),
+    })
+}
+
+pub fn read_channel_values(
+    path: impl AsRef<Path>,
+    summary: &parquet_schema::SchemaSummary,
+    selected_channel: &str,
+) -> Result<ChannelData, String> {
+    let path = path.as_ref();
+    let channel = find_channel(&summary.channels, selected_channel)?;
+
+    let started = Instant::now();
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| error.to_string())?;
+    let projection = ProjectionMask::leaves(builder.parquet_schema(), [channel.index]);
+    let mut reader = builder
+        .with_projection(projection)
+        .with_batch_size(BATCH_SIZE)
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    let capacity = usize::try_from(summary.row_count).unwrap_or(0);
+    let mut values = Vec::with_capacity(capacity);
+
+    for batch in &mut reader {
+        let batch = batch.map_err(|error| error.to_string())?;
+        append_numeric_as_f32(
+            batch.column(0).as_ref(),
+            &mut values,
+            channel.display_name(),
+            NullPolicy::NaN,
+        )?;
+    }
+
+    Ok(ChannelData {
+        path: path.to_path_buf(),
+        channel_name: channel.display_name().to_owned(),
+        channel_path: channel.path.clone(),
+        values,
+        projected_column_index: channel.index,
         elapsed: started.elapsed(),
     })
 }
@@ -442,6 +614,33 @@ mod tests {
         assert_eq!(data.sample_count(), 100_000);
         assert_eq!(data.projected_column_indices, [0, 4]);
         assert_eq!(data.channel_name, "chirp_1_500Hz");
+    }
+
+    #[test]
+    fn reads_shared_time_and_channel_values_if_dataset_exists() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../proto_3_1b/data/test_100k.parquet");
+
+        if !path.exists() {
+            return;
+        }
+
+        let summary = parquet_schema::read_schema_summary(&path).expect("read schema");
+        let time = read_time_column(&path, &summary).expect("read time column");
+        let channel =
+            read_channel_values(&path, &summary, "chirp_1_500Hz").expect("read channel values");
+
+        assert_eq!(time.sample_count(), 100_000);
+        assert_eq!(channel.sample_count(), time.sample_count());
+        assert_eq!(time.projected_column_index, 0);
+        assert_eq!(channel.projected_column_index, 4);
+        assert_eq!(channel.channel_name, "chirp_1_500Hz");
+        assert!(
+            channel
+                .min_max_envelope_for_range(&time.time, time.time_range().unwrap(), 512)
+                .value_range
+                .is_some()
+        );
     }
 
     #[test]
