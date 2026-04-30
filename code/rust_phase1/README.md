@@ -99,3 +99,4 @@ pwm_1kHz_advance_1sample
 - The visible X range is re-extracted into a min/max envelope sized to the current plot width.
 - Step mode uses exact raw samples at low density, exact change points when sample density is high but edge count is still bounded, and min/max envelope only when there are too many changes to draw directly.
 - Row channels can be hidden and styled with per-row color overrides and line widths.
+- Hover X is synchronized across rows, with a vertical hover line and visible-channel value readout.

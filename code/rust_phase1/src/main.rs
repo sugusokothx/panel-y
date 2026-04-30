@@ -19,6 +19,7 @@ const MAX_STEP_CHANGE_POINTS: usize = 12_000;
 const DEFAULT_TRACE_LINE_WIDTH: f32 = 1.25;
 const MIN_TRACE_LINE_WIDTH: f32 = 0.5;
 const MAX_TRACE_LINE_WIDTH: f32 = 6.0;
+const MAX_HOVER_READOUT_CHANNELS: usize = 4;
 
 fn main() -> eframe::Result {
     if let Some(command) = cli_command_arg() {
@@ -162,6 +163,7 @@ struct ViewState {
     selected_row_id: Option<u64>,
     next_row_id: u64,
     x_range: Option<(f64, f64)>,
+    hover_x: Option<f64>,
     rows: Vec<PlotRow>,
 }
 
@@ -225,6 +227,7 @@ struct VisibleTrace {
     color: egui::Color32,
     line_width: f32,
     draw_mode: DrawMode,
+    hover_value: Option<f32>,
     data: VisibleTraceData,
 }
 
@@ -291,6 +294,7 @@ impl Default for ViewState {
             selected_row_id: Some(0),
             next_row_id: 1,
             x_range: None,
+            hover_x: None,
             rows: vec![PlotRow {
                 id: 0,
                 channels: Vec::new(),
@@ -361,6 +365,7 @@ impl ViewState {
         }
 
         self.x_range = None;
+        self.hover_x = None;
         self.selected_row_id = Some(0);
         self.next_row_id = 1;
         self.rows = vec![PlotRow {
@@ -372,6 +377,7 @@ impl ViewState {
     fn reset_empty(&mut self) {
         self.selected_channel.clear();
         self.x_range = None;
+        self.hover_x = None;
         self.selected_row_id = Some(0);
         self.next_row_id = 1;
         self.rows = vec![PlotRow {
@@ -1199,6 +1205,7 @@ impl PanelYApp {
         let mut built_count = 0usize;
         let mut exact_step_count = 0usize;
         let mut edge_step_count = 0usize;
+        let hover_x = self.view.hover_x;
         {
             let dataset = &mut self.dataset;
             let Some(shared_time) = dataset.shared_time.as_ref() else {
@@ -1286,6 +1293,17 @@ impl PanelYApp {
                         }
                     };
 
+                    let hover_value = hover_x.and_then(|hover_x| {
+                        loaded_channels.channel(&channel_path).and_then(|channel| {
+                            hover_value_at_time(
+                                time_values,
+                                &channel.values,
+                                hover_x,
+                                row_channel.draw_mode,
+                            )
+                        })
+                    });
+
                     traces.push(VisibleTrace {
                         channel_name,
                         channel_path,
@@ -1295,6 +1313,7 @@ impl PanelYApp {
                             .line_width
                             .clamp(MIN_TRACE_LINE_WIDTH, MAX_TRACE_LINE_WIDTH),
                         draw_mode: row_channel.draw_mode,
+                        hover_value,
                         data,
                     });
                 }
@@ -1343,9 +1362,11 @@ impl PanelYApp {
         plot_rects: &[egui::Rect],
     ) {
         let Some(shared_time) = self.dataset.shared_time.as_ref() else {
+            self.view.hover_x = None;
             return;
         };
         let Some(full_range) = shared_time.time_range() else {
+            self.view.hover_x = None;
             return;
         };
 
@@ -1371,6 +1392,9 @@ impl PanelYApp {
                 .find(|plot_rect| plot_rect.contains(pointer_pos))
                 .map(|plot_rect| (pointer_pos, plot_rect))
         }) else {
+            if self.view.hover_x.take().is_some() {
+                ui.ctx().request_repaint();
+            }
             return;
         };
 
@@ -1416,6 +1440,12 @@ impl PanelYApp {
         if changed && next_range != current_range {
             self.view.x_range = Some(next_range);
             self.dataset.loaded_channels.clear_envelope_cache();
+        }
+
+        let next_hover_x = time_at_plot_x(pointer_pos.x, plot_rect, next_range);
+        if self.view.hover_x != next_hover_x {
+            self.view.hover_x = next_hover_x;
+            ui.ctx().request_repaint();
         }
     }
 }
@@ -1559,6 +1589,23 @@ impl eframe::App for PanelYApp {
                                     row_index,
                                 );
                             }
+                        }
+
+                        draw_hover_line(
+                            &painter,
+                            plot_rect,
+                            self.view.hover_x,
+                            self.view.x_range,
+                            ui.visuals(),
+                        );
+                        if let Some(row) = visible_row {
+                            draw_hover_readout(
+                                &painter,
+                                plot_rect,
+                                self.view.hover_x,
+                                ui.visuals(),
+                                &row.traces,
+                            );
                         }
                     }
                 });
@@ -2232,6 +2279,153 @@ fn draw_axis_labels(
     );
 }
 
+fn draw_hover_line(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    hover_x: Option<f64>,
+    time_range: Option<(f64, f64)>,
+    visuals: &egui::Visuals,
+) {
+    let Some(hover_x) = hover_x else {
+        return;
+    };
+    let Some(time_range) = time_range else {
+        return;
+    };
+    let Some(x) = plot_x_for_time(hover_x, rect, time_range) else {
+        return;
+    };
+
+    let stroke = egui::Stroke::new(1.25, visuals.selection.stroke.color);
+    painter.line_segment(
+        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+        stroke,
+    );
+}
+
+fn draw_hover_readout(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    hover_x: Option<f64>,
+    visuals: &egui::Visuals,
+    visible_traces: &[VisibleTrace],
+) {
+    let Some(hover_x) = hover_x else {
+        return;
+    };
+    let Some(hover_line_x) = visible_traces
+        .first()
+        .and_then(trace_time_range)
+        .and_then(|time_range| plot_x_for_time(hover_x, rect, time_range))
+    else {
+        return;
+    };
+
+    let values = visible_traces
+        .iter()
+        .filter_map(|trace| trace.hover_value.map(|value| (trace, value)))
+        .take(MAX_HOVER_READOUT_CHANNELS)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+
+    let extra_count = visible_traces
+        .iter()
+        .filter(|trace| trace.hover_value.is_some())
+        .count()
+        .saturating_sub(values.len());
+    let mut lines = Vec::with_capacity(values.len() + 2);
+    lines.push(format!("x {:.6} s", hover_x));
+    for (trace, value) in &values {
+        lines.push(format!(
+            "{}  {}",
+            compact_channel_label(trace_label(trace), 24),
+            format_hover_value(*value)
+        ));
+    }
+    if extra_count > 0 {
+        lines.push(format!("+{extra_count} more"));
+    }
+
+    let font = egui::FontId::monospace(11.0);
+    let line_height = 15.0;
+    let max_panel_width = (rect.width() - 8.0).max(64.0).min(340.0);
+    let panel_width = lines
+        .iter()
+        .map(|line| line.chars().count() as f32)
+        .fold(0.0, f32::max)
+        .mul_add(7.2, 18.0)
+        .clamp(64.0, max_panel_width);
+    let panel_height = lines.len() as f32 * line_height + 12.0;
+    let panel_left = if hover_line_x < rect.center().x {
+        rect.right() - panel_width - 8.0
+    } else {
+        rect.left() + 8.0
+    }
+    .max(rect.left() + 4.0)
+    .min(rect.right() - panel_width - 4.0);
+    let panel_top = rect.top() + 8.0;
+    let panel_rect = egui::Rect::from_min_size(
+        egui::pos2(panel_left, panel_top),
+        egui::vec2(panel_width, panel_height),
+    );
+    let fill = if visuals.dark_mode {
+        egui::Color32::from_black_alpha(190)
+    } else {
+        egui::Color32::from_white_alpha(220)
+    };
+    painter.rect_filled(panel_rect, 3.0, fill);
+    painter.rect_stroke(
+        panel_rect,
+        3.0,
+        egui::Stroke::new(1.0, visuals.widgets.noninteractive.fg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+
+    let text_color = visuals.text_color();
+    let mut y = panel_rect.top() + 6.0;
+    painter.text(
+        egui::pos2(panel_rect.left() + 8.0, y),
+        egui::Align2::LEFT_TOP,
+        &lines[0],
+        font.clone(),
+        text_color,
+    );
+    y += line_height;
+
+    for ((trace, _), line) in values.iter().zip(lines.iter().skip(1)) {
+        let swatch_y = y + line_height * 0.5;
+        painter.line_segment(
+            [
+                egui::pos2(panel_rect.left() + 8.0, swatch_y),
+                egui::pos2(panel_rect.left() + 18.0, swatch_y),
+            ],
+            egui::Stroke::new(2.0, trace.color),
+        );
+        painter.text(
+            egui::pos2(panel_rect.left() + 24.0, y),
+            egui::Align2::LEFT_TOP,
+            line,
+            font.clone(),
+            text_color,
+        );
+        y += line_height;
+    }
+
+    if extra_count > 0
+        && let Some(extra_line) = lines.last()
+    {
+        painter.text(
+            egui::pos2(panel_rect.left() + 24.0, y),
+            egui::Align2::LEFT_TOP,
+            extra_line,
+            font,
+            visuals.weak_text_color(),
+        );
+    }
+}
+
 fn draw_row_marker(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -2282,6 +2476,129 @@ fn draw_status_label(painter: &egui::Painter, rect: egui::Rect, label: &str) {
         egui::FontId::monospace(14.0),
         egui::Color32::GRAY,
     );
+}
+
+fn hover_value_at_time(
+    time: &[f64],
+    values: &[f32],
+    target_time: f64,
+    draw_mode: DrawMode,
+) -> Option<f32> {
+    match draw_mode {
+        DrawMode::Line => nearest_sample_value(time, values, target_time),
+        DrawMode::Step => step_sample_value_at_time(time, values, target_time),
+    }
+}
+
+fn nearest_sample_value(time: &[f64], values: &[f32], target_time: f64) -> Option<f32> {
+    if !target_time.is_finite() {
+        return None;
+    }
+
+    let sample_count = time.len().min(values.len());
+    if sample_count == 0 {
+        return None;
+    }
+
+    let insertion_index =
+        time[..sample_count].partition_point(|sample_time| *sample_time < target_time);
+    let candidates = [
+        insertion_index.checked_sub(1),
+        (insertion_index < sample_count).then_some(insertion_index),
+    ];
+    let mut best = None;
+
+    for index in candidates.into_iter().flatten() {
+        let sample_time = time[index];
+        let value = values[index];
+        if !sample_time.is_finite() || !value.is_finite() {
+            continue;
+        }
+
+        let distance = (sample_time - target_time).abs();
+        match best {
+            Some((best_distance, _)) if best_distance <= distance => {}
+            _ => best = Some((distance, value)),
+        }
+    }
+
+    best.map(|(_, value)| value)
+}
+
+fn step_sample_value_at_time(time: &[f64], values: &[f32], target_time: f64) -> Option<f32> {
+    if !target_time.is_finite() {
+        return None;
+    }
+
+    let sample_count = time.len().min(values.len());
+    if sample_count == 0 {
+        return None;
+    }
+
+    let index = time[..sample_count]
+        .partition_point(|sample_time| *sample_time <= target_time)
+        .saturating_sub(1)
+        .min(sample_count - 1);
+    let sample_time = time[index];
+    let value = values[index];
+    (sample_time.is_finite() && value.is_finite()).then_some(value)
+}
+
+fn time_at_plot_x(x: f32, rect: egui::Rect, time_range: (f64, f64)) -> Option<f64> {
+    let (start, end) = normalized_range(time_range)?;
+    if rect.width() <= 1.0 {
+        return None;
+    }
+
+    let ratio = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+    Some(start + (end - start) * ratio)
+}
+
+fn plot_x_for_time(time: f64, rect: egui::Rect, time_range: (f64, f64)) -> Option<f32> {
+    let (start, end) = normalized_range(time_range)?;
+    if !time.is_finite() || rect.width() <= 1.0 {
+        return None;
+    }
+
+    let ratio = ((time - start) / (end - start)) as f32;
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return None;
+    }
+
+    Some(egui::lerp(rect.left()..=rect.right(), ratio))
+}
+
+fn trace_label(trace: &VisibleTrace) -> &str {
+    if trace.channel_name.is_empty() {
+        trace.channel_path.as_str()
+    } else {
+        trace.channel_name.as_str()
+    }
+}
+
+fn compact_channel_label(label: &str, max_chars: usize) -> String {
+    let char_count = label.chars().count();
+    if char_count <= max_chars {
+        return label.to_owned();
+    }
+
+    if max_chars <= 3 {
+        return label.chars().take(max_chars).collect();
+    }
+
+    let mut compact = label.chars().take(max_chars - 3).collect::<String>();
+    compact.push_str("...");
+    compact
+}
+
+fn format_hover_value(value: f32) -> String {
+    let value = f64::from(value);
+    let abs = value.abs();
+    if value == 0.0 || (1.0e-3..1.0e5).contains(&abs) {
+        format!("{value:.6}")
+    } else {
+        format!("{value:.6e}")
+    }
 }
 
 fn format_range(range: Option<(f64, f64)>) -> String {
@@ -2622,6 +2939,45 @@ mod app_tests {
         view.rows[0].channels[0].visible = false;
 
         assert!(!view.has_visible_channels());
+    }
+
+    #[test]
+    fn converts_plot_x_to_time_with_clamping() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(100.0, 50.0));
+
+        assert_eq!(time_at_plot_x(10.0, rect, (2.0, 12.0)), Some(2.0));
+        assert_eq!(time_at_plot_x(60.0, rect, (2.0, 12.0)), Some(7.0));
+        assert_eq!(time_at_plot_x(120.0, rect, (2.0, 12.0)), Some(12.0));
+    }
+
+    #[test]
+    fn line_hover_uses_nearest_sample_value() {
+        let time = [0.0, 1.0, 2.0, 3.0];
+        let values = [0.0, 10.0, 20.0, 30.0];
+
+        assert_eq!(
+            hover_value_at_time(&time, &values, 1.6, DrawMode::Line),
+            Some(20.0)
+        );
+        assert_eq!(
+            hover_value_at_time(&time, &values, 1.5, DrawMode::Line),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn step_hover_uses_held_sample_value() {
+        let time = [0.0, 1.0, 2.0, 3.0];
+        let values = [0.0, 10.0, 20.0, 30.0];
+
+        assert_eq!(
+            hover_value_at_time(&time, &values, 1.9, DrawMode::Step),
+            Some(10.0)
+        );
+        assert_eq!(
+            hover_value_at_time(&time, &values, 2.0, DrawMode::Step),
+            Some(20.0)
+        );
     }
 
     #[test]

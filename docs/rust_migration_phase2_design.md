@@ -299,6 +299,8 @@ UI実装の優先:
 - 2026-04-30: P2-06b GUI確認。`gate_pwm` のStep表示で、change-point Step対象範囲とmin/max envelope fallback範囲のどちらも見え方に違和感がないことを確認した
 - 2026-04-30: P2-07実装。row内channelごとにvisible、color override、line widthを編集できるようにし、hidden channelは描画・Y auto range・表示ステータス集計から外れるようにした
 - 2026-04-30: P2-07 GUI確認。visible ON/OFF、line width即時反映、custom color / resetが期待通り動作することを確認した
+- 2026-04-30: P2-09実装。hover X位置を `ViewState` で共有し、全rowへの縦ライン表示とvisible channelの値readoutを追加した。Lineはnearest sample、Stepはsample-and-hold値を表示する
+- 2026-04-30: P2-09 GUI確認完了。`test_100k.parquet` / `panely_large_10s_1mhz_9ch.parquet` で複数row hover、Line/Step値表示、hidden channel除外、plot外hover clear、左右readout位置切替、更新レスポンスが期待通り動作することを確認した
 
 ---
 
