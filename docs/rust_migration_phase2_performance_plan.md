@@ -3,8 +3,8 @@ project: Panel_y
 doc_type: Phase 2性能改善検討メモ
 target: Rust移植 Phase 2
 created: "2026-04-30"
-updated: "2026-04-30"
-status: 計画
+updated: "2026-05-01"
+status: Phase A実装済み
 source: "docs/rust_migration_phase2_benchmark_results.md"
 implementation: "code/rust_phase1"
 ---
@@ -323,3 +323,40 @@ GUI frame timing
   -> channel並列化 / overscan range cache
   -> coarse tile / LOD
 ```
+
+---
+
+## 8. Phase A 実施結果
+
+実施日: 2026-05-01
+
+対象実装: `code/rust_phase1/src/main.rs`
+
+実施内容:
+
+- GUI frame timing計測を追加した。top barでframe / visible trace生成 / draw shape生成 / input処理 / rows / channels / draw points / bucket数を確認できる。
+- pan/zoom操作中previewを追加した。ただしmedium級や小さい表示範囲では発動させず、8M samples以上かつ表示負荷が大きい場合だけ、range変更後140 msはbucket数を通常の1/4、最大512に抑える。
+- Step広範囲fallbackを早期化した。change-point上限超過をchannelごとに記録し、同等以上のspan/sample数では次回からchange-point走査をskipしてenvelopeへ回す。
+- preview中の広範囲Stepは、raw exact表示に収まらない場合はchange-point走査をskipしてenvelope表示にする。
+
+検証:
+
+```text
+cargo check
+cargo test
+cargo run -- --bench-phase2 ../proto_3_1b/data/step_validation_100k.parquet
+cargo run --release -- --bench-phase2 ../proto_3_1b/data/panely_medium_2m_8ch.parquet
+cargo run --release -- --bench-phase2 ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet
+```
+
+確認結果:
+
+- `cargo test`: 32 passed
+- `step_validation_100k.parquet`: 1sample進み/遅れを含むStep系CLIベンチが通過
+- `panely_medium_2m_8ch.parquet` release: visible avg 0.0053 s、max 0.0161 s、hover avg 0.210 us/lookup
+- `panely_large_10s_1mhz_9ch.parquet` release: visible avg 0.0283 s、max 0.0784 s、hover avg 0.352 us/lookup
+
+残タスク:
+
+- large全9chでGUI操作中のframe timingを確認する
+- Phase Bとしてchannelごとのenvelope並列化とoverscan range cacheを検証する

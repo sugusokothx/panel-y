@@ -1,6 +1,7 @@
 use eframe::egui;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 mod parquet_schema;
 mod parquet_waveform;
@@ -18,6 +19,12 @@ const MIN_WAVEFORM_ROW_HEIGHT: f32 = 180.0;
 const WAVEFORM_ROW_GAP: f32 = 10.0;
 const MAX_EXACT_STEP_SAMPLES: usize = 12_000;
 const MAX_STEP_CHANGE_POINTS: usize = 12_000;
+const INTERACTION_PREVIEW_SETTLE: Duration = Duration::from_millis(140);
+const PREVIEW_MIN_DATASET_SAMPLES: usize = 8_000_000;
+const PREVIEW_MIN_VISIBLE_LINE_SAMPLE_WORK: usize = 32_000_000;
+const PREVIEW_MIN_VISIBLE_STEP_SAMPLES: usize = 1_000_000;
+const PREVIEW_BUCKET_DIVISOR: usize = 4;
+const MAX_PREVIEW_ENVELOPE_BUCKETS: usize = 512;
 const DEFAULT_TRACE_LINE_WIDTH: f32 = 1.25;
 const MIN_TRACE_LINE_WIDTH: f32 = 0.5;
 const MAX_TRACE_LINE_WIDTH: f32 = 6.0;
@@ -158,6 +165,8 @@ struct PanelYApp {
     dataset: DatasetState,
     view: ViewState,
     load: LoadState,
+    interaction: InteractionState,
+    perf: PerfStats,
     load_result_tx: mpsc::Sender<LoadJobResult>,
     load_result_rx: mpsc::Receiver<LoadJobResult>,
     next_load_job_id: u64,
@@ -178,6 +187,7 @@ struct ViewState {
     next_row_id: u64,
     x_range: Option<(f64, f64)>,
     hover_x: Option<f64>,
+    large_preview_enabled: bool,
     rows: Vec<PlotRow>,
 }
 
@@ -188,6 +198,26 @@ struct LoadState {
     progress: Option<String>,
     error: Option<String>,
     active_jobs: BTreeMap<u64, ActiveLoadJob>,
+}
+
+#[derive(Clone, Debug)]
+struct InteractionState {
+    last_range_change: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct PerfStats {
+    show: bool,
+    frame_ms: f64,
+    interaction_ms: f64,
+    visible_ms: f64,
+    draw_ms: f64,
+    rows: usize,
+    channels: usize,
+    draw_points: usize,
+    requested_buckets: usize,
+    effective_buckets: usize,
+    preview: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +287,13 @@ struct ChannelStore {
     raw_by_channel: BTreeMap<String, parquet_waveform::ChannelData>,
     envelope_cache: BTreeMap<EnvelopeKey, parquet_waveform::MinMaxEnvelope>,
     envelope_context: Option<EnvelopeContext>,
+    step_fallback_hints: BTreeMap<String, StepFallbackHint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepFallbackHint {
+    min_span: f64,
+    min_source_sample_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,7 +329,7 @@ enum VisibleTraceData {
     RawStep(RawStepTrace),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct RawStepTrace {
     samples: Vec<StepSample>,
     source_sample_count: usize,
@@ -307,10 +344,28 @@ enum StepTraceKind {
     ChangePoints,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum StepTraceBuildResult {
+    Trace(RawStepTrace),
+    TooManyChangePoints { source_sample_count: usize },
+    Empty,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct StepSample {
     time: f64,
     value: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VisibleSampleRange {
+    range_start: f64,
+    range_end: f64,
+    start: usize,
+    end: usize,
+    context_start: usize,
+    source_sample_count: usize,
+    draw_sample_count: usize,
 }
 
 #[derive(Debug)]
@@ -331,6 +386,8 @@ impl Default for PanelYApp {
             dataset: DatasetState::default(),
             view: ViewState::default(),
             load: LoadState::default(),
+            interaction: InteractionState::default(),
+            perf: PerfStats::default(),
             load_result_tx,
             load_result_rx,
             next_load_job_id: 1,
@@ -357,6 +414,7 @@ impl Default for ViewState {
             next_row_id: 1,
             x_range: None,
             hover_x: None,
+            large_preview_enabled: true,
             rows: vec![PlotRow::new(0)],
         }
     }
@@ -370,6 +428,32 @@ impl Default for LoadState {
             progress: None,
             error: None,
             active_jobs: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for InteractionState {
+    fn default() -> Self {
+        Self {
+            last_range_change: None,
+        }
+    }
+}
+
+impl Default for PerfStats {
+    fn default() -> Self {
+        Self {
+            show: true,
+            frame_ms: 0.0,
+            interaction_ms: 0.0,
+            visible_ms: 0.0,
+            draw_ms: 0.0,
+            rows: 0,
+            channels: 0,
+            draw_points: 0,
+            requested_buckets: 0,
+            effective_buckets: 0,
+            preview: false,
         }
     }
 }
@@ -406,6 +490,70 @@ impl LoadState {
             Some(format!("loading: {labels}"))
         };
     }
+}
+
+impl InteractionState {
+    fn mark_range_changed(&mut self) {
+        self.last_range_change = Some(Instant::now());
+    }
+
+    fn preview_active(&self) -> bool {
+        self.last_range_change
+            .is_some_and(|changed_at| changed_at.elapsed() < INTERACTION_PREVIEW_SETTLE)
+    }
+}
+
+impl PerfStats {
+    fn update(
+        &mut self,
+        timing: FrameTiming,
+        visible_rows: &[VisibleRowTrace],
+        requested_buckets: usize,
+        effective_buckets: usize,
+        preview: bool,
+    ) {
+        self.frame_ms = duration_ms(timing.frame);
+        self.interaction_ms = duration_ms(timing.interaction);
+        self.visible_ms = duration_ms(timing.visible);
+        self.draw_ms = duration_ms(timing.draw);
+        self.rows = visible_rows.len();
+        self.channels = visible_rows
+            .iter()
+            .map(|row| row.traces.len())
+            .sum::<usize>();
+        self.draw_points = visible_rows
+            .iter()
+            .flat_map(|row| row.traces.iter())
+            .map(trace_draw_point_count)
+            .sum::<usize>();
+        self.requested_buckets = requested_buckets;
+        self.effective_buckets = effective_buckets;
+        self.preview = preview;
+    }
+
+    fn summary(&self) -> String {
+        let mode = if self.preview { "preview" } else { "full" };
+        format!(
+            "{mode} frame {:.1}ms visible {:.1}ms draw {:.1}ms input {:.1}ms rows {} ch {} points {} buckets {}/{}",
+            self.frame_ms,
+            self.visible_ms,
+            self.draw_ms,
+            self.interaction_ms,
+            self.rows,
+            self.channels,
+            self.draw_points,
+            self.effective_buckets,
+            self.requested_buckets
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameTiming {
+    frame: Duration,
+    interaction: Duration,
+    visible: Duration,
+    draw: Duration,
 }
 
 impl DrawMode {
@@ -650,6 +798,7 @@ impl ChannelStore {
     fn clear_all(&mut self) {
         self.raw_by_channel.clear();
         self.clear_envelope_cache();
+        self.step_fallback_hints.clear();
     }
 
     fn clear_envelope_cache(&mut self) {
@@ -666,6 +815,7 @@ impl ChannelStore {
     }
 
     fn insert_channel(&mut self, channel: parquet_waveform::ChannelData) {
+        self.step_fallback_hints.remove(&channel.channel_path);
         self.raw_by_channel
             .insert(channel.channel_path.clone(), channel);
         self.clear_envelope_cache();
@@ -707,6 +857,45 @@ impl ChannelStore {
             .get(&key)
             .cloned()
             .map(|envelope| (envelope, !was_cached))
+    }
+
+    fn should_skip_step_change_points(
+        &self,
+        channel_path: &str,
+        time_range: (f64, f64),
+        source_sample_count: usize,
+    ) -> bool {
+        let Some(hint) = self.step_fallback_hints.get(channel_path) else {
+            return false;
+        };
+        let span = (time_range.1 - time_range.0).abs();
+        span.is_finite()
+            && span >= hint.min_span * 0.95
+            && source_sample_count >= hint.min_source_sample_count.saturating_mul(9) / 10
+    }
+
+    fn record_step_change_point_fallback(
+        &mut self,
+        channel_path: &str,
+        time_range: (f64, f64),
+        source_sample_count: usize,
+    ) {
+        let span = (time_range.1 - time_range.0).abs();
+        if !span.is_finite() || span <= 0.0 || source_sample_count == 0 {
+            return;
+        }
+
+        self.step_fallback_hints
+            .entry(channel_path.to_owned())
+            .and_modify(|hint| {
+                hint.min_span = hint.min_span.min(span);
+                hint.min_source_sample_count =
+                    hint.min_source_sample_count.min(source_sample_count);
+            })
+            .or_insert(StepFallbackHint {
+                min_span: span,
+                min_source_sample_count: source_sample_count,
+            });
     }
 }
 
@@ -1149,7 +1338,7 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         app.view.x_range = Some(range);
         app.view.hover_x = Some((range.0 + range.1) * 0.5);
         let started = std::time::Instant::now();
-        let visible_rows = app.visible_row_traces(BENCH_VISIBLE_ENVELOPE_BUCKETS, true);
+        let visible_rows = app.visible_row_traces(BENCH_VISIBLE_ENVELOPE_BUCKETS, true, false);
         let elapsed_sec = started.elapsed().as_secs_f64();
 
         let mut visible_channel_count = 0usize;
@@ -1926,10 +2115,63 @@ impl PanelYApp {
         self.dataset.loaded_channels.clear_envelope_cache();
     }
 
+    fn should_use_interaction_preview(&self) -> bool {
+        if !self.view.large_preview_enabled || !self.interaction.preview_active() {
+            return false;
+        }
+
+        let Some(shared_time) = self.dataset.shared_time.as_ref() else {
+            return false;
+        };
+        let Some(full_range) = shared_time.time_range() else {
+            return false;
+        };
+        let min_span = min_view_span(full_range, shared_time.sample_count());
+        let view_range = clamp_view_range(
+            self.view.x_range.unwrap_or(full_range),
+            full_range,
+            min_span,
+        );
+        let Some(sample_range) =
+            visible_sample_range(&shared_time.time, shared_time.sample_count(), view_range)
+        else {
+            return false;
+        };
+        let (line_channels, step_channels) = self.visible_loaded_draw_mode_counts();
+
+        preview_needed_for_workload(
+            shared_time.sample_count(),
+            sample_range.source_sample_count,
+            line_channels,
+            step_channels,
+        )
+    }
+
+    fn visible_loaded_draw_mode_counts(&self) -> (usize, usize) {
+        self.view
+            .rows
+            .iter()
+            .flat_map(|row| row.channels.iter())
+            .filter(|channel| {
+                channel.visible
+                    && self
+                        .dataset
+                        .loaded_channels
+                        .has_channel(&channel.channel_path)
+            })
+            .fold((0usize, 0usize), |(line, step), channel| {
+                match channel.draw_mode {
+                    DrawMode::Line => (line + 1, step),
+                    DrawMode::Step => (line, step + 1),
+                }
+            })
+    }
+
     fn visible_row_traces(
         &mut self,
         requested_bucket_count: usize,
         dark_mode: bool,
+        preview: bool,
     ) -> Vec<VisibleRowTrace> {
         let rows = self.view.rows.clone();
         let loading_channel_paths = self.load.loading_channel_paths();
@@ -2006,6 +2248,7 @@ impl PanelYApp {
         let mut built_count = 0usize;
         let mut exact_step_count = 0usize;
         let mut edge_step_count = 0usize;
+        let mut early_step_fallback_count = 0usize;
         let hover_x = self.view.hover_x;
         {
             let dataset = &mut self.dataset;
@@ -2060,31 +2303,22 @@ impl PanelYApp {
                             VisibleTraceData::Envelope(envelope)
                         }
                         DrawMode::Step => {
-                            if let Some(raw_step) =
-                                loaded_channels.channel(&channel_path).and_then(|channel| {
-                                    build_raw_step_trace(
-                                        time_values,
-                                        &channel.values,
-                                        view_range,
-                                        MAX_EXACT_STEP_SAMPLES,
-                                    )
-                                })
-                            {
-                                exact_step_count += 1;
-                                VisibleTraceData::RawStep(raw_step)
-                            } else if let Some(edge_step) =
-                                loaded_channels.channel(&channel_path).and_then(|channel| {
-                                    build_change_point_step_trace(
-                                        time_values,
-                                        &channel.values,
-                                        view_range,
-                                        MAX_STEP_CHANGE_POINTS,
-                                    )
-                                })
-                            {
-                                edge_step_count += 1;
-                                VisibleTraceData::RawStep(edge_step)
-                            } else {
+                            let sample_range =
+                                visible_sample_range(time_values, sample_count, view_range);
+                            let use_preview_envelope = preview
+                                && sample_range.is_some_and(|range| {
+                                    range.draw_sample_count > MAX_EXACT_STEP_SAMPLES
+                                });
+                            let use_hint_fallback = sample_range.is_some_and(|range| {
+                                loaded_channels.should_skip_step_change_points(
+                                    &channel_path,
+                                    view_range,
+                                    range.source_sample_count,
+                                )
+                            });
+
+                            if use_preview_envelope || use_hint_fallback {
+                                early_step_fallback_count += 1;
                                 let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
                                     &channel_path,
                                     time_values,
@@ -2097,6 +2331,76 @@ impl PanelYApp {
                                     built_count += 1;
                                 }
                                 VisibleTraceData::Envelope(envelope)
+                            } else if let Some(raw_step) =
+                                loaded_channels.channel(&channel_path).and_then(|channel| {
+                                    build_raw_step_trace(
+                                        time_values,
+                                        &channel.values,
+                                        view_range,
+                                        MAX_EXACT_STEP_SAMPLES,
+                                    )
+                                })
+                            {
+                                exact_step_count += 1;
+                                VisibleTraceData::RawStep(raw_step)
+                            } else if let Some(step_result) =
+                                loaded_channels.channel(&channel_path).map(|channel| {
+                                    build_change_point_step_trace_result(
+                                        time_values,
+                                        &channel.values,
+                                        view_range,
+                                        MAX_STEP_CHANGE_POINTS,
+                                    )
+                                })
+                            {
+                                match step_result {
+                                    StepTraceBuildResult::Trace(edge_step) => {
+                                        edge_step_count += 1;
+                                        VisibleTraceData::RawStep(edge_step)
+                                    }
+                                    StepTraceBuildResult::TooManyChangePoints {
+                                        source_sample_count,
+                                    } => {
+                                        loaded_channels.record_step_change_point_fallback(
+                                            &channel_path,
+                                            view_range,
+                                            source_sample_count,
+                                        );
+                                        early_step_fallback_count += 1;
+                                        let Some((envelope, was_built)) = loaded_channels
+                                            .ensure_envelope(
+                                                &channel_path,
+                                                time_values,
+                                                view_range,
+                                                requested_bucket_count,
+                                            )
+                                        else {
+                                            continue;
+                                        };
+                                        if was_built {
+                                            built_count += 1;
+                                        }
+                                        VisibleTraceData::Envelope(envelope)
+                                    }
+                                    StepTraceBuildResult::Empty => {
+                                        let Some((envelope, was_built)) = loaded_channels
+                                            .ensure_envelope(
+                                                &channel_path,
+                                                time_values,
+                                                view_range,
+                                                requested_bucket_count,
+                                            )
+                                        else {
+                                            continue;
+                                        };
+                                        if was_built {
+                                            built_count += 1;
+                                        }
+                                        VisibleTraceData::Envelope(envelope)
+                                    }
+                                }
+                            } else {
+                                continue;
                             }
                         }
                     };
@@ -2156,7 +2460,11 @@ impl PanelYApp {
             }
         }
 
-        if built_count > 0 || exact_step_count > 0 || edge_step_count > 0 {
+        if built_count > 0
+            || exact_step_count > 0
+            || edge_step_count > 0
+            || early_step_fallback_count > 0
+        {
             let visible_channel_count = visible_rows
                 .iter()
                 .map(|row| row.traces.len())
@@ -2167,8 +2475,9 @@ impl PanelYApp {
                 .next()
                 .map(trace_source_sample_count)
                 .unwrap_or_default();
+            let quality = if preview { "preview" } else { "full" };
             self.load.status = format!(
-                "View {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, cache {}",
+                "{quality} view {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, step fallback {}, cache {}, hints {}",
                 view_range.0,
                 view_range.1,
                 visible_rows.len(),
@@ -2177,7 +2486,9 @@ impl PanelYApp {
                 built_count,
                 exact_step_count,
                 edge_step_count,
-                self.dataset.loaded_channels.envelope_cache.len()
+                early_step_fallback_count,
+                self.dataset.loaded_channels.envelope_cache.len(),
+                self.dataset.loaded_channels.step_fallback_hints.len()
             );
         }
 
@@ -2269,6 +2580,8 @@ impl PanelYApp {
         if changed && next_range != current_range {
             self.view.x_range = Some(next_range);
             self.dataset.loaded_channels.clear_envelope_cache();
+            self.interaction.mark_range_changed();
+            ui.ctx().request_repaint_after(INTERACTION_PREVIEW_SETTLE);
         }
 
         let next_hover_x = time_at_plot_x(pointer_pos.x, plot_rect, next_range);
@@ -2281,6 +2594,7 @@ impl PanelYApp {
 
 impl eframe::App for PanelYApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let frame_started = Instant::now();
         self.drain_load_results();
         let load_active = self.load.is_busy();
         let loading_channel_paths = self.load.loading_channel_paths();
@@ -2298,6 +2612,10 @@ impl eframe::App for PanelYApp {
                 if let Some(progress) = &self.load.progress {
                     ui.separator();
                     ui.label(progress);
+                }
+                if self.perf.show {
+                    ui.separator();
+                    ui.monospace(self.perf.summary());
                 }
             });
         });
@@ -2357,6 +2675,11 @@ impl eframe::App for PanelYApp {
                             if let Some((start, end)) = self.view.x_range {
                                 ui.monospace(format!("x: {start:.6} .. {end:.6} s"));
                             }
+                            ui.checkbox(&mut self.perf.show, "Frame timing");
+                            ui.checkbox(&mut self.view.large_preview_enabled, "Large-data preview")
+                                .on_hover_text(
+                                    "Only reduces quality while interacting with very large visible ranges",
+                                );
                         }
 
                         draw_channel_cache_controls(ui, &self.dataset);
@@ -2400,10 +2723,22 @@ impl eframe::App for PanelYApp {
                         .map(visible_envelope_bucket_count)
                         .unwrap_or(MIN_VISIBLE_ENVELOPE_BUCKETS);
 
+                    let interaction_started = Instant::now();
                     self.handle_plot_interaction(ui, &response, &plot_rects);
-                    let visible_rows =
-                        self.visible_row_traces(requested_buckets, ui.visuals().dark_mode);
+                    let interaction_elapsed = interaction_started.elapsed();
 
+                    let preview = self.should_use_interaction_preview();
+                    let effective_buckets = if preview {
+                        preview_envelope_bucket_count(requested_buckets)
+                    } else {
+                        requested_buckets
+                    };
+                    let visible_started = Instant::now();
+                    let visible_rows =
+                        self.visible_row_traces(effective_buckets, ui.visuals().dark_mode, preview);
+                    let visible_elapsed = visible_started.elapsed();
+
+                    let draw_started = Instant::now();
                     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
                     for (index, row_rect) in row_rects.iter().copied().enumerate() {
                         let Some(plot_rect) = plot_rects.get(index).copied() else {
@@ -2468,6 +2803,19 @@ impl eframe::App for PanelYApp {
                             );
                         }
                     }
+                    let draw_elapsed = draw_started.elapsed();
+                    self.perf.update(
+                        FrameTiming {
+                            frame: frame_started.elapsed(),
+                            interaction: interaction_elapsed,
+                            visible: visible_elapsed,
+                            draw: draw_elapsed,
+                        },
+                        &visible_rows,
+                        requested_buckets,
+                        effective_buckets,
+                        preview,
+                    );
                 });
         });
     }
@@ -3128,6 +3476,28 @@ fn visible_envelope_bucket_count(rect: egui::Rect) -> usize {
         .clamp(MIN_VISIBLE_ENVELOPE_BUCKETS, MAX_VISIBLE_ENVELOPE_BUCKETS)
 }
 
+fn preview_envelope_bucket_count(requested_bucket_count: usize) -> usize {
+    (requested_bucket_count / PREVIEW_BUCKET_DIVISOR)
+        .max(MIN_VISIBLE_ENVELOPE_BUCKETS)
+        .min(MAX_PREVIEW_ENVELOPE_BUCKETS)
+}
+
+fn preview_needed_for_workload(
+    dataset_sample_count: usize,
+    visible_source_sample_count: usize,
+    line_channel_count: usize,
+    step_channel_count: usize,
+) -> bool {
+    if dataset_sample_count < PREVIEW_MIN_DATASET_SAMPLES {
+        return false;
+    }
+
+    let line_sample_work = visible_source_sample_count.saturating_mul(line_channel_count);
+    line_sample_work >= PREVIEW_MIN_VISIBLE_LINE_SAMPLE_WORK
+        || (step_channel_count > 0
+            && visible_source_sample_count >= PREVIEW_MIN_VISIBLE_STEP_SAMPLES)
+}
+
 fn channel_color(index: usize, dark_mode: bool) -> egui::Color32 {
     const DARK_COLORS: [(u8, u8, u8); 8] = [
         (80, 190, 255),
@@ -3582,6 +3952,10 @@ fn bytes_to_mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
 fn padded_range(min: f64, max: f64) -> (f64, f64) {
     if min == max {
         let pad = min.abs().max(1.0) * 0.05;
@@ -3603,46 +3977,58 @@ fn extend_range(range: Option<(f64, f64)>, value: f64) -> Option<(f64, f64)> {
     }
 }
 
+fn visible_sample_range(
+    time: &[f64],
+    value_count: usize,
+    time_range: (f64, f64),
+) -> Option<VisibleSampleRange> {
+    let (range_start, range_end) = normalized_range(time_range)?;
+    let sample_count = time.len().min(value_count);
+    if sample_count == 0 {
+        return None;
+    }
+
+    let time = &time[..sample_count];
+    let start = time.partition_point(|time| *time < range_start);
+    let end = time.partition_point(|time| *time <= range_end);
+    let context_start = start.saturating_sub(usize::from(start > 0));
+    Some(VisibleSampleRange {
+        range_start,
+        range_end,
+        start,
+        end,
+        context_start,
+        source_sample_count: end.saturating_sub(start),
+        draw_sample_count: end.saturating_sub(context_start),
+    })
+}
+
 fn build_raw_step_trace(
     time: &[f64],
     values: &[f32],
     time_range: (f64, f64),
     max_samples: usize,
 ) -> Option<RawStepTrace> {
-    let (range_start, range_end) = normalized_range(time_range)?;
-    let sample_count = time.len().min(values.len());
-    if sample_count == 0 {
+    let sample_range = visible_sample_range(time, values.len(), time_range)?;
+    if sample_range.draw_sample_count == 0 || sample_range.draw_sample_count > max_samples {
         return None;
     }
 
-    let start = time
-        .partition_point(|time| *time < range_start)
-        .min(sample_count);
-    let end = time
-        .partition_point(|time| *time <= range_end)
-        .min(sample_count);
-    let context_start = start.saturating_sub(usize::from(start > 0));
-    let source_sample_count = end.saturating_sub(start);
-    let draw_sample_count = end.saturating_sub(context_start);
-    if draw_sample_count == 0 || draw_sample_count > max_samples {
-        return None;
-    }
-
-    let mut samples = Vec::with_capacity(draw_sample_count);
+    let mut samples = Vec::with_capacity(sample_range.draw_sample_count);
     let mut value_range = None;
 
-    if context_start < start {
-        let value = values[context_start];
+    if sample_range.context_start < sample_range.start {
+        let value = values[sample_range.context_start];
         if value.is_finite() {
             samples.push(StepSample {
-                time: range_start,
+                time: sample_range.range_start,
                 value,
             });
             value_range = extend_range(value_range, f64::from(value));
         }
     }
 
-    for index in start..end {
+    for index in sample_range.start..sample_range.end {
         let sample_time = time[index];
         let value = values[index];
         if !sample_time.is_finite() || !value.is_finite() {
@@ -3650,7 +4036,7 @@ fn build_raw_step_trace(
         }
 
         samples.push(StepSample {
-            time: sample_time.clamp(range_start, range_end),
+            time: sample_time.clamp(sample_range.range_start, sample_range.range_end),
             value,
         });
         value_range = extend_range(value_range, f64::from(value));
@@ -3662,35 +4048,37 @@ fn build_raw_step_trace(
 
     Some(RawStepTrace {
         samples,
-        source_sample_count,
-        time_range: Some((range_start, range_end)),
+        source_sample_count: sample_range.source_sample_count,
+        time_range: Some((sample_range.range_start, sample_range.range_end)),
         value_range,
         kind: StepTraceKind::RawSamples,
     })
 }
 
+#[cfg(test)]
 fn build_change_point_step_trace(
     time: &[f64],
     values: &[f32],
     time_range: (f64, f64),
     max_change_points: usize,
 ) -> Option<RawStepTrace> {
-    let (range_start, range_end) = normalized_range(time_range)?;
-    let sample_count = time.len().min(values.len());
-    if sample_count == 0 {
-        return None;
+    match build_change_point_step_trace_result(time, values, time_range, max_change_points) {
+        StepTraceBuildResult::Trace(trace) => Some(trace),
+        StepTraceBuildResult::TooManyChangePoints { .. } | StepTraceBuildResult::Empty => None,
     }
+}
 
-    let start = time
-        .partition_point(|time| *time < range_start)
-        .min(sample_count);
-    let end = time
-        .partition_point(|time| *time <= range_end)
-        .min(sample_count);
-    let context_start = start.saturating_sub(usize::from(start > 0));
-    let source_sample_count = end.saturating_sub(start);
-    if end.saturating_sub(context_start) == 0 {
-        return None;
+fn build_change_point_step_trace_result(
+    time: &[f64],
+    values: &[f32],
+    time_range: (f64, f64),
+    max_change_points: usize,
+) -> StepTraceBuildResult {
+    let Some(sample_range) = visible_sample_range(time, values.len(), time_range) else {
+        return StepTraceBuildResult::Empty;
+    };
+    if sample_range.draw_sample_count == 0 {
+        return StepTraceBuildResult::Empty;
     }
 
     let mut samples = Vec::new();
@@ -3698,11 +4086,11 @@ fn build_change_point_step_trace(
     let mut previous_value = None;
     let mut change_points = 0usize;
 
-    if context_start < start {
-        let value = values[context_start];
+    if sample_range.context_start < sample_range.start {
+        let value = values[sample_range.context_start];
         if value.is_finite() {
             samples.push(StepSample {
-                time: range_start,
+                time: sample_range.range_start,
                 value,
             });
             value_range = extend_range(value_range, f64::from(value));
@@ -3710,7 +4098,7 @@ fn build_change_point_step_trace(
         }
     }
 
-    for index in start..end {
+    for index in sample_range.start..sample_range.end {
         let sample_time = time[index];
         let value = values[index];
         if !sample_time.is_finite() || !value.is_finite() {
@@ -3722,10 +4110,12 @@ fn build_change_point_step_trace(
             Some(previous) if previous == value => {}
             Some(_) => {
                 if change_points >= max_change_points {
-                    return None;
+                    return StepTraceBuildResult::TooManyChangePoints {
+                        source_sample_count: sample_range.source_sample_count,
+                    };
                 }
                 samples.push(StepSample {
-                    time: sample_time.clamp(range_start, range_end),
+                    time: sample_time.clamp(sample_range.range_start, sample_range.range_end),
                     value,
                 });
                 previous_value = Some(value);
@@ -3733,7 +4123,7 @@ fn build_change_point_step_trace(
             }
             None => {
                 samples.push(StepSample {
-                    time: sample_time.clamp(range_start, range_end),
+                    time: sample_time.clamp(sample_range.range_start, sample_range.range_end),
                     value,
                 });
                 previous_value = Some(value);
@@ -3742,13 +4132,13 @@ fn build_change_point_step_trace(
     }
 
     if samples.is_empty() || value_range.is_none() {
-        return None;
+        return StepTraceBuildResult::Empty;
     }
 
-    Some(RawStepTrace {
+    StepTraceBuildResult::Trace(RawStepTrace {
         samples,
-        source_sample_count,
-        time_range: Some((range_start, range_end)),
+        source_sample_count: sample_range.source_sample_count,
+        time_range: Some((sample_range.range_start, sample_range.range_end)),
         value_range,
         kind: StepTraceKind::ChangePoints,
     })
@@ -4157,5 +4547,60 @@ mod app_tests {
         let trace = build_change_point_step_trace(&time, &values, (0.0, 4.0), 2);
 
         assert!(trace.is_none());
+    }
+
+    #[test]
+    fn change_point_step_trace_reports_dense_fallback() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 1.0, 0.0, 1.0, 0.0];
+
+        let result = build_change_point_step_trace_result(&time, &values, (0.0, 4.0), 2);
+
+        assert_eq!(
+            result,
+            StepTraceBuildResult::TooManyChangePoints {
+                source_sample_count: 5
+            }
+        );
+    }
+
+    #[test]
+    fn step_fallback_hint_applies_to_same_or_wider_ranges() {
+        let mut store = ChannelStore::default();
+
+        store.record_step_change_point_fallback("gate_pwm", (10.0, 20.0), 100_000);
+
+        assert!(store.should_skip_step_change_points("gate_pwm", (10.0, 20.0), 95_000));
+        assert!(store.should_skip_step_change_points("gate_pwm", (10.0, 30.0), 150_000));
+        assert!(!store.should_skip_step_change_points("gate_pwm", (12.0, 18.0), 60_000));
+        assert!(!store.should_skip_step_change_points("other", (10.0, 30.0), 150_000));
+    }
+
+    #[test]
+    fn preview_bucket_count_is_capped_and_reduced() {
+        assert_eq!(
+            preview_envelope_bucket_count(100),
+            MIN_VISIBLE_ENVELOPE_BUCKETS
+        );
+        assert_eq!(preview_envelope_bucket_count(1_200), 300);
+        assert_eq!(
+            preview_envelope_bucket_count(8_192),
+            MAX_PREVIEW_ENVELOPE_BUCKETS
+        );
+    }
+
+    #[test]
+    fn preview_workload_gate_excludes_medium_class_data() {
+        assert!(!preview_needed_for_workload(2_000_000, 1_000_000, 8, 3));
+    }
+
+    #[test]
+    fn preview_workload_gate_excludes_small_large_data_windows() {
+        assert!(!preview_needed_for_workload(10_000_000, 100_000, 8, 1));
+    }
+
+    #[test]
+    fn preview_workload_gate_allows_large_wide_ranges() {
+        assert!(preview_needed_for_workload(10_000_000, 5_000_000, 8, 1));
     }
 }
