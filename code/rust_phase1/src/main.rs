@@ -28,6 +28,9 @@ const MAX_PREVIEW_ENVELOPE_BUCKETS: usize = 512;
 const ENVELOPE_OVERSCAN_RATIO: f64 = 0.5;
 const ENVELOPE_CONTEXT_SPAN_TOLERANCE: f64 = 0.05;
 const MAX_CACHED_ENVELOPE_BUCKETS: usize = MAX_VISIBLE_ENVELOPE_BUCKETS * 3;
+const LINE_TILE_SAMPLE_WIDTH: usize = 256;
+const LINE_TILE_MIN_SOURCE_SAMPLES: usize = 500_000;
+const LINE_TILE_MIN_BUCKET_SIZE: usize = LINE_TILE_SAMPLE_WIDTH * 2;
 const DEFAULT_TRACE_LINE_WIDTH: f32 = 1.25;
 const MIN_TRACE_LINE_WIDTH: f32 = 0.5;
 const MAX_TRACE_LINE_WIDTH: f32 = 6.0;
@@ -225,6 +228,8 @@ struct PerfStats {
     envelope_cache_misses: usize,
     envelope_context_hits: usize,
     envelope_context_misses: usize,
+    line_tile_hits: usize,
+    line_tile_builds: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +297,7 @@ enum DrawMode {
 #[derive(Debug, Default)]
 struct ChannelStore {
     raw_by_channel: BTreeMap<String, parquet_waveform::ChannelData>,
+    line_tile_cache: BTreeMap<String, parquet_waveform::LineTileCache>,
     envelope_cache: BTreeMap<EnvelopeKey, parquet_waveform::MinMaxEnvelope>,
     envelope_context: Option<EnvelopeContext>,
     envelope_plan: Option<parquet_waveform::MinMaxEnvelopePlan>,
@@ -321,6 +327,9 @@ struct EnvelopeCacheStats {
     hits: usize,
     misses: usize,
     clipped: usize,
+    tile_hits: usize,
+    tile_builds: usize,
+    tile_buckets: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -478,6 +487,8 @@ impl Default for PerfStats {
             envelope_cache_misses: 0,
             envelope_context_hits: 0,
             envelope_context_misses: 0,
+            line_tile_hits: 0,
+            line_tile_builds: 0,
         }
     }
 }
@@ -558,12 +569,14 @@ impl PerfStats {
         self.envelope_cache_misses = envelope_stats.misses;
         self.envelope_context_hits = envelope_stats.context_hits;
         self.envelope_context_misses = envelope_stats.context_misses;
+        self.line_tile_hits = envelope_stats.tile_hits;
+        self.line_tile_builds = envelope_stats.tile_builds;
     }
 
     fn summary(&self) -> String {
         let mode = if self.preview { "preview" } else { "full" };
         format!(
-            "{mode} frame {:.1}ms visible {:.1}ms draw {:.1}ms input {:.1}ms rows {} ch {} points {} buckets {}/{} env h/m {}/{} ctx {}/{}",
+            "{mode} frame {:.1}ms visible {:.1}ms draw {:.1}ms input {:.1}ms rows {} ch {} points {} buckets {}/{} env h/m {}/{} ctx {}/{} tile h/b {}/{}",
             self.frame_ms,
             self.visible_ms,
             self.draw_ms,
@@ -576,7 +589,9 @@ impl PerfStats {
             self.envelope_cache_hits,
             self.envelope_cache_misses,
             self.envelope_context_hits,
-            self.envelope_context_misses
+            self.envelope_context_misses,
+            self.line_tile_hits,
+            self.line_tile_builds
         )
     }
 }
@@ -830,6 +845,7 @@ fn row_missing_channel_counts(
 impl ChannelStore {
     fn clear_all(&mut self) {
         self.raw_by_channel.clear();
+        self.line_tile_cache.clear();
         self.clear_envelope_cache();
         self.step_fallback_hints.clear();
     }
@@ -850,6 +866,7 @@ impl ChannelStore {
 
     fn insert_channel(&mut self, channel: parquet_waveform::ChannelData) {
         self.step_fallback_hints.remove(&channel.channel_path);
+        self.line_tile_cache.remove(&channel.channel_path);
         self.raw_by_channel
             .insert(channel.channel_path.clone(), channel);
         self.clear_envelope_cache();
@@ -862,8 +879,38 @@ impl ChannelStore {
             .sum()
     }
 
+    fn line_tile_memory_bytes(&self) -> usize {
+        self.line_tile_cache
+            .values()
+            .map(parquet_waveform::LineTileCache::memory_bytes)
+            .sum()
+    }
+
+    fn line_tile_build_seconds(&self) -> f64 {
+        self.line_tile_cache
+            .values()
+            .map(|cache| cache.elapsed.as_secs_f64())
+            .sum()
+    }
+
     fn begin_envelope_frame(&mut self) {
         self.last_envelope_stats = EnvelopeCacheStats::default();
+    }
+
+    fn ensure_line_tile_cache(&mut self, channel_path: &str) -> Option<bool> {
+        let was_cached = self.line_tile_cache.contains_key(channel_path);
+        if !was_cached {
+            let channel = self.raw_by_channel.get(channel_path)?;
+            let tile_cache =
+                parquet_waveform::build_line_tile_cache(&channel.values, LINE_TILE_SAMPLE_WIDTH);
+            self.line_tile_cache
+                .insert(channel_path.to_owned(), tile_cache);
+            self.last_envelope_stats.tile_builds += 1;
+        } else {
+            self.last_envelope_stats.tile_hits += 1;
+        }
+
+        Some(!was_cached)
     }
 
     fn prepare_envelope_context(
@@ -907,6 +954,7 @@ impl ChannelStore {
         time: &[f64],
         view_range: (f64, f64),
         requested_bucket_count: usize,
+        allow_line_tile_lod: bool,
     ) -> Option<(parquet_waveform::MinMaxEnvelope, bool)> {
         let context = self.envelope_context?;
         let cache_range = context.cache_range();
@@ -914,10 +962,29 @@ impl ChannelStore {
         let was_cached = self.envelope_cache.contains_key(&key);
         if !was_cached {
             let envelope = {
-                let channel = self.raw_by_channel.get(channel_path)?;
-                if let Some(plan) = self.envelope_plan.as_ref() {
+                if allow_line_tile_lod
+                    && self
+                        .envelope_plan
+                        .as_ref()
+                        .is_some_and(should_use_line_tile_lod)
+                {
+                    let plan = self.envelope_plan.clone()?;
+                    let _tile_was_built = self.ensure_line_tile_cache(channel_path)?;
+                    let channel = self.raw_by_channel.get(channel_path)?;
+                    let tile_cache = self.line_tile_cache.get(channel_path)?;
+                    let envelope = parquet_waveform::min_max_envelope_for_plan_with_tiles(
+                        time,
+                        &channel.values,
+                        &plan,
+                        tile_cache,
+                    );
+                    self.last_envelope_stats.tile_buckets += envelope.bucket_count();
+                    envelope
+                } else if let Some(plan) = self.envelope_plan.as_ref() {
+                    let channel = self.raw_by_channel.get(channel_path)?;
                     parquet_waveform::min_max_envelope_for_plan(&channel.values, plan)
                 } else {
+                    let channel = self.raw_by_channel.get(channel_path)?;
                     channel.min_max_envelope_for_range(
                         time,
                         cache_range,
@@ -1326,6 +1393,7 @@ fn benchmark_multi_channel(path: String, channels: Vec<String>) -> Result<String
             &time.time,
             full_range,
             BENCH_VISIBLE_ENVELOPE_BUCKETS,
+            true,
         ) else {
             return Err(format!(
                 "loaded channel is missing from cache: {channel_path}"
@@ -1599,6 +1667,14 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         .iter()
         .map(|result| result.envelope_stats.context_misses)
         .sum::<usize>();
+    let total_tile_hits = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.tile_hits)
+        .sum::<usize>();
+    let total_tile_builds = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.tile_builds)
+        .sum::<usize>();
 
     let schema = app.dataset.schema.as_ref().expect("schema is set");
     let shared_time = app.dataset.shared_time.as_ref().expect("time is set");
@@ -1639,11 +1715,17 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         max_raw_step_samples
     ));
     report.push_str(&format!(
-        "envelope cache: hits {}, misses {}, context hits {}, context misses {}\n",
-        total_envelope_hits, total_envelope_misses, total_context_hits, total_context_misses
+        "envelope cache: hits {}, misses {}, context hits {}, context misses {}, line tile hits {}, builds {}, tile memory {:.1} MiB\n",
+        total_envelope_hits,
+        total_envelope_misses,
+        total_context_hits,
+        total_context_misses,
+        total_tile_hits,
+        total_tile_builds,
+        bytes_to_mib(app.dataset.loaded_channels.line_tile_memory_bytes())
     ));
     report.push_str(&format!(
-        "pan cache benchmark: {} ranges, total {:.3}s, avg {:.4}s, max {:.4}s, cache hits {}, misses {}, context hits {}, context misses {}\n",
+        "pan cache benchmark: {} ranges, total {:.3}s, avg {:.4}s, max {:.4}s, cache hits {}, misses {}, context hits {}, context misses {}, tile hits {}, builds {}\n",
         pan_cache_result.ranges,
         pan_cache_result.elapsed_sec,
         pan_cache_result.avg_visible_sec(),
@@ -1651,7 +1733,9 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         pan_cache_result.envelope_hits,
         pan_cache_result.envelope_misses,
         pan_cache_result.context_hits,
-        pan_cache_result.context_misses
+        pan_cache_result.context_misses,
+        pan_cache_result.tile_hits,
+        pan_cache_result.tile_builds
     ));
     report.push_str(&format!(
         "hover benchmark: {} positions, {} lookups, {} hits, total {:.4}s, avg {:.3} us/lookup\n",
@@ -1686,7 +1770,7 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
     report.push_str("visible runs:\n");
     for result in &visible_results {
         report.push_str(&format!(
-            "  #{:02} {:.6}..{:.6}s {:.4}s rows={} ch={} samples={} env={} step={} edge={} step_samples={} draw_points={} hover_values={} cache_h/m={}/{} ctx={}/{}\n",
+            "  #{:02} {:.6}..{:.6}s {:.4}s rows={} ch={} samples={} env={} step={} edge={} step_samples={} draw_points={} hover_values={} cache_h/m={}/{} ctx={}/{} tile_h/b={}/{}\n",
             result.index,
             result.range.0,
             result.range.1,
@@ -1703,7 +1787,9 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
             result.envelope_stats.hits,
             result.envelope_stats.misses,
             result.envelope_stats.context_hits,
-            result.envelope_stats.context_misses
+            result.envelope_stats.context_misses,
+            result.envelope_stats.tile_hits,
+            result.envelope_stats.tile_builds
         ));
     }
 
@@ -1782,6 +1868,8 @@ fn benchmark_phase2_pan_cache(
         result.envelope_misses += envelope_stats.misses;
         result.context_hits += envelope_stats.context_hits;
         result.context_misses += envelope_stats.context_misses;
+        result.tile_hits += envelope_stats.tile_hits;
+        result.tile_builds += envelope_stats.tile_builds;
     }
 
     result
@@ -1905,6 +1993,8 @@ struct Phase2PanCacheBenchmarkResult {
     envelope_misses: usize,
     context_hits: usize,
     context_misses: usize,
+    tile_hits: usize,
+    tile_builds: usize,
 }
 
 impl Phase2PanCacheBenchmarkResult {
@@ -2576,6 +2666,7 @@ impl PanelYApp {
                                 time_values,
                                 view_range,
                                 requested_bucket_count,
+                                true,
                             ) else {
                                 continue;
                             };
@@ -2606,6 +2697,7 @@ impl PanelYApp {
                                     time_values,
                                     view_range,
                                     requested_bucket_count,
+                                    false,
                                 ) else {
                                     continue;
                                 };
@@ -2655,6 +2747,7 @@ impl PanelYApp {
                                                 time_values,
                                                 view_range,
                                                 requested_bucket_count,
+                                                false,
                                             )
                                         else {
                                             continue;
@@ -2671,6 +2764,7 @@ impl PanelYApp {
                                                 time_values,
                                                 view_range,
                                                 requested_bucket_count,
+                                                false,
                                             )
                                         else {
                                             continue;
@@ -2760,7 +2854,7 @@ impl PanelYApp {
             let envelope_stats = self.dataset.loaded_channels.last_envelope_stats;
             let quality = if preview { "preview" } else { "full" };
             self.load.status = format!(
-                "{quality} view {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, step fallback {}, env h/m {}/{}, ctx {}/{}, clips {}, cache {}, hints {}",
+                "{quality} view {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, step fallback {}, env h/m {}/{}, ctx {}/{}, clips {}, tile h/b {}/{}, cache {}, hints {}",
                 view_range.0,
                 view_range.1,
                 visible_rows.len(),
@@ -2775,6 +2869,8 @@ impl PanelYApp {
                 envelope_stats.context_hits,
                 envelope_stats.context_misses,
                 envelope_stats.clipped,
+                envelope_stats.tile_hits,
+                envelope_stats.tile_builds,
                 self.dataset.loaded_channels.envelope_cache.len(),
                 self.dataset.loaded_channels.step_fallback_hints.len()
             );
@@ -3221,6 +3317,14 @@ fn draw_channel_cache_controls(ui: &mut egui::Ui, dataset: &DatasetState) {
         dataset.loaded_channels.raw_by_channel.len(),
         bytes_to_mib(dataset.loaded_channels.raw_memory_bytes())
     ));
+    if !dataset.loaded_channels.line_tile_cache.is_empty() {
+        ui.label(format!(
+            "Line tiles: {} cached ({:.1} MiB, build {:.3}s)",
+            dataset.loaded_channels.line_tile_cache.len(),
+            bytes_to_mib(dataset.loaded_channels.line_tile_memory_bytes()),
+            dataset.loaded_channels.line_tile_build_seconds()
+        ));
+    }
     for channel in dataset.loaded_channels.raw_by_channel.values() {
         let file_name = channel
             .path
@@ -3785,6 +3889,11 @@ fn preview_needed_for_workload(
     line_sample_work >= PREVIEW_MIN_VISIBLE_LINE_SAMPLE_WORK
         || (step_channel_count > 0
             && visible_source_sample_count >= PREVIEW_MIN_VISIBLE_STEP_SAMPLES)
+}
+
+fn should_use_line_tile_lod(plan: &parquet_waveform::MinMaxEnvelopePlan) -> bool {
+    plan.source_sample_count >= LINE_TILE_MIN_SOURCE_SAMPLES
+        && plan.bucket_size >= LINE_TILE_MIN_BUCKET_SIZE
 }
 
 fn channel_color(index: usize, dark_mode: bool) -> egui::Color32 {
@@ -4960,7 +5069,7 @@ mod app_tests {
         store.begin_envelope_frame();
         store.prepare_envelope_context(&time, time.len(), (10.0, 30.0), (0.0, 99.0), 10);
         let first = store
-            .ensure_envelope("ch", &time, (10.0, 30.0), 10)
+            .ensure_envelope("ch", &time, (10.0, 30.0), 10, true)
             .expect("first envelope");
         assert!(first.1);
         assert_eq!(first.0.time_range, Some((10.0, 30.0)));
@@ -4970,7 +5079,7 @@ mod app_tests {
         store.begin_envelope_frame();
         store.prepare_envelope_context(&time, time.len(), (15.0, 35.0), (0.0, 99.0), 10);
         let second = store
-            .ensure_envelope("ch", &time, (15.0, 35.0), 10)
+            .ensure_envelope("ch", &time, (15.0, 35.0), 10, true)
             .expect("second envelope");
         assert!(!second.1);
         assert_eq!(second.0.time_range, Some((15.0, 35.0)));
@@ -4984,5 +5093,28 @@ mod app_tests {
 
         assert!(context.reuses_for_view((15.0, 35.0), 100));
         assert!(!context.reuses_for_view((15.0, 25.0), 100));
+    }
+
+    #[test]
+    fn line_tile_lod_only_applies_to_wide_line_buckets() {
+        let wide_plan = parquet_waveform::MinMaxEnvelopePlan {
+            bucket_spans: Vec::new(),
+            source_sample_count: LINE_TILE_MIN_SOURCE_SAMPLES,
+            requested_bucket_count: 100,
+            bucket_size: LINE_TILE_MIN_BUCKET_SIZE,
+            time_range: Some((0.0, 1.0)),
+        };
+        let narrow_plan = parquet_waveform::MinMaxEnvelopePlan {
+            bucket_size: LINE_TILE_MIN_BUCKET_SIZE - 1,
+            ..wide_plan.clone()
+        };
+        let small_plan = parquet_waveform::MinMaxEnvelopePlan {
+            source_sample_count: LINE_TILE_MIN_SOURCE_SAMPLES - 1,
+            ..wide_plan.clone()
+        };
+
+        assert!(should_use_line_tile_lod(&wide_plan));
+        assert!(!should_use_line_tile_lod(&narrow_plan));
+        assert!(!should_use_line_tile_lod(&small_plan));
     }
 }
