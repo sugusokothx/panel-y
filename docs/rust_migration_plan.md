@@ -4,7 +4,7 @@ doc_type: 移植計画書
 target: Rust版 波形ビューア
 created: "2026-04-27"
 updated: "2026-05-02"
-status: Phase 2.5計画中
+status: Phase 2.5ロードUI優先
 source_proto: "code/proto_3_1b"
 ---
 
@@ -253,22 +253,21 @@ Closeout判断:
 優先対象:
 
 - データロード関係のUI充実
-- wheel操作分離
-- box zoom
+- 低リスク作図補助としてのsession preset
 - ロード済みcache操作
 
 設計上の注意:
 
 - 解析機能より、実ログを開いて確認する導線を優先する
-- 通常wheelは縦スクロール、`Ctrl + wheel` / pinchはX zoom、horizontal scrollはX panを基本にする
-- box zoomはまずX範囲zoomに絞り、Y range変更は必須にしない
-- `.pyc.json` 完全互換や設定保存はPhase 4へ残す
+- parquet path直打ちを避け、schema load、channel検索、load/addまでの距離を縮める
+- session presetはRust版内部の軽量復元に限定し、`.pyc.json` 完全互換や正式作図設定はPhase 4へ残す
+- wheel操作分離とbox zoomは有用だが、ロードUI整理後に扱う
 
 完了条件:
 
 - 実ログを開く、schemaを確認する、複数channelをloadする操作が実用上のストレスにならない
-- wheel操作で縦スクロールとX zoomを使い分けられる
-- box zoomでイベント周辺へ素早く寄れる
+- channel一覧からload/addでき、loaded / loading / unloaded状態が分かる
+- 低リスクなsession presetで、実地検証中の表示状態へ戻れる
 - 代表データでロード、pan、zoom、row追加、channel追加を一通りGUI確認済み
 
 ---
