@@ -4,7 +4,7 @@ doc_type: Phase 2性能改善計画 その2
 target: Rust移植 Phase 2
 created: "2026-05-02"
 updated: "2026-05-02"
-status: 一部実装済み
+status: Phase 2 closeout完了
 source: "docs/rust_migration_phase2_performance_plan.md"
 implementation: "code/rust_phase1"
 ---
@@ -24,6 +24,32 @@ Phase 2性能改善の主戦略を、操作中previewから「イベントを隠
 - 操作中と停止後で見え方が変わると、目印を失いやすい
 
 この用途では、操作中だけ描画品質を落とすpreviewは相性が悪い。以後は、通常描画そのものを軽くし、pan/zoom中も停止後も同じ情報が見える方針を基本にする。
+
+### 1.1 Closeout summary
+
+2026-05-02時点で、Phase 2性能改善は一区切りとする。
+
+実装済み:
+
+- previewのdebug / emergency toggle化
+- frame timingとcache統計の表示
+- overscan range cache
+- bucket境界共有 / 一括生成
+- Line lazy tile / LOD
+- ripple検証データとbench
+- Step edge cache / dense LOD
+
+保留:
+
+- Line tile / Step edge cacheのbackground build
+- 複数level LOD
+- channel並列化
+
+判断:
+
+- pan cache時のlarge全9ch応答は良好で、Phase 3へ進む妨げではない
+- 初回build costは既知の体感リスクとして残すが、現時点では深追いしない
+- 今後も単純間引きではなく、Lineはmin/max保持、Stepはedge保持を基本にする
 
 ---
 
@@ -118,6 +144,12 @@ Phase 2性能改善の主戦略を、操作中previewから「イベントを隠
 - preview OFFでも既存の基本操作が成立する
 - UI上でpreview状態がユーザーの意図せず混ざらない
 
+実装結果:
+
+- `ViewState::large_preview_enabled` の既定値を `false` にした
+- UI表示を `Emergency preview` に変更した
+- previewは主戦略ではなく、debug / emergency用toggleとして残す扱いにした
+
 ### 5.2 overscan range cache
 
 狙い:
@@ -144,6 +176,13 @@ Phase 2性能改善の主戦略を、操作中previewから「イベントを隠
 - pan中と停止後で見た目が切り替わらない
 - Y auto rangeが表示範囲外の値に引っ張られない
 
+実装結果:
+
+- `ChannelStore` のenvelope cacheをoverscan付きcache rangeへ変更した
+- view rangeがcache range内ならpan中もcacheを再利用する
+- overscan範囲外を描画前にclipし、境界bucketはraw値で再計算することでY auto rangeの混入を避けた
+- `--bench-phase2` にpan cache benchmarkを追加した
+
 ### 5.3 bucket境界共有 / 一括生成
 
 狙い:
@@ -162,6 +201,12 @@ Phase 2性能改善の主戦略を、操作中previewから「イベントを隠
 
 - medium / largeのmulti channel visible trace生成時間が下がる
 - 表示点数とY rangeの意味が現行と一致する
+
+実装結果:
+
+- `parquet_waveform::MinMaxEnvelopePlan` を追加した
+- view rangeからsample index rangeとbucket境界を一度だけ作り、複数Line channelで共有するようにした
+- `EnvelopeBucket` に `start_index` / `end_index` を持たせ、overscan cacheのclip時に境界bucketを正しく扱えるようにした
 
 ### 5.4 Line用lazy tile / LOD
 
@@ -194,6 +239,14 @@ Phase 2性能改善の主戦略を、操作中previewから「イベントを隠
 - large全9chの広域Line表示でvisible生成時間が安定して下がる
 - spike / outlierが消えない
 - RSS増加が許容範囲に収まる
+
+実装結果:
+
+- `parquet_waveform::LineTileCache` を追加した
+- channelごとに `256 samples/tile` のmin/max tileをlazy buildする
+- 広域Line表示だけtile LODを使い、Step fallbackには使わないよう分離した
+- spike / ripple検証でmin/max envelopeが重要成分を落とさないことを確認した
+- 初回tile buildは同期実行のため、background buildは保留にした
 
 ### 5.5 Step用edge cache / dense LOD
 
@@ -247,6 +300,11 @@ Phase 2性能改善の主戦略を、操作中previewから「イベントを隠
 
 - large全9chのcold生成maxが明確に下がる
 - small / mediumでoverheadが増えない
+
+Closeout判断:
+
+- overscan cache、bucket境界共有、Line tile、Step edge cacheでPhase 2として十分な改善が得られたため、channel並列化は保留する
+- 今後、初回build costやcold生成maxが実使用で問題になった場合に再検討する
 
 ---
 
@@ -353,7 +411,7 @@ Step dense LOD:
 
 ## 10. 結論
 
-今後の主戦略はpreviewではなく、以下に切り替える。
+Phase 2 closeout時点で、主戦略はpreviewではなく以下に確定する。
 
 ```text
 Line: min/maxを保持したままcache / tileで軽くする
@@ -363,3 +421,5 @@ multi channel: bucket境界共有で重複計算を減らす
 ```
 
 単純な描画点間引きは採らない。描画点数を減らす場合は、min/max、edge、densityなど、探索に必要な情報を保存する形だけを採用する。
+
+Phase 2性能改善はここで一区切りとする。残る初回build costは既知の保留事項として扱い、Line tile / Step edge cacheのbackground build、複数level LOD、channel並列化はPhase 3前後で必要になった場合に再検討する。

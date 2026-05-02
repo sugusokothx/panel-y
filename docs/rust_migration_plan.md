@@ -3,8 +3,8 @@ project: Panel_y
 doc_type: 移植計画書
 target: Rust版 波形ビューア
 created: "2026-04-27"
-updated: "2026-04-30"
-status: Phase 2 P2-12測定完了
+updated: "2026-05-02"
+status: Phase 2.5計画中
 source_proto: "code/proto_3_1b"
 ---
 
@@ -198,13 +198,15 @@ Analysis Layer
 
 ### Phase 2: 波形ビューア基本機能の移植
 
-状態: P2-12測定完了
+状態: Phase 2 closeout完了（性能改善一区切り）
 
 目的: `proto_3_1b` のビューアとしての主要操作をRust版に移す。
 
 設計方針: [rust_migration_phase2_design.md](rust_migration_phase2_design.md)
 
 性能測定: [rust_migration_phase2_benchmark_results.md](rust_migration_phase2_benchmark_results.md)
+
+性能改善: [rust_migration_phase2_performance_plan_2.md](rust_migration_phase2_performance_plan_2.md)
 
 移植対象:
 
@@ -229,6 +231,45 @@ Analysis Layer
 
 - 日常的な波形確認作業がRust版だけで実施できる
 - `proto_3_1b` の基本表示機能と同等以上の操作性がある
+
+Closeout判断:
+
+- P2-12後の追加性能改善として、previewのdebug扱い化、overscan range cache、bucket境界共有、Line lazy tile / LOD、Step edge cache / dense LODを実装した
+- Lineはmin/maxを保持するcache / tile、Stepはedge保持とdense fallbackを使い、pan/zoom中もイベント探索に必要な情報を落とさない方針で固めた
+- ripple検証とStep edge検証で、低振幅高周波成分と1sample差分のStep表示を確認した
+- 初回のLine tile build / Step edge cache build costは既知の保留事項とし、現時点ではPhase 3のブロッカーにしない
+- wheel操作分離、box zoom、データロードUI改善はPhase 2.5としてPhase 3前に扱う
+
+---
+
+### Phase 2.5: 実地検証UI polish
+
+状態: 計画中
+
+目的: Phase 3の解析機能へ入る前に、実地検証を効率よく回すためのUIを整える。
+
+詳細計画: [rust_migration_phase2_5_ui_polish.md](rust_migration_phase2_5_ui_polish.md)
+
+優先対象:
+
+- データロード関係のUI充実
+- wheel操作分離
+- box zoom
+- ロード済みcache操作
+
+設計上の注意:
+
+- 解析機能より、実ログを開いて確認する導線を優先する
+- 通常wheelは縦スクロール、`Ctrl + wheel` / pinchはX zoom、horizontal scrollはX panを基本にする
+- box zoomはまずX範囲zoomに絞り、Y range変更は必須にしない
+- `.pyc.json` 完全互換や設定保存はPhase 4へ残す
+
+完了条件:
+
+- 実ログを開く、schemaを確認する、複数channelをloadする操作が実用上のストレスにならない
+- wheel操作で縦スクロールとX zoomを使い分けられる
+- box zoomでイベント周辺へ素早く寄れる
+- 代表データでロード、pan、zoom、row追加、channel追加を一通りGUI確認済み
 
 ---
 

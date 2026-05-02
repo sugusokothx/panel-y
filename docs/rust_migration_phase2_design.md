@@ -3,8 +3,8 @@ project: Panel_y
 doc_type: Phase 2設計方針
 target: Rust移植 Phase 2
 created: "2026-04-30"
-updated: "2026-04-30"
-status: P2-12測定完了
+updated: "2026-05-02"
+status: Phase 2 closeout完了
 source_proto: "code/proto_3_1b"
 base_implementation: "code/rust_phase1"
 ---
@@ -308,6 +308,7 @@ UI実装の優先:
 - 2026-04-30: P2-08改善GUI確認完了。Manual切替時の初期値とReset時に直近Auto範囲へ戻る動きが問題ないことを確認した
 - 2026-04-30: P2-12測定完了。`--bench-phase2` を追加し、中データ全8ch、大データ全9ch、大データ代表4chで複数row表示データ生成・hover・RSSを測定した。大データ全9chではvisible trace生成 avg 31.3 ms / max 92.5 ms、RSS after bench 435.4 MiB。結果は [rust_migration_phase2_benchmark_results.md](rust_migration_phase2_benchmark_results.md) に記録した
 - 2026-04-30: P2-12後の性能改善候補を整理。tile / LODをすぐ入れるのではなく、GUI frame timing、操作中preview / debounce、Step広範囲fallback早期化、channel並列化 / overscan cache、coarse tile / LODの順で進める方針を [rust_migration_phase2_performance_plan.md](rust_migration_phase2_performance_plan.md) に記録した
+- 2026-05-02: Phase 2性能改善をcloseout。previewをdebug扱いへ下げ、overscan range cache、bucket境界共有、Line lazy tile / LOD、ripple検証、Step edge cache / dense LODまで実装・検証した。初回build costは既知の保留事項とし、Phase 3のブロッカーにはしない
 
 ---
 
@@ -324,6 +325,12 @@ Phase 2は以下を満たしたら完了とする。
 - 複数ch表示でも描画処理が表示幅オーダーに収まる
 - 中・大データで操作不能にならない
 - 90M点級または実機ログ相当データの測定方針が確定している
+
+Closeout結果:
+
+- 上記条件はPhase 2として満了扱いにする
+- P2-11 theme切替はUI polishとして残す。wheel操作分離、box zoom、データロードUI改善はPhase 2.5としてPhase 3前に扱う
+- 初回Line tile build / Step edge cache buildのbackground化は、実使用で体感問題が出た場合に再検討する
 
 ---
 
