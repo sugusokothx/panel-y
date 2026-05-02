@@ -175,6 +175,7 @@ struct PanelYApp {
     load: LoadState,
     interaction: InteractionState,
     perf: PerfStats,
+    session_preset: Option<SessionPreset>,
     load_result_tx: mpsc::Sender<LoadJobResult>,
     load_result_rx: mpsc::Receiver<LoadJobResult>,
     next_load_job_id: u64,
@@ -251,6 +252,39 @@ struct ActiveLoadJob {
     started: std::time::Instant,
 }
 
+#[derive(Clone, Debug)]
+struct SessionPreset {
+    parquet_path: String,
+    selected_channel: String,
+    selected_row_index: Option<usize>,
+    x_range: Option<(f64, f64)>,
+    large_preview_enabled: bool,
+    rows: Vec<SessionPresetRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SessionPresetRow {
+    y_range: RowYRange,
+    channels: Vec<SessionPresetChannel>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SessionPresetChannel {
+    channel_path: String,
+    color_index: usize,
+    draw_mode: DrawMode,
+    visible: bool,
+    color_override: Option<egui::Color32>,
+    line_width: f32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SessionPresetApplyReport {
+    restored_rows: usize,
+    restored_channels: usize,
+    missing_channels: Vec<String>,
+}
+
 #[derive(Debug)]
 struct LoadJobResult {
     job_id: u64,
@@ -269,6 +303,19 @@ struct LoadedChannelData {
 struct SchemaControlsResponse {
     selection_changed: bool,
     load_channel: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CacheControlsResponse {
+    action: Option<CacheControlAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CacheControlAction {
+    AddToSelectedRow(String),
+    UnloadChannel(String),
+    UnloadAllChannels,
+    ClearDrawCaches,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -480,6 +527,7 @@ impl Default for PanelYApp {
             load: LoadState::default(),
             interaction: InteractionState::default(),
             perf: PerfStats::default(),
+            session_preset: None,
             load_result_tx,
             load_result_rx,
             next_load_job_id: 1,
@@ -1171,6 +1219,146 @@ impl ViewState {
     }
 }
 
+impl SessionPreset {
+    fn capture(parquet_path: &str, view: &ViewState) -> Self {
+        Self {
+            parquet_path: parquet_path.trim().to_owned(),
+            selected_channel: view.selected_channel.clone(),
+            selected_row_index: view
+                .selected_row_id
+                .and_then(|row_id| view.rows.iter().position(|row| row.id == row_id)),
+            x_range: view.x_range,
+            large_preview_enabled: view.large_preview_enabled,
+            rows: view
+                .rows
+                .iter()
+                .map(|row| SessionPresetRow {
+                    y_range: row.y_range,
+                    channels: row
+                        .channels
+                        .iter()
+                        .map(SessionPresetChannel::from)
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn channel_count(&self) -> usize {
+        self.rows.iter().map(|row| row.channels.len()).sum()
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{}: {} row(s), {} channel(s)",
+            recent_path_label(&self.parquet_path),
+            self.rows.len().max(1),
+            self.channel_count()
+        )
+    }
+
+    fn apply_to_view(
+        &self,
+        view: &mut ViewState,
+        schema: &parquet_schema::SchemaSummary,
+    ) -> SessionPresetApplyReport {
+        let valid_channels = schema
+            .channels
+            .iter()
+            .map(|channel| channel.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut missing_channels = BTreeSet::new();
+        let mut restored_channels = 0usize;
+
+        let mut rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(row_index, preset_row)| {
+                let channels = preset_row
+                    .channels
+                    .iter()
+                    .filter_map(|channel| {
+                        if valid_channels.contains(channel.channel_path.as_str()) {
+                            restored_channels += 1;
+                            Some(RowChannel::from(channel))
+                        } else {
+                            missing_channels.insert(channel.channel_path.clone());
+                            None
+                        }
+                    })
+                    .collect();
+
+                PlotRow {
+                    id: row_index as u64,
+                    y_range: preset_row.y_range,
+                    channels,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if rows.is_empty() {
+            rows.push(PlotRow::new(0));
+        }
+
+        view.rows = rows;
+        view.next_row_id = view.rows.len() as u64;
+        view.selected_row_id = self
+            .selected_row_index
+            .and_then(|row_index| view.rows.get(row_index).map(|row| row.id))
+            .or_else(|| view.rows.first().map(|row| row.id));
+        view.x_range = self.x_range;
+        view.hover_x = None;
+        view.large_preview_enabled = self.large_preview_enabled;
+        view.selected_channel = if valid_channels.contains(self.selected_channel.as_str()) {
+            self.selected_channel.clone()
+        } else {
+            view.rows
+                .iter()
+                .flat_map(|row| row.channels.iter())
+                .map(|channel| channel.channel_path.clone())
+                .next()
+                .or_else(|| schema.channels.first().map(|channel| channel.path.clone()))
+                .unwrap_or_default()
+        };
+        view.ensure_row_state();
+
+        SessionPresetApplyReport {
+            restored_rows: view.rows.len(),
+            restored_channels,
+            missing_channels: missing_channels.into_iter().collect(),
+        }
+    }
+}
+
+impl From<&RowChannel> for SessionPresetChannel {
+    fn from(channel: &RowChannel) -> Self {
+        Self {
+            channel_path: channel.channel_path.clone(),
+            color_index: channel.color_index,
+            draw_mode: channel.draw_mode,
+            visible: channel.visible,
+            color_override: channel.color_override,
+            line_width: channel.line_width,
+        }
+    }
+}
+
+impl From<&SessionPresetChannel> for RowChannel {
+    fn from(channel: &SessionPresetChannel) -> Self {
+        Self {
+            channel_path: channel.channel_path.clone(),
+            color_index: channel.color_index,
+            draw_mode: channel.draw_mode,
+            visible: channel.visible,
+            color_override: channel.color_override,
+            line_width: channel
+                .line_width
+                .clamp(MIN_TRACE_LINE_WIDTH, MAX_TRACE_LINE_WIDTH),
+        }
+    }
+}
+
 fn row_missing_channel_counts(
     row: &PlotRow,
     loaded_channels: Option<&ChannelStore>,
@@ -1199,10 +1387,41 @@ impl ChannelStore {
         self.step_fallback_hints.clear();
     }
 
+    fn unload_channel(&mut self, channel_path: &str) -> bool {
+        let removed_raw = self.raw_by_channel.remove(channel_path).is_some();
+        let removed_line_tiles = self.line_tile_cache.remove(channel_path).is_some();
+        let removed_step_edges = self.step_edge_cache.remove(channel_path).is_some();
+        let removed_step_hint = self.step_fallback_hints.remove(channel_path).is_some();
+        if removed_raw || removed_line_tiles || removed_step_edges || removed_step_hint {
+            self.clear_envelope_cache();
+        }
+
+        removed_raw
+    }
+
+    fn clear_draw_caches(&mut self) -> bool {
+        let had_draw_cache = self.has_draw_caches();
+        self.line_tile_cache.clear();
+        self.step_edge_cache.clear();
+        self.step_fallback_hints.clear();
+        self.clear_envelope_cache();
+        self.last_envelope_stats = EnvelopeCacheStats::default();
+        had_draw_cache
+    }
+
     fn clear_envelope_cache(&mut self) {
         self.envelope_cache.clear();
         self.envelope_context = None;
         self.envelope_plan = None;
+    }
+
+    fn has_draw_caches(&self) -> bool {
+        !self.envelope_cache.is_empty()
+            || self.envelope_context.is_some()
+            || self.envelope_plan.is_some()
+            || !self.line_tile_cache.is_empty()
+            || !self.step_edge_cache.is_empty()
+            || !self.step_fallback_hints.is_empty()
     }
 
     fn has_channel(&self, channel_path: &str) -> bool {
@@ -2642,6 +2861,181 @@ impl PanelYApp {
         self.load.progress = None;
     }
 
+    fn save_session_preset(&mut self) {
+        self.view.ensure_row_state();
+        let preset = SessionPreset::capture(&self.dataset.parquet_path, &self.view);
+        let status = format!("Saved session preset: {}", preset.summary());
+        self.session_preset = Some(preset);
+        self.load.error = None;
+        self.load.status = status;
+    }
+
+    fn apply_session_preset(&mut self) {
+        if self.load.is_busy() {
+            self.load.status =
+                "Wait for active load jobs before applying session preset".to_owned();
+            return;
+        }
+
+        let Some(preset) = self.session_preset.clone() else {
+            self.load.status = "No session preset saved".to_owned();
+            return;
+        };
+
+        let mut schema_loaded_for_preset = false;
+        if self.dataset.parquet_path.trim() != preset.parquet_path || self.dataset.schema.is_none()
+        {
+            self.dataset.parquet_path = preset.parquet_path.clone();
+            self.reset_dataset_after_path_change();
+            self.load_schema();
+            schema_loaded_for_preset = true;
+        }
+
+        let Some(schema) = self.dataset.schema.as_ref() else {
+            if self.load.error.is_none() {
+                self.load.status =
+                    "Load schema before applying the saved session preset".to_owned();
+            }
+            return;
+        };
+
+        let report = preset.apply_to_view(&mut self.view, schema);
+        self.dataset.loaded_channels.clear_envelope_cache();
+        remember_recent_parquet_path(
+            &mut self.dataset.recent_parquet_paths,
+            preset.parquet_path.clone(),
+        );
+
+        let schema_note = if schema_loaded_for_preset {
+            "schema loaded, "
+        } else {
+            ""
+        };
+        let missing_note = if report.missing_channels.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", skipped {} missing channel(s)",
+                report.missing_channels.len()
+            )
+        };
+        self.load.status = format!(
+            "Applied session preset (not .pyc.json): {schema_note}{} row(s), {} channel(s){missing_note}",
+            report.restored_rows, report.restored_channels
+        );
+        self.load.error = if report.missing_channels.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Session preset skipped channel(s) not found in the current schema:\n{}",
+                report.missing_channels.join("\n")
+            ))
+        };
+    }
+
+    fn clear_session_preset(&mut self) {
+        self.session_preset = None;
+        self.load.error = None;
+        self.load.status = "Cleared session preset".to_owned();
+    }
+
+    fn add_cached_channel_to_selected_row(&mut self, channel_path: &str) {
+        let Some(channel) = self.dataset.loaded_channels.channel(channel_path) else {
+            self.load.status = format!("Channel is not cached: {channel_path}");
+            return;
+        };
+        let channel_name = channel.channel_name.clone();
+        let Some(target_row_id) = self.view.selected_row_id_or_first() else {
+            self.load.status = "Select a row before adding cached channel".to_owned();
+            return;
+        };
+        let target_row_label = self.view.row_display_name(target_row_id);
+        let (row_added, row_id) = self
+            .view
+            .add_channel_to_row(target_row_id, channel_path)
+            .unwrap_or((false, target_row_id));
+        self.view.selected_channel = channel_path.to_owned();
+        self.dataset.loaded_channels.clear_envelope_cache();
+        self.load.error = None;
+        self.load.status = if row_added {
+            format!("Added cached channel: {channel_name} -> {target_row_label} (id {row_id})")
+        } else {
+            format!(
+                "Cached channel already exists in {target_row_label}: {channel_name} (id {row_id})"
+            )
+        };
+    }
+
+    fn unload_cached_channel(&mut self, channel_path: &str) {
+        if self.load.is_channel_loading(channel_path) {
+            self.load.status = format!("Wait for active load before unloading: {channel_path}");
+            return;
+        }
+
+        let channel_name = self
+            .dataset
+            .loaded_channels
+            .channel(channel_path)
+            .map(|channel| channel.channel_name.clone())
+            .unwrap_or_else(|| channel_path.to_owned());
+        if self.dataset.loaded_channels.unload_channel(channel_path) {
+            self.load.error = None;
+            self.load.status = format!(
+                "Unloaded cached channel data: {channel_name}; row references remain as unloaded"
+            );
+        } else {
+            self.load.status = format!("Channel is not cached: {channel_path}");
+        }
+    }
+
+    fn unload_all_cached_channels(&mut self) {
+        if self.load.is_busy() {
+            self.load.status = "Wait for active load jobs before unloading all channels".to_owned();
+            return;
+        }
+
+        let channel_count = self.dataset.loaded_channels.raw_by_channel.len();
+        let raw_memory = self.dataset.loaded_channels.raw_memory_bytes();
+        self.dataset.loaded_channels.clear_all();
+        self.load.error = None;
+        self.load.status = format!(
+            "Unloaded all cached channel data: {channel_count} channel(s), {:.1} MiB; row references remain as unloaded",
+            bytes_to_mib(raw_memory)
+        );
+    }
+
+    fn clear_draw_caches(&mut self) {
+        let envelope_count = self.dataset.loaded_channels.envelope_cache.len();
+        let line_tile_count = self.dataset.loaded_channels.line_tile_cache.len();
+        let step_edge_count = self.dataset.loaded_channels.step_edge_cache.len();
+        let hint_count = self.dataset.loaded_channels.step_fallback_hints.len();
+        if self.dataset.loaded_channels.clear_draw_caches() {
+            self.load.error = None;
+            self.load.status = format!(
+                "Cleared draw caches: {envelope_count} envelope(s), {line_tile_count} line tile cache(s), {step_edge_count} step edge cache(s), {hint_count} hint(s)"
+            );
+        } else {
+            self.load.status = "No draw caches to clear".to_owned();
+        }
+    }
+
+    fn handle_cache_action(&mut self, action: CacheControlAction) {
+        match action {
+            CacheControlAction::AddToSelectedRow(channel_path) => {
+                self.add_cached_channel_to_selected_row(&channel_path);
+            }
+            CacheControlAction::UnloadChannel(channel_path) => {
+                self.unload_cached_channel(&channel_path);
+            }
+            CacheControlAction::UnloadAllChannels => {
+                self.unload_all_cached_channels();
+            }
+            CacheControlAction::ClearDrawCaches => {
+                self.clear_draw_caches();
+            }
+        }
+    }
+
     fn browse_parquet_path(&mut self) {
         if self.load.is_busy() {
             self.load.status = "Wait for active load jobs before browsing".to_owned();
@@ -3404,11 +3798,12 @@ impl PanelYApp {
         );
         let current_range = next_range;
         let mut changed = false;
-        let (pointer_pos, zoom_delta, scroll_delta) = ui.input(|input| {
+        let (pointer_pos, zoom_delta, scroll_delta, zoom_modifier_pressed) = ui.input(|input| {
             (
                 input.pointer.latest_pos(),
                 input.zoom_delta(),
                 input.smooth_scroll_delta(),
+                input.modifiers.matches_any(egui::Modifiers::COMMAND),
             )
         });
         let Some((pointer_pos, plot_rect)) = pointer_pos.and_then(|pointer_pos| {
@@ -3445,15 +3840,17 @@ impl PanelYApp {
                 let shift = -f64::from(scroll_delta.x) / f64::from(plot_rect.width()) * span;
                 next_range = pan_view_range(next_range, full_range, shift, min_span);
                 changed = true;
+                ui.input_mut(|input| {
+                    input.smooth_scroll_delta.x = 0.0;
+                });
             }
 
-            let zoom_factor = if zoom_delta != 1.0 {
-                1.0 / f64::from(zoom_delta)
-            } else if scroll_delta.y != 0.0 {
-                (-f64::from(scroll_delta.y) * WHEEL_ZOOM_SENSITIVITY).exp()
-            } else {
-                1.0
-            };
+            let zoom_factor = x_zoom_factor(zoom_delta, scroll_delta.y, zoom_modifier_pressed);
+            if zoom_delta == 1.0 && zoom_modifier_pressed && scroll_delta.y != 0.0 {
+                ui.input_mut(|input| {
+                    input.smooth_scroll_delta.y = 0.0;
+                });
+            }
 
             if zoom_factor.is_finite() && (zoom_factor - 1.0).abs() > f64::EPSILON {
                 let anchor_ratio = ((pointer_pos.x - plot_rect.left()) / plot_rect.width()) as f64;
@@ -3642,6 +4039,59 @@ impl eframe::App for PanelYApp {
                             self.load_selected_channel(ui.ctx());
                         }
 
+                        if self.dataset.schema.is_some() || self.session_preset.is_some() {
+                            ui.add_space(16.0);
+                            ui.heading("Session preset");
+                            ui.label("Rust session only; not .pyc.json.");
+
+                            let mut save_preset = false;
+                            let mut apply_preset = false;
+                            let mut clear_preset = false;
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        !load_active && self.dataset.schema.is_some(),
+                                        egui::Button::new("Save"),
+                                    )
+                                    .clicked()
+                                {
+                                    save_preset = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !load_active && self.session_preset.is_some(),
+                                        egui::Button::new("Apply"),
+                                    )
+                                    .clicked()
+                                {
+                                    apply_preset = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        self.session_preset.is_some(),
+                                        egui::Button::new("Clear"),
+                                    )
+                                    .clicked()
+                                {
+                                    clear_preset = true;
+                                }
+                            });
+
+                            if let Some(preset) = &self.session_preset {
+                                ui.monospace(preset.summary());
+                            } else {
+                                ui.label("No preset saved");
+                            }
+
+                            if save_preset {
+                                self.save_session_preset();
+                            } else if apply_preset {
+                                self.apply_session_preset();
+                            } else if clear_preset {
+                                self.clear_session_preset();
+                            }
+                        }
+
                         if self.dataset.shared_time.is_some() || self.view.has_visible_channels() {
                             ui.add_space(16.0);
                             ui.heading("View");
@@ -3658,7 +4108,16 @@ impl eframe::App for PanelYApp {
                                 );
                         }
 
-                        draw_channel_cache_controls(ui, &self.dataset);
+                        let cache_response = draw_channel_cache_controls(
+                            ui,
+                            &self.dataset,
+                            &self.view,
+                            &loading_channel_paths,
+                            load_active,
+                        );
+                        if let Some(action) = cache_response.action {
+                            self.handle_cache_action(action);
+                        }
                         if draw_row_controls(
                             ui,
                             &mut self.view,
@@ -3678,7 +4137,10 @@ impl eframe::App for PanelYApp {
                 .scroll_bar_visibility(
                     egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
                 )
-                .scroll_source(egui::containers::scroll_area::ScrollSource::SCROLL_BAR)
+                .scroll_source(
+                    egui::containers::scroll_area::ScrollSource::SCROLL_BAR
+                        | egui::containers::scroll_area::ScrollSource::MOUSE_WHEEL,
+                )
                 .show(ui, |ui| {
                     let row_count = self.view.rows.len().max(1);
                     let content_height = waveform_content_height(viewport_size.y, row_count);
@@ -4102,9 +4564,16 @@ fn draw_target_row_selector(ui: &mut egui::Ui, view: &mut ViewState) {
     view.selected_row_id = selected_row_id;
 }
 
-fn draw_channel_cache_controls(ui: &mut egui::Ui, dataset: &DatasetState) {
+fn draw_channel_cache_controls(
+    ui: &mut egui::Ui,
+    dataset: &DatasetState,
+    view: &ViewState,
+    loading_channel_paths: &BTreeSet<String>,
+    load_active: bool,
+) -> CacheControlsResponse {
     ui.add_space(16.0);
     ui.heading("Cache");
+    let mut response = CacheControlsResponse::default();
 
     if let Some(time) = &dataset.shared_time {
         let file_name = time
@@ -4131,6 +4600,7 @@ fn draw_channel_cache_controls(ui: &mut egui::Ui, dataset: &DatasetState) {
         dataset.loaded_channels.raw_by_channel.len(),
         bytes_to_mib(dataset.loaded_channels.raw_memory_bytes())
     ));
+
     if !dataset.loaded_channels.line_tile_cache.is_empty() {
         ui.label(format!(
             "Line tiles: {} cached ({:.1} MiB, build {:.3}s)",
@@ -4154,20 +4624,86 @@ fn draw_channel_cache_controls(ui: &mut egui::Ui, dataset: &DatasetState) {
             dataset.loaded_channels.step_edge_build_seconds()
         ));
     }
-    for channel in dataset.loaded_channels.raw_by_channel.values() {
-        let file_name = channel
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("-");
-        ui.monospace(format!(
-            "  #{} {} ({} samples, file {})",
-            channel.projected_column_index,
-            channel.channel_name,
-            channel.sample_count(),
-            file_name
-        ));
+
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(
+                !load_active && !dataset.loaded_channels.raw_by_channel.is_empty(),
+                egui::Button::new("Unload all channels"),
+            )
+            .on_hover_text("Drop cached channel data while keeping rows and time data")
+            .clicked()
+        {
+            response.action = Some(CacheControlAction::UnloadAllChannels);
+        }
+        if ui
+            .add_enabled(
+                dataset.loaded_channels.has_draw_caches(),
+                egui::Button::new("Clear draw caches"),
+            )
+            .on_hover_text("Drop envelope, line tile, and step edge caches while keeping raw data")
+            .clicked()
+        {
+            response.action = Some(CacheControlAction::ClearDrawCaches);
+        }
+    });
+
+    if dataset.loaded_channels.raw_by_channel.is_empty() {
+        ui.label("No cached channels");
+        return response;
     }
+
+    let target_row_label = view.selected_row_display_name();
+    egui::ScrollArea::vertical()
+        .id_salt("loaded_channel_cache_list")
+        .max_height(220.0)
+        .show(ui, |ui| {
+            for channel in dataset.loaded_channels.raw_by_channel.values() {
+                let file_name = channel
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("-");
+                let channel_loading = loading_channel_paths.contains(&channel.channel_path);
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(format!(
+                        "#{} {}",
+                        channel.projected_column_index, channel.channel_name
+                    ));
+                    ui.label(format!(
+                        "{} samples, {:.1} MiB, file {}",
+                        channel.sample_count(),
+                        bytes_to_mib(channel.memory_bytes()),
+                        file_name
+                    ));
+                    if ui
+                        .small_button(format!("Add to {target_row_label}"))
+                        .on_hover_text("Reuse cached data in the selected row")
+                        .clicked()
+                    {
+                        response.action = Some(CacheControlAction::AddToSelectedRow(
+                            channel.channel_path.clone(),
+                        ));
+                    }
+                    if ui
+                        .add_enabled(
+                            !channel_loading,
+                            egui::Button::new("Unload")
+                                .small()
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        )
+                        .on_hover_text("Drop this channel's cached data; row references stay")
+                        .clicked()
+                    {
+                        response.action = Some(CacheControlAction::UnloadChannel(
+                            channel.channel_path.clone(),
+                        ));
+                    }
+                });
+            }
+        });
+
+    response
 }
 
 fn draw_row_controls(
@@ -5530,6 +6066,16 @@ fn pan_view_range(
     range_with_start(start + shift, span, full_range)
 }
 
+fn x_zoom_factor(zoom_delta: f32, scroll_delta_y: f32, zoom_modifier_pressed: bool) -> f64 {
+    if zoom_delta != 1.0 {
+        1.0 / f64::from(zoom_delta)
+    } else if zoom_modifier_pressed && scroll_delta_y != 0.0 {
+        (-f64::from(scroll_delta_y) * WHEEL_ZOOM_SENSITIVITY).exp()
+    } else {
+        1.0
+    }
+}
+
 fn zoom_view_range(
     range: (f64, f64),
     full_range: (f64, f64),
@@ -5646,6 +6192,69 @@ mod app_tests {
         }
     }
 
+    fn test_schema(channels: &[&str]) -> parquet_schema::SchemaSummary {
+        let channel_infos = channels
+            .iter()
+            .enumerate()
+            .map(|(index, name)| test_channel_info(index + 1, name))
+            .collect::<Vec<_>>();
+        let time_column = parquet_schema::ColumnInfo {
+            index: 0,
+            name: "time".to_owned(),
+            path: "time".to_owned(),
+            physical_type: "DOUBLE".to_owned(),
+            logical_type: None,
+            converted_type: "NONE".to_owned(),
+            is_numeric: true,
+            role: parquet_schema::ColumnRole::Time,
+        };
+        let mut columns = vec![time_column.clone()];
+        columns.extend(channel_infos.clone());
+
+        parquet_schema::SchemaSummary {
+            path: PathBuf::from("/tmp/test.parquet"),
+            row_count: 4,
+            row_group_count: 1,
+            column_count: columns.len(),
+            created_by: None,
+            time_column: Some(time_column),
+            channels: channel_infos,
+            columns,
+        }
+    }
+
+    fn test_channel_data(channel_path: &str) -> parquet_waveform::ChannelData {
+        parquet_waveform::ChannelData {
+            path: PathBuf::new(),
+            channel_name: channel_path.to_owned(),
+            channel_path: channel_path.to_owned(),
+            values: vec![0.0, 1.0, 0.0],
+            projected_column_index: 1,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn empty_line_tile_cache() -> parquet_waveform::LineTileCache {
+        parquet_waveform::LineTileCache {
+            tile_size: 2,
+            sample_count: 3,
+            tiles: Vec::new(),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn empty_min_max_envelope() -> parquet_waveform::MinMaxEnvelope {
+        parquet_waveform::MinMaxEnvelope {
+            buckets: Vec::new(),
+            source_sample_count: 0,
+            requested_bucket_count: 10,
+            bucket_size: 0,
+            time_range: None,
+            value_range: None,
+            elapsed: Duration::ZERO,
+        }
+    }
+
     #[test]
     fn adds_channels_to_the_selected_row() {
         let mut view = ViewState::default();
@@ -5704,6 +6313,78 @@ mod app_tests {
         view.rows[0].channels[0].visible = false;
 
         assert!(!view.has_visible_channels());
+    }
+
+    #[test]
+    fn session_preset_restores_lightweight_view_state() {
+        let schema = test_schema(&["sine_50Hz", "pwm_1kHz"]);
+        let mut view = ViewState {
+            selected_channel: "pwm_1kHz".to_owned(),
+            x_range: Some((1.25, 2.5)),
+            large_preview_enabled: true,
+            ..ViewState::default()
+        };
+        let (added_first, _) = view.add_channel_to_selected_row("sine_50Hz");
+        assert!(added_first);
+        view.rows[0].y_range = RowYRange {
+            mode: YRangeMode::Manual,
+            min: -2.0,
+            max: 3.0,
+            last_auto: Some((-1.0, 1.0)),
+        };
+        view.rows[0].channels[0].visible = false;
+        view.rows[0].channels[0].draw_mode = DrawMode::Step;
+        view.rows[0].channels[0].color_override = Some(egui::Color32::from_rgb(10, 20, 30));
+        view.rows[0].channels[0].line_width = 2.5;
+        let second_row_id = view.add_row();
+        let (added_second, _) = view.add_channel_to_selected_row("pwm_1kHz");
+        assert!(added_second);
+
+        let preset = SessionPreset::capture("/tmp/test.parquet", &view);
+        let mut restored = ViewState::default();
+        let report = preset.apply_to_view(&mut restored, &schema);
+
+        assert_eq!(report.restored_rows, 2);
+        assert_eq!(report.restored_channels, 2);
+        assert!(report.missing_channels.is_empty());
+        assert_eq!(restored.x_range, Some((1.25, 2.5)));
+        assert!(restored.large_preview_enabled);
+        assert_eq!(restored.selected_channel, "pwm_1kHz");
+        assert_eq!(restored.selected_row_id, Some(second_row_id));
+        assert_eq!(restored.rows[0].y_range.mode, YRangeMode::Manual);
+        assert_eq!(
+            (restored.rows[0].y_range.min, restored.rows[0].y_range.max),
+            (-2.0, 3.0)
+        );
+        assert!(!restored.rows[0].channels[0].visible);
+        assert_eq!(restored.rows[0].channels[0].draw_mode, DrawMode::Step);
+        assert_eq!(
+            restored.rows[0].channels[0].color_override,
+            Some(egui::Color32::from_rgb(10, 20, 30))
+        );
+        assert_eq!(restored.rows[0].channels[0].line_width, 2.5);
+    }
+
+    #[test]
+    fn session_preset_skips_channels_missing_from_schema() {
+        let original_schema = test_schema(&["sine_50Hz", "missing_later"]);
+        let target_schema = test_schema(&["sine_50Hz"]);
+        let mut view = ViewState::default();
+        let (added_first, _) = view.add_channel_to_selected_row("sine_50Hz");
+        assert!(added_first);
+        let (added_second, _) = view.add_channel_to_selected_row("missing_later");
+        assert!(added_second);
+
+        let preset = SessionPreset::capture("/tmp/test.parquet", &view);
+        let mut restored = ViewState::default();
+        let report = preset.apply_to_view(&mut restored, &target_schema);
+
+        assert_eq!(original_schema.channels.len(), 2);
+        assert_eq!(report.restored_rows, 1);
+        assert_eq!(report.restored_channels, 1);
+        assert_eq!(report.missing_channels, vec!["missing_later".to_owned()]);
+        assert_eq!(restored.rows[0].channels.len(), 1);
+        assert_eq!(restored.rows[0].channels[0].channel_path, "sine_50Hz");
     }
 
     #[test]
@@ -6047,14 +6728,8 @@ mod app_tests {
     #[test]
     fn channel_store_reuses_step_edge_cache() {
         let time = [0.0, 1.0, 2.0, 3.0, 4.0];
-        let channel = parquet_waveform::ChannelData {
-            path: std::path::PathBuf::new(),
-            channel_name: "gate_pwm".to_owned(),
-            channel_path: "gate_pwm".to_owned(),
-            values: vec![0.0, 1.0, 0.0, 1.0, 0.0],
-            projected_column_index: 1,
-            elapsed: Duration::ZERO,
-        };
+        let mut channel = test_channel_data("gate_pwm");
+        channel.values = vec![0.0, 1.0, 0.0, 1.0, 0.0];
         let mut store = ChannelStore::default();
         store.insert_channel(channel);
 
@@ -6068,6 +6743,102 @@ mod app_tests {
         assert_eq!(first_stats.step_edge_hits, 0);
         assert_eq!(second_stats.step_edge_builds, 1);
         assert_eq!(second_stats.step_edge_hits, 1);
+    }
+
+    #[test]
+    fn channel_store_unloads_one_channel_and_its_draw_caches() {
+        let mut store = ChannelStore::default();
+        store.insert_channel(test_channel_data("gate_pwm"));
+        store.insert_channel(test_channel_data("sine_50Hz"));
+        store
+            .line_tile_cache
+            .insert("gate_pwm".to_owned(), empty_line_tile_cache());
+        store.step_edge_cache.insert(
+            "gate_pwm".to_owned(),
+            StepEdgeCache {
+                sample_count: 3,
+                edges: Vec::new(),
+                elapsed: Duration::ZERO,
+            },
+        );
+        store.step_fallback_hints.insert(
+            "gate_pwm".to_owned(),
+            StepFallbackHint {
+                min_span: 1.0,
+                min_source_sample_count: 3,
+            },
+        );
+        store.envelope_cache.insert(
+            EnvelopeKey::new("gate_pwm", (0.0, 1.0), 10),
+            empty_min_max_envelope(),
+        );
+
+        assert!(store.unload_channel("gate_pwm"));
+
+        assert!(!store.has_channel("gate_pwm"));
+        assert!(store.has_channel("sine_50Hz"));
+        assert!(store.line_tile_cache.is_empty());
+        assert!(store.step_edge_cache.is_empty());
+        assert!(store.step_fallback_hints.is_empty());
+        assert!(store.envelope_cache.is_empty());
+    }
+
+    #[test]
+    fn channel_store_clear_draw_caches_keeps_raw_channel_data() {
+        let mut store = ChannelStore::default();
+        store.insert_channel(test_channel_data("gate_pwm"));
+        store
+            .line_tile_cache
+            .insert("gate_pwm".to_owned(), empty_line_tile_cache());
+        store.step_edge_cache.insert(
+            "gate_pwm".to_owned(),
+            StepEdgeCache {
+                sample_count: 3,
+                edges: Vec::new(),
+                elapsed: Duration::ZERO,
+            },
+        );
+        store.step_fallback_hints.insert(
+            "gate_pwm".to_owned(),
+            StepFallbackHint {
+                min_span: 1.0,
+                min_source_sample_count: 3,
+            },
+        );
+        store.envelope_cache.insert(
+            EnvelopeKey::new("gate_pwm", (0.0, 1.0), 10),
+            empty_min_max_envelope(),
+        );
+
+        assert!(store.clear_draw_caches());
+
+        assert!(store.has_channel("gate_pwm"));
+        assert!(store.line_tile_cache.is_empty());
+        assert!(store.step_edge_cache.is_empty());
+        assert!(store.step_fallback_hints.is_empty());
+        assert!(store.envelope_cache.is_empty());
+        assert!(!store.clear_draw_caches());
+    }
+
+    #[test]
+    fn unloading_cached_channel_keeps_row_reference() {
+        let mut app = PanelYApp::default();
+        app.dataset
+            .loaded_channels
+            .insert_channel(test_channel_data("gate_pwm"));
+        let (added, _) = app.view.add_channel_to_selected_row("gate_pwm");
+        assert!(added);
+
+        app.unload_cached_channel("gate_pwm");
+
+        assert!(!app.dataset.loaded_channels.has_channel("gate_pwm"));
+        assert!(
+            app.view.rows[0]
+                .channels
+                .iter()
+                .any(|channel| channel.channel_path == "gate_pwm")
+        );
+        assert!(app.load.status.contains("row references remain"));
     }
 
     #[test]
@@ -6273,6 +7044,20 @@ mod app_tests {
         assert_eq!(format_frequency_hz(500.0), "500.000 Hz");
         assert_eq!(format_frequency_hz(12_500.0), "12.500 kHz");
         assert_eq!(format_frequency_hz(2_500_000.0), "2.500 MHz");
+    }
+
+    #[test]
+    fn x_zoom_factor_ignores_plain_vertical_wheel() {
+        assert_eq!(x_zoom_factor(1.0, 120.0, false), 1.0);
+    }
+
+    #[test]
+    fn x_zoom_factor_uses_modifier_wheel_or_pinch() {
+        let modifier_zoom = x_zoom_factor(1.0, 120.0, true);
+        let pinch_zoom = x_zoom_factor(2.0, 0.0, false);
+
+        assert!(modifier_zoom < 1.0);
+        assert_eq!(pinch_zoom, 0.5);
     }
 
     #[test]
