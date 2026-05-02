@@ -46,6 +46,12 @@ To benchmark Phase 2 shared-time multi-channel cache memory:
 cargo run --release -- --bench-multi-channel ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet
 ```
 
+To benchmark Phase 2 multi-row visible trace generation and hover lookup:
+
+```bash
+cargo run --release -- --bench-phase2 ../proto_3_1b/data/panely_large_10s_1mhz_9ch.parquet
+```
+
 ## Reference Data
 
 Use the Phase 0 datasets under:
@@ -86,6 +92,28 @@ pwm_1kHz_delay_1sample
 pwm_1kHz_advance_1sample
 ```
 
+For ripple envelope checks, generate:
+
+```bash
+../.venv/bin/python ../proto_3_1b/generate_ripple_validation_data.py --force
+```
+
+Then load or benchmark:
+
+```text
+../proto_3_1b/data/ripple_validation_2_4m.parquet
+```
+
+Channels:
+
+```text
+ripple_low_amp_80kHz
+ripple_am_60kHz
+ripple_noise_70kHz
+ripple_bucket_near_2048samples
+ripple_on_sine_80kHz
+```
+
 ## Current State
 
 - `eframe` app shell is in place.
@@ -97,7 +125,7 @@ pwm_1kHz_advance_1sample
 - Full-range min/max envelope drawing is in place for the selected channel.
 - X-axis pan/zoom is in place for the selected channel.
 - The visible X range is re-extracted into a min/max envelope sized to the current plot width.
-- Step mode uses exact raw samples at low density, exact change points when sample density is high but edge count is still bounded, and min/max envelope only when there are too many changes to draw directly.
+- Step mode uses exact raw samples at low density, cached exact change points when sample density is high but edge count is still bounded, and a Step-specific dense min/max envelope only when there are too many changes to draw directly.
 - Row channels can be hidden and styled with per-row color overrides and line widths.
 - Hover X is synchronized across rows, with a vertical hover line and visible-channel value readout.
 - Rows support auto or manual Y ranges with per-row min/max controls seeded from the latest auto range.

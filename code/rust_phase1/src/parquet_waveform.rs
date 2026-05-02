@@ -104,9 +104,50 @@ impl MinMaxEnvelope {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EnvelopeBucket {
+    pub start_index: usize,
+    pub end_index: usize,
     pub time: f64,
     pub min: f32,
     pub max: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MinMaxEnvelopePlan {
+    pub bucket_spans: Vec<EnvelopeBucketSpan>,
+    pub source_sample_count: usize,
+    pub requested_bucket_count: usize,
+    pub bucket_size: usize,
+    pub time_range: Option<(f64, f64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnvelopeBucketSpan {
+    pub start_index: usize,
+    pub end_index: usize,
+    pub time: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LineTileCache {
+    pub tile_size: usize,
+    pub sample_count: usize,
+    pub tiles: Vec<LineMinMaxTile>,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineMinMaxTile {
+    pub start_index: usize,
+    pub end_index: usize,
+    pub min: f32,
+    pub max: f32,
+    pub has_finite: bool,
+}
+
+impl LineTileCache {
+    pub fn memory_bytes(&self) -> usize {
+        self.tiles.len() * std::mem::size_of::<LineMinMaxTile>()
+    }
 }
 
 impl WaveformData {
@@ -190,22 +231,189 @@ pub fn min_max_envelope_for_range(
     time_range: (f64, f64),
     requested_bucket_count: usize,
 ) -> MinMaxEnvelope {
+    let plan =
+        min_max_envelope_plan_for_range(time, values.len(), time_range, requested_bucket_count);
+    min_max_envelope_for_plan(values, &plan)
+}
+
+pub fn min_max_envelope_plan_for_range(
+    time: &[f64],
+    value_count: usize,
+    time_range: (f64, f64),
+    requested_bucket_count: usize,
+) -> MinMaxEnvelopePlan {
     let Some((range_start, range_end)) = normalized_time_range(time_range) else {
-        return empty_envelope(requested_bucket_count, None, Instant::now());
+        return empty_envelope_plan(requested_bucket_count, None);
     };
 
-    let sample_count = time.len().min(values.len());
-    let start = time.partition_point(|time| *time < range_start);
-    let end = time.partition_point(|time| *time <= range_end);
+    let sample_count = time.len().min(value_count);
+    let start = time[..sample_count].partition_point(|time| *time < range_start);
+    let end = time[..sample_count].partition_point(|time| *time <= range_end);
 
-    min_max_envelope_for_indices(
+    min_max_envelope_plan_for_indices(
         time,
-        values,
+        value_count,
         start.min(sample_count),
         end.min(sample_count),
         requested_bucket_count,
         Some((range_start, range_end)),
     )
+}
+
+pub fn min_max_envelope_for_plan(values: &[f32], plan: &MinMaxEnvelopePlan) -> MinMaxEnvelope {
+    let started = Instant::now();
+    let mut buckets = Vec::with_capacity(plan.bucket_spans.len());
+    let mut value_range = None;
+
+    for span in &plan.bucket_spans {
+        if let Some(bucket) = envelope_bucket_for_span(values, *span) {
+            value_range = update_range(value_range, f64::from(bucket.min));
+            value_range = update_range(value_range, f64::from(bucket.max));
+            buckets.push(bucket);
+        }
+    }
+
+    MinMaxEnvelope {
+        buckets,
+        source_sample_count: plan.source_sample_count,
+        requested_bucket_count: plan.requested_bucket_count,
+        bucket_size: plan.bucket_size,
+        time_range: plan.time_range,
+        value_range,
+        elapsed: started.elapsed(),
+    }
+}
+
+pub fn build_line_tile_cache(values: &[f32], tile_size: usize) -> LineTileCache {
+    let started = Instant::now();
+    let tile_size = tile_size.max(1);
+    let mut tiles = Vec::with_capacity(values.len().div_ceil(tile_size));
+    let mut start = 0usize;
+
+    while start < values.len() {
+        let end = (start + tile_size).min(values.len());
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        for value in &values[start..end] {
+            if value.is_finite() {
+                min = min.min(*value);
+                max = max.max(*value);
+            }
+        }
+        let has_finite = min.is_finite() && max.is_finite();
+        tiles.push(LineMinMaxTile {
+            start_index: start,
+            end_index: end,
+            min,
+            max,
+            has_finite,
+        });
+        start = end;
+    }
+
+    LineTileCache {
+        tile_size,
+        sample_count: values.len(),
+        tiles,
+        elapsed: started.elapsed(),
+    }
+}
+
+pub fn min_max_envelope_for_plan_with_tiles(
+    time: &[f64],
+    values: &[f32],
+    plan: &MinMaxEnvelopePlan,
+    tile_cache: &LineTileCache,
+) -> MinMaxEnvelope {
+    let started = Instant::now();
+    let sample_count = time.len().min(values.len()).min(tile_cache.sample_count);
+    let values = &values[..sample_count];
+    let mut buckets = Vec::with_capacity(plan.bucket_spans.len());
+    let mut value_range = None;
+
+    for span in &plan.bucket_spans {
+        if let Some(bucket) = envelope_bucket_for_span_with_tiles(values, *span, tile_cache) {
+            value_range = update_range(value_range, f64::from(bucket.min));
+            value_range = update_range(value_range, f64::from(bucket.max));
+            buckets.push(bucket);
+        }
+    }
+
+    MinMaxEnvelope {
+        buckets,
+        source_sample_count: plan.source_sample_count.min(sample_count),
+        requested_bucket_count: plan.requested_bucket_count,
+        bucket_size: plan.bucket_size,
+        time_range: plan.time_range,
+        value_range,
+        elapsed: started.elapsed(),
+    }
+}
+
+pub fn clip_min_max_envelope_to_range(
+    cached: &MinMaxEnvelope,
+    time: &[f64],
+    values: &[f32],
+    time_range: (f64, f64),
+    requested_bucket_count: usize,
+) -> MinMaxEnvelope {
+    let started = Instant::now();
+    let Some((range_start, range_end)) = normalized_time_range(time_range) else {
+        return empty_envelope(requested_bucket_count, None, started);
+    };
+
+    let sample_count = time.len().min(values.len());
+    let time = &time[..sample_count];
+    let values = &values[..sample_count];
+    let view_start = time.partition_point(|time| *time < range_start);
+    let view_end = time.partition_point(|time| *time <= range_end);
+    if view_start >= view_end {
+        return empty_envelope(
+            requested_bucket_count,
+            Some((range_start, range_end)),
+            started,
+        );
+    }
+
+    let mut buckets = Vec::new();
+    let mut value_range = None;
+    for cached_bucket in &cached.buckets {
+        if cached_bucket.end_index <= view_start || cached_bucket.start_index >= view_end {
+            continue;
+        }
+
+        let clipped_start = cached_bucket.start_index.max(view_start);
+        let clipped_end = cached_bucket.end_index.min(view_end);
+        let bucket = if clipped_start == cached_bucket.start_index
+            && clipped_end == cached_bucket.end_index
+        {
+            *cached_bucket
+        } else {
+            let span = EnvelopeBucketSpan {
+                start_index: clipped_start,
+                end_index: clipped_end,
+                time: bucket_mid_time(time, clipped_start, clipped_end),
+            };
+            match envelope_bucket_for_span(values, span) {
+                Some(bucket) => bucket,
+                None => continue,
+            }
+        };
+
+        value_range = update_range(value_range, f64::from(bucket.min));
+        value_range = update_range(value_range, f64::from(bucket.max));
+        buckets.push(bucket);
+    }
+
+    MinMaxEnvelope {
+        buckets,
+        source_sample_count: view_end - view_start,
+        requested_bucket_count,
+        bucket_size: cached.bucket_size,
+        time_range: Some((range_start, range_end)),
+        value_range,
+        elapsed: started.elapsed(),
+    }
 }
 
 fn min_max_envelope_for_indices(
@@ -216,8 +424,26 @@ fn min_max_envelope_for_indices(
     requested_bucket_count: usize,
     time_range: Option<(f64, f64)>,
 ) -> MinMaxEnvelope {
-    let started = Instant::now();
-    let sample_count = time.len().min(values.len());
+    let plan = min_max_envelope_plan_for_indices(
+        time,
+        values.len(),
+        start_index,
+        end_index,
+        requested_bucket_count,
+        time_range,
+    );
+    min_max_envelope_for_plan(values, &plan)
+}
+
+fn min_max_envelope_plan_for_indices(
+    time: &[f64],
+    value_count: usize,
+    start_index: usize,
+    end_index: usize,
+    requested_bucket_count: usize,
+    time_range: Option<(f64, f64)>,
+) -> MinMaxEnvelopePlan {
+    let sample_count = time.len().min(value_count);
     let start_index = start_index.min(sample_count);
     let end_index = end_index.min(sample_count).max(start_index);
     let source_sample_count = end_index - start_index;
@@ -225,44 +451,41 @@ fn min_max_envelope_for_indices(
         .max(1)
         .min(source_sample_count.max(1));
     let bucket_size = source_sample_count.div_ceil(target_bucket_count).max(1);
-    let mut buckets = Vec::with_capacity(target_bucket_count);
-    let mut value_range = None;
+    let mut bucket_spans = Vec::with_capacity(target_bucket_count);
 
     let mut start = start_index;
     while start < end_index {
         let end = (start + bucket_size).min(end_index);
-        if let Some(bucket) = envelope_bucket(time, values, start, end) {
-            value_range = update_range(value_range, f64::from(bucket.min));
-            value_range = update_range(value_range, f64::from(bucket.max));
-            buckets.push(bucket);
-        }
+        bucket_spans.push(EnvelopeBucketSpan {
+            start_index: start,
+            end_index: end,
+            time: bucket_mid_time(time, start, end),
+        });
         start = end;
     }
 
-    MinMaxEnvelope {
-        buckets,
+    MinMaxEnvelopePlan {
+        bucket_spans,
         source_sample_count,
         requested_bucket_count,
         bucket_size,
         time_range,
-        value_range,
-        elapsed: started.elapsed(),
     }
 }
 
-fn envelope_bucket(
-    time_values: &[f64],
+fn envelope_bucket_for_span(
     channel_values: &[f32],
-    start: usize,
-    end: usize,
+    span: EnvelopeBucketSpan,
 ) -> Option<EnvelopeBucket> {
-    if start >= end {
+    let start_index = span.start_index.min(channel_values.len());
+    let end_index = span.end_index.min(channel_values.len()).max(start_index);
+    if start_index >= end_index {
         return None;
     }
 
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
-    for value in &channel_values[start..end] {
+    for value in &channel_values[start_index..end_index] {
         if value.is_finite() {
             min = min.min(*value);
             max = max.max(*value);
@@ -273,14 +496,97 @@ fn envelope_bucket(
         return None;
     }
 
-    let time_start = *time_values.get(start)?;
-    let time_end = *time_values.get(end - 1)?;
-    let time = (time_start + time_end) * 0.5;
-    if !time.is_finite() {
+    if !span.time.is_finite() {
         return None;
     }
 
-    Some(EnvelopeBucket { time, min, max })
+    Some(EnvelopeBucket {
+        start_index,
+        end_index,
+        time: span.time,
+        min,
+        max,
+    })
+}
+
+fn envelope_bucket_for_span_with_tiles(
+    channel_values: &[f32],
+    span: EnvelopeBucketSpan,
+    tile_cache: &LineTileCache,
+) -> Option<EnvelopeBucket> {
+    let start_index = span.start_index.min(channel_values.len());
+    let end_index = span.end_index.min(channel_values.len()).max(start_index);
+    if start_index >= end_index || tile_cache.tile_size == 0 {
+        return None;
+    }
+
+    let tile_size = tile_cache.tile_size;
+    let first_full_tile = start_index.div_ceil(tile_size);
+    let last_full_tile_exclusive = end_index / tile_size;
+    let raw_prefix_end = (first_full_tile * tile_size).min(end_index);
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+
+    update_f32_range_from_raw(
+        &mut min,
+        &mut max,
+        &channel_values[start_index..raw_prefix_end],
+    );
+
+    for tile_index in first_full_tile..last_full_tile_exclusive {
+        if let Some(tile) = tile_cache.tiles.get(tile_index)
+            && tile.has_finite
+            && tile.start_index >= start_index
+            && tile.end_index <= end_index
+        {
+            min = min.min(tile.min);
+            max = max.max(tile.max);
+        }
+    }
+
+    let raw_suffix_start = (last_full_tile_exclusive * tile_size)
+        .max(raw_prefix_end)
+        .min(end_index);
+    update_f32_range_from_raw(
+        &mut min,
+        &mut max,
+        &channel_values[raw_suffix_start..end_index],
+    );
+
+    if !min.is_finite() || !max.is_finite() || !span.time.is_finite() {
+        return None;
+    }
+
+    Some(EnvelopeBucket {
+        start_index,
+        end_index,
+        time: span.time,
+        min,
+        max,
+    })
+}
+
+fn update_f32_range_from_raw(min: &mut f32, max: &mut f32, values: &[f32]) {
+    for value in values {
+        if value.is_finite() {
+            *min = min.min(*value);
+            *max = max.max(*value);
+        }
+    }
+}
+
+fn bucket_mid_time(time_values: &[f64], start: usize, end: usize) -> f64 {
+    if start >= end {
+        return f64::NAN;
+    }
+
+    let Some(time_start) = time_values.get(start).copied() else {
+        return f64::NAN;
+    };
+    let Some(time_end) = time_values.get(end - 1).copied() else {
+        return f64::NAN;
+    };
+    (time_start + time_end) * 0.5
 }
 
 pub fn time_range(time: &[f64]) -> Option<(f64, f64)> {
@@ -312,6 +618,19 @@ fn empty_envelope(
         time_range,
         value_range: None,
         elapsed: started.elapsed(),
+    }
+}
+
+fn empty_envelope_plan(
+    requested_bucket_count: usize,
+    time_range: Option<(f64, f64)>,
+) -> MinMaxEnvelopePlan {
+    MinMaxEnvelopePlan {
+        bucket_spans: Vec::new(),
+        source_sample_count: 0,
+        requested_bucket_count,
+        bucket_size: 1,
+        time_range,
     }
 }
 
@@ -665,16 +984,22 @@ mod tests {
             envelope.buckets,
             vec![
                 EnvelopeBucket {
+                    start_index: 0,
+                    end_index: 3,
                     time: 1.0,
                     min: -1.0,
                     max: 3.0,
                 },
                 EnvelopeBucket {
+                    start_index: 3,
+                    end_index: 6,
                     time: 4.0,
                     min: 2.0,
                     max: 5.0,
                 },
                 EnvelopeBucket {
+                    start_index: 6,
+                    end_index: 7,
                     time: 6.0,
                     min: 0.0,
                     max: 0.0,
@@ -706,11 +1031,15 @@ mod tests {
             envelope.buckets,
             vec![
                 EnvelopeBucket {
+                    start_index: 2,
+                    end_index: 4,
                     time: 2.5,
                     min: -1.0,
                     max: 4.0,
                 },
                 EnvelopeBucket {
+                    start_index: 4,
+                    end_index: 5,
                     time: 4.0,
                     min: 2.0,
                     max: 2.0,
@@ -736,5 +1065,40 @@ mod tests {
         assert_eq!(envelope.time_range, Some((0.0, 2.0)));
         assert_eq!(envelope.source_sample_count, 3);
         assert_eq!(envelope.bucket_count(), 3);
+    }
+
+    #[test]
+    fn clips_cached_envelope_without_using_overscan_values_for_y_range() {
+        let time = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let values = vec![100.0, 3.0, -1.0, 4.0, 2.0, 5.0, 0.0];
+        let cached = min_max_envelope_for_range(&time, &values, (0.0, 6.0), 3);
+
+        let clipped = clip_min_max_envelope_to_range(&cached, &time, &values, (2.0, 4.0), 2);
+
+        assert_eq!(clipped.time_range, Some((2.0, 4.0)));
+        assert_eq!(clipped.source_sample_count, 3);
+        assert_eq!(clipped.value_range, Some((-1.0, 4.0)));
+        assert_eq!(clipped.bucket_count(), 2);
+        assert_eq!(clipped.buckets[0].start_index, 2);
+        assert_eq!(clipped.buckets[0].end_index, 3);
+        assert_eq!(clipped.buckets[1].start_index, 3);
+        assert_eq!(clipped.buckets[1].end_index, 5);
+    }
+
+    #[test]
+    fn line_tile_envelope_preserves_spikes_and_matches_raw_envelope() {
+        let time = (0..16).map(|value| value as f64).collect::<Vec<_>>();
+        let mut values = vec![0.0; 16];
+        values[6] = 25.0;
+        values[13] = -10.0;
+        let plan = min_max_envelope_plan_for_range(&time, values.len(), (0.0, 15.0), 2);
+        let tiles = build_line_tile_cache(&values, 4);
+
+        let raw = min_max_envelope_for_plan(&values, &plan);
+        let tiled = min_max_envelope_for_plan_with_tiles(&time, &values, &plan, &tiles);
+
+        assert_eq!(tiled.bucket_count(), raw.bucket_count());
+        assert_eq!(tiled.value_range, Some((-10.0, 25.0)));
+        assert_eq!(tiled.buckets, raw.buckets);
     }
 }

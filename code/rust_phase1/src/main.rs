@@ -1,5 +1,7 @@
 use eframe::egui;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 mod parquet_schema;
 mod parquet_waveform;
@@ -10,12 +12,25 @@ const MAX_VISIBLE_ENVELOPE_BUCKETS: usize = 8_192;
 const WHEEL_ZOOM_SENSITIVITY: f64 = 0.0015;
 const BENCH_VISIBLE_ENVELOPE_BUCKETS: usize = 1_200;
 const BENCH_RANGE_RUNS: usize = 24;
+const BENCH_HOVER_RUNS: usize = 1_000;
 const STRESS_RANGE_RUNS: usize = 1_000;
 const STRESS_REPORT_BLOCKS: usize = 5;
 const MIN_WAVEFORM_ROW_HEIGHT: f32 = 180.0;
 const WAVEFORM_ROW_GAP: f32 = 10.0;
 const MAX_EXACT_STEP_SAMPLES: usize = 12_000;
 const MAX_STEP_CHANGE_POINTS: usize = 12_000;
+const INTERACTION_PREVIEW_SETTLE: Duration = Duration::from_millis(140);
+const PREVIEW_MIN_DATASET_SAMPLES: usize = 8_000_000;
+const PREVIEW_MIN_VISIBLE_LINE_SAMPLE_WORK: usize = 32_000_000;
+const PREVIEW_MIN_VISIBLE_STEP_SAMPLES: usize = 1_000_000;
+const PREVIEW_BUCKET_DIVISOR: usize = 4;
+const MAX_PREVIEW_ENVELOPE_BUCKETS: usize = 512;
+const ENVELOPE_OVERSCAN_RATIO: f64 = 0.5;
+const ENVELOPE_CONTEXT_SPAN_TOLERANCE: f64 = 0.05;
+const MAX_CACHED_ENVELOPE_BUCKETS: usize = MAX_VISIBLE_ENVELOPE_BUCKETS * 3;
+const LINE_TILE_SAMPLE_WIDTH: usize = 256;
+const LINE_TILE_MIN_SOURCE_SAMPLES: usize = 500_000;
+const LINE_TILE_MIN_BUCKET_SIZE: usize = LINE_TILE_SAMPLE_WIDTH * 2;
 const DEFAULT_TRACE_LINE_WIDTH: f32 = 1.25;
 const MIN_TRACE_LINE_WIDTH: f32 = 0.5;
 const MAX_TRACE_LINE_WIDTH: f32 = 6.0;
@@ -57,6 +72,7 @@ fn main() -> eframe::Result {
             CliCommand::BenchMultiChannel { path, channels } => {
                 benchmark_multi_channel(path, channels)
             }
+            CliCommand::BenchPhase2 { path, channels } => benchmark_phase2_view(path, channels),
         };
 
         match result {
@@ -104,6 +120,10 @@ enum CliCommand {
         path: String,
         channels: Vec<String>,
     },
+    BenchPhase2 {
+        path: String,
+        channels: Vec<String>,
+    },
 }
 
 fn cli_command_arg() -> Option<CliCommand> {
@@ -138,15 +158,24 @@ fn cli_command_arg() -> Option<CliCommand> {
             let channels = args.collect();
             Some(CliCommand::BenchMultiChannel { path, channels })
         }
+        Some("--bench-phase2") => {
+            let path = args.next()?;
+            let channels = args.collect();
+            Some(CliCommand::BenchPhase2 { path, channels })
+        }
         _ => None,
     }
 }
 
-#[derive(Debug)]
 struct PanelYApp {
     dataset: DatasetState,
     view: ViewState,
     load: LoadState,
+    interaction: InteractionState,
+    perf: PerfStats,
+    load_result_tx: mpsc::Sender<LoadJobResult>,
+    load_result_rx: mpsc::Receiver<LoadJobResult>,
+    next_load_job_id: u64,
 }
 
 #[derive(Debug)]
@@ -164,6 +193,7 @@ struct ViewState {
     next_row_id: u64,
     x_range: Option<(f64, f64)>,
     hover_x: Option<f64>,
+    large_preview_enabled: bool,
     rows: Vec<PlotRow>,
 }
 
@@ -173,6 +203,60 @@ struct LoadState {
     pending_jobs: usize,
     progress: Option<String>,
     error: Option<String>,
+    active_jobs: BTreeMap<u64, ActiveLoadJob>,
+}
+
+#[derive(Clone, Debug)]
+struct InteractionState {
+    last_range_change: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct PerfStats {
+    show: bool,
+    frame_ms: f64,
+    interaction_ms: f64,
+    visible_ms: f64,
+    draw_ms: f64,
+    rows: usize,
+    channels: usize,
+    draw_points: usize,
+    requested_buckets: usize,
+    effective_buckets: usize,
+    preview: bool,
+    envelope_cache_hits: usize,
+    envelope_cache_misses: usize,
+    envelope_context_hits: usize,
+    envelope_context_misses: usize,
+    line_tile_hits: usize,
+    line_tile_builds: usize,
+    step_edge_hits: usize,
+    step_edge_builds: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveLoadJob {
+    channel_path: String,
+    channel_name: String,
+    target_row_id: u64,
+    target_row_label: String,
+    time_was_cached: bool,
+    channel_was_cached: bool,
+    started: std::time::Instant,
+}
+
+#[derive(Debug)]
+struct LoadJobResult {
+    job_id: u64,
+    parquet_path: String,
+    channel_path: String,
+    result: Result<LoadedChannelData, String>,
+}
+
+#[derive(Debug)]
+struct LoadedChannelData {
+    time: Option<parquet_waveform::TimeData>,
+    channel: Option<parquet_waveform::ChannelData>,
 }
 
 #[derive(Clone, Debug)]
@@ -215,15 +299,42 @@ enum DrawMode {
 #[derive(Debug, Default)]
 struct ChannelStore {
     raw_by_channel: BTreeMap<String, parquet_waveform::ChannelData>,
+    line_tile_cache: BTreeMap<String, parquet_waveform::LineTileCache>,
+    step_edge_cache: BTreeMap<String, StepEdgeCache>,
     envelope_cache: BTreeMap<EnvelopeKey, parquet_waveform::MinMaxEnvelope>,
     envelope_context: Option<EnvelopeContext>,
+    envelope_plan: Option<parquet_waveform::MinMaxEnvelopePlan>,
+    last_envelope_stats: EnvelopeCacheStats,
+    step_fallback_hints: BTreeMap<String, StepFallbackHint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepFallbackHint {
+    min_span: f64,
+    min_source_sample_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EnvelopeContext {
-    range_start_bits: u64,
-    range_end_bits: u64,
-    requested_bucket_count: usize,
+    cache_range_start_bits: u64,
+    cache_range_end_bits: u64,
+    view_span_bits: u64,
+    requested_view_bucket_count: usize,
+    cache_bucket_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EnvelopeCacheStats {
+    context_hits: usize,
+    context_misses: usize,
+    hits: usize,
+    misses: usize,
+    clipped: usize,
+    tile_hits: usize,
+    tile_builds: usize,
+    tile_buckets: usize,
+    step_edge_hits: usize,
+    step_edge_builds: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -249,10 +360,11 @@ struct VisibleTrace {
 #[derive(Clone, Debug)]
 enum VisibleTraceData {
     Envelope(parquet_waveform::MinMaxEnvelope),
+    DenseStepEnvelope(parquet_waveform::MinMaxEnvelope),
     RawStep(RawStepTrace),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct RawStepTrace {
     samples: Vec<StepSample>,
     source_sample_count: usize,
@@ -267,10 +379,42 @@ enum StepTraceKind {
     ChangePoints,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum StepTraceBuildResult {
+    Trace(RawStepTrace),
+    TooManyChangePoints { source_sample_count: usize },
+    Empty,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StepEdgeCache {
+    sample_count: usize,
+    edges: Vec<StepEdge>,
+    elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepEdge {
+    index: usize,
+    time: f64,
+    value: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct StepSample {
     time: f64,
     value: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VisibleSampleRange {
+    range_start: f64,
+    range_end: f64,
+    start: usize,
+    end: usize,
+    context_start: usize,
+    source_sample_count: usize,
+    draw_sample_count: usize,
 }
 
 #[derive(Debug)]
@@ -278,16 +422,24 @@ struct VisibleRowTrace {
     row_id: u64,
     row_index: usize,
     row_channel_count: usize,
+    loading_channel_count: usize,
+    unloaded_channel_count: usize,
     y_range: RowYRange,
     traces: Vec<VisibleTrace>,
 }
 
 impl Default for PanelYApp {
     fn default() -> Self {
+        let (load_result_tx, load_result_rx) = mpsc::channel();
         Self {
             dataset: DatasetState::default(),
             view: ViewState::default(),
             load: LoadState::default(),
+            interaction: InteractionState::default(),
+            perf: PerfStats::default(),
+            load_result_tx,
+            load_result_rx,
+            next_load_job_id: 1,
         }
     }
 }
@@ -311,6 +463,7 @@ impl Default for ViewState {
             next_row_id: 1,
             x_range: None,
             hover_x: None,
+            large_preview_enabled: false,
             rows: vec![PlotRow::new(0)],
         }
     }
@@ -323,8 +476,158 @@ impl Default for LoadState {
             pending_jobs: 0,
             progress: None,
             error: None,
+            active_jobs: BTreeMap::new(),
         }
     }
+}
+
+impl Default for InteractionState {
+    fn default() -> Self {
+        Self {
+            last_range_change: None,
+        }
+    }
+}
+
+impl Default for PerfStats {
+    fn default() -> Self {
+        Self {
+            show: true,
+            frame_ms: 0.0,
+            interaction_ms: 0.0,
+            visible_ms: 0.0,
+            draw_ms: 0.0,
+            rows: 0,
+            channels: 0,
+            draw_points: 0,
+            requested_buckets: 0,
+            effective_buckets: 0,
+            preview: false,
+            envelope_cache_hits: 0,
+            envelope_cache_misses: 0,
+            envelope_context_hits: 0,
+            envelope_context_misses: 0,
+            line_tile_hits: 0,
+            line_tile_builds: 0,
+            step_edge_hits: 0,
+            step_edge_builds: 0,
+        }
+    }
+}
+
+impl LoadState {
+    fn is_busy(&self) -> bool {
+        !self.active_jobs.is_empty()
+    }
+
+    fn is_channel_loading(&self, channel_path: &str) -> bool {
+        self.active_jobs
+            .values()
+            .any(|job| job.channel_path == channel_path)
+    }
+
+    fn loading_channel_paths(&self) -> BTreeSet<String> {
+        self.active_jobs
+            .values()
+            .map(|job| job.channel_path.clone())
+            .collect()
+    }
+
+    fn refresh_progress(&mut self) {
+        self.pending_jobs = self.active_jobs.len();
+        self.progress = if self.active_jobs.is_empty() {
+            None
+        } else {
+            let labels = self
+                .active_jobs
+                .values()
+                .map(|job| format!("{} -> {}", job.channel_name, job.target_row_label))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("loading: {labels}"))
+        };
+    }
+}
+
+impl InteractionState {
+    fn mark_range_changed(&mut self) {
+        self.last_range_change = Some(Instant::now());
+    }
+
+    fn preview_active(&self) -> bool {
+        self.last_range_change
+            .is_some_and(|changed_at| changed_at.elapsed() < INTERACTION_PREVIEW_SETTLE)
+    }
+}
+
+impl PerfStats {
+    fn update(
+        &mut self,
+        timing: FrameTiming,
+        visible_rows: &[VisibleRowTrace],
+        requested_buckets: usize,
+        effective_buckets: usize,
+        preview: bool,
+        envelope_stats: EnvelopeCacheStats,
+    ) {
+        self.frame_ms = duration_ms(timing.frame);
+        self.interaction_ms = duration_ms(timing.interaction);
+        self.visible_ms = duration_ms(timing.visible);
+        self.draw_ms = duration_ms(timing.draw);
+        self.rows = visible_rows.len();
+        self.channels = visible_rows
+            .iter()
+            .map(|row| row.traces.len())
+            .sum::<usize>();
+        self.draw_points = visible_rows
+            .iter()
+            .flat_map(|row| row.traces.iter())
+            .map(trace_draw_point_count)
+            .sum::<usize>();
+        self.requested_buckets = requested_buckets;
+        self.effective_buckets = effective_buckets;
+        self.preview = preview;
+        self.envelope_cache_hits = envelope_stats.hits;
+        self.envelope_cache_misses = envelope_stats.misses;
+        self.envelope_context_hits = envelope_stats.context_hits;
+        self.envelope_context_misses = envelope_stats.context_misses;
+        self.line_tile_hits = envelope_stats.tile_hits;
+        self.line_tile_builds = envelope_stats.tile_builds;
+        self.step_edge_hits = envelope_stats.step_edge_hits;
+        self.step_edge_builds = envelope_stats.step_edge_builds;
+    }
+
+    fn summary(&self) -> String {
+        let mode = if self.preview { "preview" } else { "full" };
+        format!(
+            "{mode} frame {:.1}ms visible {:.1}ms draw {:.1}ms input {:.1}ms rows {} ch {} points {} buckets {}/{} env h/m {}/{} ctx {}/{} tile h/b {}/{} edge h/b {}/{}",
+            self.frame_ms,
+            self.visible_ms,
+            self.draw_ms,
+            self.interaction_ms,
+            self.rows,
+            self.channels,
+            self.draw_points,
+            self.effective_buckets,
+            self.requested_buckets,
+            self.envelope_cache_hits,
+            self.envelope_cache_misses,
+            self.envelope_context_hits,
+            self.envelope_context_misses,
+            self.line_tile_hits,
+            self.line_tile_builds,
+            self.step_edge_hits,
+            self.step_edge_builds
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameTiming {
+    frame: Duration,
+    interaction: Duration,
+    visible: Duration,
+    draw: Duration,
 }
 
 impl DrawMode {
@@ -502,21 +805,41 @@ impl ViewState {
             .unwrap_or_else(|| "Row -".to_owned())
     }
 
-    fn add_channel_to_selected_row(&mut self, channel_path: &str) -> (bool, u64) {
+    fn row_display_name(&self, row_id: u64) -> String {
+        self.rows
+            .iter()
+            .position(|row| row.id == row_id)
+            .map(|index| format!("Row {}", index + 1))
+            .unwrap_or_else(|| "Row -".to_owned())
+    }
+
+    fn selected_row_id_or_first(&mut self) -> Option<u64> {
         self.ensure_row_state();
-        let row_index = self.selected_row_index().unwrap_or(0);
-        let row = &mut self.rows[row_index];
+        self.selected_row_id
+            .or_else(|| self.rows.first().map(|row| row.id))
+    }
+
+    fn add_channel_to_row(&mut self, row_id: u64, channel_path: &str) -> Option<(bool, u64)> {
+        self.ensure_row_state();
+        let row = self.rows.iter_mut().find(|row| row.id == row_id)?;
         if row
             .channels
             .iter()
             .any(|channel| channel.channel_path == channel_path)
         {
-            return (false, row.id);
+            return Some((false, row.id));
         }
 
         row.channels
             .push(RowChannel::new(channel_path, row.channels.len()));
-        (true, row.id)
+        Some((true, row.id))
+    }
+
+    #[cfg(test)]
+    fn add_channel_to_selected_row(&mut self, channel_path: &str) -> (bool, u64) {
+        let row_id = self.selected_row_id_or_first().unwrap_or(0);
+        self.add_channel_to_row(row_id, channel_path)
+            .unwrap_or((false, row_id))
     }
 
     fn has_visible_channels(&self) -> bool {
@@ -526,15 +849,38 @@ impl ViewState {
     }
 }
 
+fn row_missing_channel_counts(
+    row: &PlotRow,
+    loaded_channels: Option<&ChannelStore>,
+    loading_channel_paths: &BTreeSet<String>,
+) -> (usize, usize) {
+    row.channels.iter().filter(|channel| channel.visible).fold(
+        (0usize, 0usize),
+        |(loading, unloaded), channel| {
+            if loaded_channels.is_some_and(|store| store.has_channel(&channel.channel_path)) {
+                (loading, unloaded)
+            } else if loading_channel_paths.contains(&channel.channel_path) {
+                (loading + 1, unloaded)
+            } else {
+                (loading, unloaded + 1)
+            }
+        },
+    )
+}
+
 impl ChannelStore {
     fn clear_all(&mut self) {
         self.raw_by_channel.clear();
+        self.line_tile_cache.clear();
+        self.step_edge_cache.clear();
         self.clear_envelope_cache();
+        self.step_fallback_hints.clear();
     }
 
     fn clear_envelope_cache(&mut self) {
         self.envelope_cache.clear();
         self.envelope_context = None;
+        self.envelope_plan = None;
     }
 
     fn has_channel(&self, channel_path: &str) -> bool {
@@ -546,6 +892,9 @@ impl ChannelStore {
     }
 
     fn insert_channel(&mut self, channel: parquet_waveform::ChannelData) {
+        self.step_fallback_hints.remove(&channel.channel_path);
+        self.line_tile_cache.remove(&channel.channel_path);
+        self.step_edge_cache.remove(&channel.channel_path);
         self.raw_by_channel
             .insert(channel.channel_path.clone(), channel);
         self.clear_envelope_cache();
@@ -558,45 +907,288 @@ impl ChannelStore {
             .sum()
     }
 
-    fn prepare_envelope_context(&mut self, time_range: (f64, f64), requested_bucket_count: usize) {
-        let context = EnvelopeContext::new(time_range, requested_bucket_count);
-        if self.envelope_context != Some(context) {
-            self.envelope_cache.clear();
-            self.envelope_context = Some(context);
+    fn line_tile_memory_bytes(&self) -> usize {
+        self.line_tile_cache
+            .values()
+            .map(parquet_waveform::LineTileCache::memory_bytes)
+            .sum()
+    }
+
+    fn line_tile_build_seconds(&self) -> f64 {
+        self.line_tile_cache
+            .values()
+            .map(|cache| cache.elapsed.as_secs_f64())
+            .sum()
+    }
+
+    fn step_edge_memory_bytes(&self) -> usize {
+        self.step_edge_cache
+            .values()
+            .map(StepEdgeCache::memory_bytes)
+            .sum()
+    }
+
+    fn step_edge_build_seconds(&self) -> f64 {
+        self.step_edge_cache
+            .values()
+            .map(|cache| cache.elapsed.as_secs_f64())
+            .sum()
+    }
+
+    fn begin_envelope_frame(&mut self) {
+        self.last_envelope_stats = EnvelopeCacheStats::default();
+    }
+
+    fn ensure_line_tile_cache(&mut self, channel_path: &str) -> Option<bool> {
+        let was_cached = self.line_tile_cache.contains_key(channel_path);
+        if !was_cached {
+            let channel = self.raw_by_channel.get(channel_path)?;
+            let tile_cache =
+                parquet_waveform::build_line_tile_cache(&channel.values, LINE_TILE_SAMPLE_WIDTH);
+            self.line_tile_cache
+                .insert(channel_path.to_owned(), tile_cache);
+            self.last_envelope_stats.tile_builds += 1;
+        } else {
+            self.last_envelope_stats.tile_hits += 1;
         }
+
+        Some(!was_cached)
+    }
+
+    fn ensure_step_edge_cache(&mut self, channel_path: &str, time: &[f64]) -> Option<bool> {
+        let was_cached = self.step_edge_cache.contains_key(channel_path);
+        if !was_cached {
+            let channel = self.raw_by_channel.get(channel_path)?;
+            let edge_cache = build_step_edge_cache(time, &channel.values);
+            self.step_edge_cache
+                .insert(channel_path.to_owned(), edge_cache);
+            self.last_envelope_stats.step_edge_builds += 1;
+        } else {
+            self.last_envelope_stats.step_edge_hits += 1;
+        }
+
+        Some(!was_cached)
+    }
+
+    fn cached_change_point_step_trace_result(
+        &mut self,
+        channel_path: &str,
+        time: &[f64],
+        time_range: (f64, f64),
+        max_change_points: usize,
+    ) -> Option<StepTraceBuildResult> {
+        self.ensure_step_edge_cache(channel_path, time)?;
+        self.step_edge_cache.get(channel_path).map(|cache| {
+            build_change_point_step_trace_from_cache(time, cache, time_range, max_change_points)
+        })
+    }
+
+    fn prepare_envelope_context(
+        &mut self,
+        time: &[f64],
+        value_count: usize,
+        view_range: (f64, f64),
+        full_range: (f64, f64),
+        requested_bucket_count: usize,
+    ) {
+        let Some(context) =
+            EnvelopeContext::for_view(view_range, full_range, requested_bucket_count)
+        else {
+            self.clear_envelope_cache();
+            self.last_envelope_stats.context_misses += 1;
+            return;
+        };
+
+        if self
+            .envelope_context
+            .is_some_and(|current| current.reuses_for_view(view_range, requested_bucket_count))
+        {
+            self.last_envelope_stats.context_hits += 1;
+            return;
+        }
+
+        self.envelope_cache.clear();
+        self.envelope_plan = Some(parquet_waveform::min_max_envelope_plan_for_range(
+            time,
+            value_count,
+            context.cache_range(),
+            context.cache_bucket_count,
+        ));
+        self.envelope_context = Some(context);
+        self.last_envelope_stats.context_misses += 1;
     }
 
     fn ensure_envelope(
         &mut self,
         channel_path: &str,
         time: &[f64],
-        time_range: (f64, f64),
+        view_range: (f64, f64),
         requested_bucket_count: usize,
+        allow_line_tile_lod: bool,
     ) -> Option<(parquet_waveform::MinMaxEnvelope, bool)> {
-        let key = EnvelopeKey::new(channel_path, time_range, requested_bucket_count);
+        let context = self.envelope_context?;
+        let cache_range = context.cache_range();
+        let key = EnvelopeKey::new(channel_path, cache_range, context.cache_bucket_count);
         let was_cached = self.envelope_cache.contains_key(&key);
         if !was_cached {
             let envelope = {
-                let channel = self.raw_by_channel.get(channel_path)?;
-                channel.min_max_envelope_for_range(time, time_range, requested_bucket_count)
+                if allow_line_tile_lod
+                    && self
+                        .envelope_plan
+                        .as_ref()
+                        .is_some_and(should_use_line_tile_lod)
+                {
+                    let plan = self.envelope_plan.clone()?;
+                    let _tile_was_built = self.ensure_line_tile_cache(channel_path)?;
+                    let channel = self.raw_by_channel.get(channel_path)?;
+                    let tile_cache = self.line_tile_cache.get(channel_path)?;
+                    let envelope = parquet_waveform::min_max_envelope_for_plan_with_tiles(
+                        time,
+                        &channel.values,
+                        &plan,
+                        tile_cache,
+                    );
+                    self.last_envelope_stats.tile_buckets += envelope.bucket_count();
+                    envelope
+                } else if let Some(plan) = self.envelope_plan.as_ref() {
+                    let channel = self.raw_by_channel.get(channel_path)?;
+                    parquet_waveform::min_max_envelope_for_plan(&channel.values, plan)
+                } else {
+                    let channel = self.raw_by_channel.get(channel_path)?;
+                    channel.min_max_envelope_for_range(
+                        time,
+                        cache_range,
+                        context.cache_bucket_count,
+                    )
+                }
             };
             self.envelope_cache.insert(key.clone(), envelope);
+            self.last_envelope_stats.misses += 1;
+        } else {
+            self.last_envelope_stats.hits += 1;
         }
 
-        self.envelope_cache
-            .get(&key)
-            .cloned()
-            .map(|envelope| (envelope, !was_cached))
+        let cached = self.envelope_cache.get(&key)?.clone();
+        if context.cache_range_equals(view_range)
+            && context.cache_bucket_count == requested_bucket_count
+        {
+            return Some((cached, !was_cached));
+        }
+
+        let channel = self.raw_by_channel.get(channel_path)?;
+        self.last_envelope_stats.clipped += 1;
+        Some((
+            parquet_waveform::clip_min_max_envelope_to_range(
+                &cached,
+                time,
+                &channel.values,
+                view_range,
+                requested_bucket_count,
+            ),
+            !was_cached,
+        ))
+    }
+
+    fn should_skip_step_change_points(
+        &self,
+        channel_path: &str,
+        time_range: (f64, f64),
+        source_sample_count: usize,
+    ) -> bool {
+        let Some(hint) = self.step_fallback_hints.get(channel_path) else {
+            return false;
+        };
+        let span = (time_range.1 - time_range.0).abs();
+        span.is_finite()
+            && span >= hint.min_span * 0.95
+            && source_sample_count >= hint.min_source_sample_count.saturating_mul(9) / 10
+    }
+
+    fn record_step_change_point_fallback(
+        &mut self,
+        channel_path: &str,
+        time_range: (f64, f64),
+        source_sample_count: usize,
+    ) {
+        let span = (time_range.1 - time_range.0).abs();
+        if !span.is_finite() || span <= 0.0 || source_sample_count == 0 {
+            return;
+        }
+
+        self.step_fallback_hints
+            .entry(channel_path.to_owned())
+            .and_modify(|hint| {
+                hint.min_span = hint.min_span.min(span);
+                hint.min_source_sample_count =
+                    hint.min_source_sample_count.min(source_sample_count);
+            })
+            .or_insert(StepFallbackHint {
+                min_span: span,
+                min_source_sample_count: source_sample_count,
+            });
     }
 }
 
 impl EnvelopeContext {
-    fn new(time_range: (f64, f64), requested_bucket_count: usize) -> Self {
-        Self {
-            range_start_bits: time_range.0.to_bits(),
-            range_end_bits: time_range.1.to_bits(),
-            requested_bucket_count,
+    fn for_view(
+        view_range: (f64, f64),
+        full_range: (f64, f64),
+        requested_bucket_count: usize,
+    ) -> Option<Self> {
+        let (view_start, view_end) = normalized_range(view_range)?;
+        let (cache_start, cache_end) = overscan_cache_range((view_start, view_end), full_range)?;
+        let view_span = view_end - view_start;
+        if !view_span.is_finite() || view_span <= 0.0 {
+            return None;
         }
+
+        Some(Self {
+            cache_range_start_bits: cache_start.to_bits(),
+            cache_range_end_bits: cache_end.to_bits(),
+            view_span_bits: view_span.to_bits(),
+            requested_view_bucket_count: requested_bucket_count,
+            cache_bucket_count: cache_bucket_count_for_view(
+                (view_start, view_end),
+                (cache_start, cache_end),
+                requested_bucket_count,
+            ),
+        })
+    }
+
+    fn cache_range(self) -> (f64, f64) {
+        (
+            f64::from_bits(self.cache_range_start_bits),
+            f64::from_bits(self.cache_range_end_bits),
+        )
+    }
+
+    fn view_span(self) -> f64 {
+        f64::from_bits(self.view_span_bits)
+    }
+
+    fn reuses_for_view(self, view_range: (f64, f64), requested_bucket_count: usize) -> bool {
+        if self.requested_view_bucket_count != requested_bucket_count {
+            return false;
+        }
+
+        let Some((view_start, view_end)) = normalized_range(view_range) else {
+            return false;
+        };
+        let view_span = view_end - view_start;
+        if !similar_span(self.view_span(), view_span, ENVELOPE_CONTEXT_SPAN_TOLERANCE) {
+            return false;
+        }
+
+        let (cache_start, cache_end) = self.cache_range();
+        view_start >= cache_start && view_end <= cache_end
+    }
+
+    fn cache_range_equals(self, view_range: (f64, f64)) -> bool {
+        let Some((view_start, view_end)) = normalized_range(view_range) else {
+            return false;
+        };
+        self.cache_range_start_bits == view_start.to_bits()
+            && self.cache_range_end_bits == view_end.to_bits()
     }
 }
 
@@ -608,6 +1200,16 @@ impl EnvelopeKey {
             range_end_bits: time_range.1.to_bits(),
             requested_bucket_count,
         }
+    }
+}
+
+impl StepEdgeCache {
+    fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.edges.len() * std::mem::size_of::<StepEdge>()
     }
 }
 
@@ -853,7 +1455,14 @@ fn benchmark_multi_channel(path: String, channels: Vec<String>) -> Result<String
         channel_results.push(result);
     }
 
-    store.prepare_envelope_context(full_range, BENCH_VISIBLE_ENVELOPE_BUCKETS);
+    store.begin_envelope_frame();
+    store.prepare_envelope_context(
+        &time.time,
+        time.sample_count(),
+        full_range,
+        full_range,
+        BENCH_VISIBLE_ENVELOPE_BUCKETS,
+    );
     let mut envelope_results = Vec::with_capacity(selected_channels.len());
     for channel_path in channel_results
         .iter()
@@ -864,6 +1473,7 @@ fn benchmark_multi_channel(path: String, channels: Vec<String>) -> Result<String
             &time.time,
             full_range,
             BENCH_VISIBLE_ENVELOPE_BUCKETS,
+            true,
         ) else {
             return Err(format!(
                 "loaded channel is missing from cache: {channel_path}"
@@ -958,6 +1568,478 @@ fn benchmark_multi_channel(path: String, channels: Vec<String>) -> Result<String
     Ok(report)
 }
 
+fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, String> {
+    let rss_before_schema = process_rss_mib();
+    let schema = parquet_schema::read_schema_summary(&path)?;
+    let rss_after_schema = process_rss_mib();
+    if schema.time_column.is_none() {
+        return Err("time column not found".to_owned());
+    }
+
+    let selected_channels = if channels.is_empty() {
+        schema
+            .channels
+            .iter()
+            .map(|channel| channel.path.clone())
+            .collect::<Vec<_>>()
+    } else {
+        channels
+    };
+    if selected_channels.is_empty() {
+        return Err("no channels selected".to_owned());
+    }
+
+    let time = parquet_waveform::read_time_column(&path, &schema)?;
+    let rss_after_time = process_rss_mib();
+    let full_range = time
+        .time_range()
+        .ok_or_else(|| "loaded time column has no time range".to_owned())?;
+    let mut store = ChannelStore::default();
+    let mut channel_results = Vec::with_capacity(selected_channels.len());
+
+    for channel_name in &selected_channels {
+        let channel = parquet_waveform::read_channel_values(&path, &schema, channel_name)?;
+        if channel.sample_count() != time.sample_count() {
+            return Err(format!(
+                "time/value length mismatch for {}: {} vs {}",
+                channel.channel_path,
+                time.sample_count(),
+                channel.sample_count()
+            ));
+        }
+
+        let result = MultiChannelLoadResult {
+            channel_name: channel.channel_name.clone(),
+            channel_path: channel.channel_path.clone(),
+            sample_count: channel.sample_count(),
+            read_sec: channel.elapsed.as_secs_f64(),
+            memory_bytes: channel.memory_bytes(),
+            rss_after_load: process_rss_mib(),
+        };
+        store.insert_channel(channel);
+        channel_results.push(result);
+    }
+    let rss_after_all_channels = process_rss_mib();
+
+    let rows = phase2_benchmark_rows(&selected_channels);
+    let (line_channel_count, step_channel_count) = phase2_benchmark_mode_counts(&rows);
+    let mut app = PanelYApp::default();
+    app.dataset.parquet_path = path;
+    app.dataset.schema = Some(schema);
+    app.dataset.shared_time = Some(time);
+    app.dataset.loaded_channels = store;
+    app.view.rows = rows;
+    app.view.selected_row_id = app.view.rows.first().map(|row| row.id);
+    app.view.next_row_id = app.view.rows.iter().map(|row| row.id).max().unwrap_or(0) + 1;
+    app.view.x_range = Some(full_range);
+
+    let ranges = benchmark_ranges(full_range, BENCH_RANGE_RUNS);
+    let mut visible_results = Vec::with_capacity(ranges.len());
+    for (index, range) in ranges.into_iter().enumerate() {
+        app.view.x_range = Some(range);
+        app.view.hover_x = Some((range.0 + range.1) * 0.5);
+        let started = std::time::Instant::now();
+        let visible_rows = app.visible_row_traces(BENCH_VISIBLE_ENVELOPE_BUCKETS, true, false);
+        let elapsed_sec = started.elapsed().as_secs_f64();
+        let envelope_stats = app.dataset.loaded_channels.last_envelope_stats;
+
+        let mut visible_channel_count = 0usize;
+        let mut envelope_trace_count = 0usize;
+        let mut dense_step_trace_count = 0usize;
+        let mut raw_step_trace_count = 0usize;
+        let mut edge_step_trace_count = 0usize;
+        let mut raw_step_sample_count = 0usize;
+        let mut draw_point_count = 0usize;
+        let mut source_sample_count = 0usize;
+        let mut hover_value_count = 0usize;
+
+        for row in &visible_rows {
+            for trace in &row.traces {
+                visible_channel_count += 1;
+                draw_point_count += trace_draw_point_count(trace);
+                source_sample_count = source_sample_count.max(trace_source_sample_count(trace));
+                if trace.hover_value.is_some() {
+                    hover_value_count += 1;
+                }
+
+                match &trace.data {
+                    VisibleTraceData::Envelope(_) => {
+                        envelope_trace_count += 1;
+                    }
+                    VisibleTraceData::DenseStepEnvelope(_) => {
+                        dense_step_trace_count += 1;
+                    }
+                    VisibleTraceData::RawStep(raw_step) => {
+                        raw_step_trace_count += 1;
+                        raw_step_sample_count += raw_step.samples.len();
+                        if raw_step.kind == StepTraceKind::ChangePoints {
+                            edge_step_trace_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        visible_results.push(Phase2VisibleRunResult {
+            index: index + 1,
+            range,
+            elapsed_sec,
+            row_count: visible_rows.len(),
+            visible_channel_count,
+            envelope_trace_count,
+            dense_step_trace_count,
+            raw_step_trace_count,
+            edge_step_trace_count,
+            raw_step_sample_count,
+            draw_point_count,
+            source_sample_count,
+            hover_value_count,
+            envelope_stats,
+        });
+    }
+    let pan_cache_result = benchmark_phase2_pan_cache(&mut app, full_range);
+    let rss_after_visible_benchmark = process_rss_mib();
+
+    let hover_result = benchmark_phase2_hover(&app, full_range);
+    let rss_after_hover_benchmark = process_rss_mib();
+
+    let raw_memory_bytes = app
+        .dataset
+        .shared_time
+        .as_ref()
+        .map_or(0, parquet_waveform::TimeData::memory_bytes)
+        + app.dataset.loaded_channels.raw_memory_bytes();
+    let channel_memory_bytes = channel_results
+        .iter()
+        .map(|result| result.memory_bytes)
+        .sum::<usize>();
+    let visible_total_sec = visible_results
+        .iter()
+        .map(|result| result.elapsed_sec)
+        .sum::<f64>();
+    let visible_avg_sec = if visible_results.is_empty() {
+        0.0
+    } else {
+        visible_total_sec / visible_results.len() as f64
+    };
+    let visible_max_sec = visible_results
+        .iter()
+        .map(|result| result.elapsed_sec)
+        .fold(0.0, f64::max);
+    let max_draw_points = visible_results
+        .iter()
+        .map(|result| result.draw_point_count)
+        .max()
+        .unwrap_or(0);
+    let max_raw_step_samples = visible_results
+        .iter()
+        .map(|result| result.raw_step_sample_count)
+        .max()
+        .unwrap_or(0);
+    let total_envelope_hits = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.hits)
+        .sum::<usize>();
+    let total_envelope_misses = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.misses)
+        .sum::<usize>();
+    let total_context_hits = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.context_hits)
+        .sum::<usize>();
+    let total_context_misses = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.context_misses)
+        .sum::<usize>();
+    let total_tile_hits = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.tile_hits)
+        .sum::<usize>();
+    let total_tile_builds = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.tile_builds)
+        .sum::<usize>();
+    let total_step_edge_hits = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.step_edge_hits)
+        .sum::<usize>();
+    let total_step_edge_builds = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.step_edge_builds)
+        .sum::<usize>();
+    let step_edge_count = app
+        .dataset
+        .loaded_channels
+        .step_edge_cache
+        .values()
+        .map(StepEdgeCache::edge_count)
+        .sum::<usize>();
+
+    let schema = app.dataset.schema.as_ref().expect("schema is set");
+    let shared_time = app.dataset.shared_time.as_ref().expect("time is set");
+
+    let mut report = String::new();
+    report.push_str(&format!("file: {}\n", schema.path.display()));
+    report.push_str(&format!("rows: {}\n", schema.row_count));
+    report.push_str(&format!("channels selected: {}\n", selected_channels.len()));
+    report.push_str(&format!("channel list: {}\n", selected_channels.join(", ")));
+    report.push_str(&format!(
+        "layout: {} rows, line channels {}, step channels {}\n",
+        app.view.rows.len(),
+        line_channel_count,
+        step_channel_count
+    ));
+    report.push_str(&format!(
+        "time: {} samples, {:.1} MiB, read {:.3}s\n",
+        shared_time.sample_count(),
+        bytes_to_mib(shared_time.memory_bytes()),
+        shared_time.elapsed.as_secs_f64()
+    ));
+    report.push_str(&format!(
+        "channel arrays: {:.1} MiB\n",
+        bytes_to_mib(channel_memory_bytes)
+    ));
+    report.push_str(&format!(
+        "raw cache memory: {:.1} MiB\n",
+        bytes_to_mib(raw_memory_bytes)
+    ));
+    report.push_str(&format!(
+        "visible trace benchmark: {} ranges, {} buckets requested, total {:.3}s, avg {:.4}s, max {:.4}s, max draw points {}, max raw step samples {}\n",
+        visible_results.len(),
+        BENCH_VISIBLE_ENVELOPE_BUCKETS,
+        visible_total_sec,
+        visible_avg_sec,
+        visible_max_sec,
+        max_draw_points,
+        max_raw_step_samples
+    ));
+    report.push_str(&format!(
+        "envelope cache: hits {}, misses {}, context hits {}, context misses {}, line tile hits {}, builds {}, tile memory {:.1} MiB, step edge hits {}, builds {}, edges {}, edge memory {:.1} MiB\n",
+        total_envelope_hits,
+        total_envelope_misses,
+        total_context_hits,
+        total_context_misses,
+        total_tile_hits,
+        total_tile_builds,
+        bytes_to_mib(app.dataset.loaded_channels.line_tile_memory_bytes()),
+        total_step_edge_hits,
+        total_step_edge_builds,
+        step_edge_count,
+        bytes_to_mib(app.dataset.loaded_channels.step_edge_memory_bytes())
+    ));
+    report.push_str(&format!(
+        "pan cache benchmark: {} ranges, total {:.3}s, avg {:.4}s, max {:.4}s, cache hits {}, misses {}, context hits {}, context misses {}, tile hits {}, builds {}, step edge hits {}, builds {}\n",
+        pan_cache_result.ranges,
+        pan_cache_result.elapsed_sec,
+        pan_cache_result.avg_visible_sec(),
+        pan_cache_result.max_elapsed_sec,
+        pan_cache_result.envelope_hits,
+        pan_cache_result.envelope_misses,
+        pan_cache_result.context_hits,
+        pan_cache_result.context_misses,
+        pan_cache_result.tile_hits,
+        pan_cache_result.tile_builds,
+        pan_cache_result.step_edge_hits,
+        pan_cache_result.step_edge_builds
+    ));
+    report.push_str(&format!(
+        "hover benchmark: {} positions, {} lookups, {} hits, total {:.4}s, avg {:.3} us/lookup\n",
+        hover_result.positions,
+        hover_result.lookups,
+        hover_result.hits,
+        hover_result.elapsed_sec,
+        hover_result.avg_lookup_us()
+    ));
+    report.push_str(&format!(
+        "rss: before_schema={}, after_schema={}, after_time={}, after_all_channels={}, after_visible_benchmark={}, after_hover_benchmark={}\n",
+        format_optional_mib(rss_before_schema),
+        format_optional_mib(rss_after_schema),
+        format_optional_mib(rss_after_time),
+        format_optional_mib(rss_after_all_channels),
+        format_optional_mib(rss_after_visible_benchmark),
+        format_optional_mib(rss_after_hover_benchmark)
+    ));
+    report.push_str("channel loads:\n");
+    for (index, result) in channel_results.iter().enumerate() {
+        report.push_str(&format!(
+            "  #{:02} {} ({}) samples={} array={:.1} MiB read={:.3}s rss={}\n",
+            index + 1,
+            result.channel_name,
+            result.channel_path,
+            result.sample_count,
+            bytes_to_mib(result.memory_bytes),
+            result.read_sec,
+            format_optional_mib(result.rss_after_load)
+        ));
+    }
+    report.push_str("visible runs:\n");
+    for result in &visible_results {
+        report.push_str(&format!(
+            "  #{:02} {:.6}..{:.6}s {:.4}s rows={} ch={} samples={} env={} dense={} step={} edge={} step_samples={} draw_points={} hover_values={} cache_h/m={}/{} ctx={}/{} tile_h/b={}/{} edge_h/b={}/{}\n",
+            result.index,
+            result.range.0,
+            result.range.1,
+            result.elapsed_sec,
+            result.row_count,
+            result.visible_channel_count,
+            result.source_sample_count,
+            result.envelope_trace_count,
+            result.dense_step_trace_count,
+            result.raw_step_trace_count,
+            result.edge_step_trace_count,
+            result.raw_step_sample_count,
+            result.draw_point_count,
+            result.hover_value_count,
+            result.envelope_stats.hits,
+            result.envelope_stats.misses,
+            result.envelope_stats.context_hits,
+            result.envelope_stats.context_misses,
+            result.envelope_stats.tile_hits,
+            result.envelope_stats.tile_builds,
+            result.envelope_stats.step_edge_hits,
+            result.envelope_stats.step_edge_builds
+        ));
+    }
+
+    Ok(report)
+}
+
+fn phase2_benchmark_rows(selected_channels: &[String]) -> Vec<PlotRow> {
+    if selected_channels.is_empty() {
+        return vec![PlotRow::new(0)];
+    }
+
+    selected_channels
+        .chunks(3)
+        .enumerate()
+        .map(|(row_index, channels)| {
+            let mut row = PlotRow::new(row_index as u64);
+            row.channels = channels
+                .iter()
+                .enumerate()
+                .map(|(channel_index, channel_path)| {
+                    let mut row_channel = RowChannel::new(channel_path, channel_index);
+                    row_channel.draw_mode = phase2_benchmark_draw_mode(channel_path);
+                    row_channel
+                })
+                .collect();
+            row
+        })
+        .collect()
+}
+
+fn phase2_benchmark_draw_mode(channel_path: &str) -> DrawMode {
+    let lower = channel_path.to_ascii_lowercase();
+    if lower.contains("pwm") || lower.contains("gate") || lower.contains("step") {
+        DrawMode::Step
+    } else {
+        DrawMode::Line
+    }
+}
+
+fn phase2_benchmark_mode_counts(rows: &[PlotRow]) -> (usize, usize) {
+    rows.iter().flat_map(|row| row.channels.iter()).fold(
+        (0usize, 0usize),
+        |(line, step), channel| match channel.draw_mode {
+            DrawMode::Line => (line + 1, step),
+            DrawMode::Step => (line, step + 1),
+        },
+    )
+}
+
+fn benchmark_phase2_pan_cache(
+    app: &mut PanelYApp,
+    full_range: (f64, f64),
+) -> Phase2PanCacheBenchmarkResult {
+    let ranges = benchmark_pan_ranges(full_range, BENCH_RANGE_RUNS);
+    if ranges.is_empty() {
+        return Phase2PanCacheBenchmarkResult::default();
+    }
+
+    app.dataset.loaded_channels.clear_envelope_cache();
+    let mut result = Phase2PanCacheBenchmarkResult {
+        ranges: ranges.len(),
+        ..Phase2PanCacheBenchmarkResult::default()
+    };
+
+    for range in ranges {
+        app.view.x_range = Some(range);
+        app.view.hover_x = Some((range.0 + range.1) * 0.5);
+        let started = std::time::Instant::now();
+        let _visible_rows = app.visible_row_traces(BENCH_VISIBLE_ENVELOPE_BUCKETS, true, false);
+        let elapsed_sec = started.elapsed().as_secs_f64();
+        let envelope_stats = app.dataset.loaded_channels.last_envelope_stats;
+
+        result.elapsed_sec += elapsed_sec;
+        result.max_elapsed_sec = result.max_elapsed_sec.max(elapsed_sec);
+        result.envelope_hits += envelope_stats.hits;
+        result.envelope_misses += envelope_stats.misses;
+        result.context_hits += envelope_stats.context_hits;
+        result.context_misses += envelope_stats.context_misses;
+        result.tile_hits += envelope_stats.tile_hits;
+        result.tile_builds += envelope_stats.tile_builds;
+        result.step_edge_hits += envelope_stats.step_edge_hits;
+        result.step_edge_builds += envelope_stats.step_edge_builds;
+    }
+
+    result
+}
+
+fn benchmark_phase2_hover(app: &PanelYApp, full_range: (f64, f64)) -> Phase2HoverBenchmarkResult {
+    let Some(shared_time) = app.dataset.shared_time.as_ref() else {
+        return Phase2HoverBenchmarkResult::empty();
+    };
+    let Some((range_start, range_end)) = normalized_range(full_range) else {
+        return Phase2HoverBenchmarkResult::empty();
+    };
+    let span = range_end - range_start;
+    if span <= 0.0 {
+        return Phase2HoverBenchmarkResult::empty();
+    }
+
+    let started = std::time::Instant::now();
+    let mut lookups = 0usize;
+    let mut hits = 0usize;
+    for index in 0..BENCH_HOVER_RUNS {
+        let ratio = if BENCH_HOVER_RUNS <= 1 {
+            0.5
+        } else {
+            index as f64 / (BENCH_HOVER_RUNS - 1) as f64
+        };
+        let target_time = range_start + span * ratio;
+        for row in &app.view.rows {
+            for row_channel in row.channels.iter().filter(|channel| channel.visible) {
+                let Some(channel) = app
+                    .dataset
+                    .loaded_channels
+                    .channel(&row_channel.channel_path)
+                else {
+                    continue;
+                };
+                lookups += 1;
+                if hover_value_at_time(
+                    &shared_time.time,
+                    &channel.values,
+                    target_time,
+                    row_channel.draw_mode,
+                )
+                .is_some()
+                {
+                    hits += 1;
+                }
+            }
+        }
+    }
+
+    Phase2HoverBenchmarkResult {
+        positions: BENCH_HOVER_RUNS,
+        lookups,
+        hits,
+        elapsed_sec: started.elapsed().as_secs_f64(),
+    }
+}
+
 #[derive(Debug)]
 struct BenchmarkRangeResult {
     index: usize,
@@ -996,6 +2078,76 @@ struct MultiChannelEnvelopeResult {
     elapsed_sec: f64,
 }
 
+#[derive(Debug)]
+struct Phase2VisibleRunResult {
+    index: usize,
+    range: (f64, f64),
+    elapsed_sec: f64,
+    row_count: usize,
+    visible_channel_count: usize,
+    envelope_trace_count: usize,
+    dense_step_trace_count: usize,
+    raw_step_trace_count: usize,
+    edge_step_trace_count: usize,
+    raw_step_sample_count: usize,
+    draw_point_count: usize,
+    source_sample_count: usize,
+    hover_value_count: usize,
+    envelope_stats: EnvelopeCacheStats,
+}
+
+#[derive(Debug, Default)]
+struct Phase2PanCacheBenchmarkResult {
+    ranges: usize,
+    elapsed_sec: f64,
+    max_elapsed_sec: f64,
+    envelope_hits: usize,
+    envelope_misses: usize,
+    context_hits: usize,
+    context_misses: usize,
+    tile_hits: usize,
+    tile_builds: usize,
+    step_edge_hits: usize,
+    step_edge_builds: usize,
+}
+
+impl Phase2PanCacheBenchmarkResult {
+    fn avg_visible_sec(&self) -> f64 {
+        if self.ranges == 0 {
+            0.0
+        } else {
+            self.elapsed_sec / self.ranges as f64
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Phase2HoverBenchmarkResult {
+    positions: usize,
+    lookups: usize,
+    hits: usize,
+    elapsed_sec: f64,
+}
+
+impl Phase2HoverBenchmarkResult {
+    fn empty() -> Self {
+        Self {
+            positions: 0,
+            lookups: 0,
+            hits: 0,
+            elapsed_sec: 0.0,
+        }
+    }
+
+    fn avg_lookup_us(&self) -> f64 {
+        if self.lookups == 0 {
+            0.0
+        } else {
+            self.elapsed_sec * 1_000_000.0 / self.lookups as f64
+        }
+    }
+}
+
 fn benchmark_ranges(full_range: (f64, f64), run_count: usize) -> Vec<(f64, f64)> {
     let Some((start, end)) = normalized_range(full_range) else {
         return Vec::new();
@@ -1023,6 +2175,34 @@ fn benchmark_ranges(full_range: (f64, f64), run_count: usize) -> Vec<(f64, f64)>
     ranges
 }
 
+fn benchmark_pan_ranges(full_range: (f64, f64), run_count: usize) -> Vec<(f64, f64)> {
+    let Some((start, end)) = normalized_range(full_range) else {
+        return Vec::new();
+    };
+    let span = end - start;
+    if span <= 0.0 || run_count == 0 {
+        return Vec::new();
+    }
+
+    let window = (span * 0.20).max(span * 1.0e-9).min(span);
+    if window >= span || run_count == 1 {
+        return vec![(start, start + window)];
+    }
+
+    let available = span - window;
+    let requested_total_shift = window * 0.10 * run_count.saturating_sub(1) as f64;
+    let total_shift = requested_total_shift.min(available);
+    let step = total_shift / run_count.saturating_sub(1) as f64;
+    let first_left = start + (available - total_shift) * 0.5;
+
+    (0..run_count)
+        .map(|index| {
+            let left = (first_left + step * index as f64).min(end - window);
+            (left, left + window)
+        })
+        .collect()
+}
+
 fn process_rss_mib() -> Option<f64> {
     let pid = std::process::id().to_string();
     let output = std::process::Command::new("ps")
@@ -1044,8 +2224,70 @@ fn format_optional_mib(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".to_owned())
 }
 
+fn load_channel_data(
+    path: &str,
+    summary: &parquet_schema::SchemaSummary,
+    channel_path: &str,
+    needs_time: bool,
+    needs_channel: bool,
+) -> Result<LoadedChannelData, String> {
+    let time = if needs_time {
+        Some(parquet_waveform::read_time_column(path, summary)?)
+    } else {
+        None
+    };
+    let channel = if needs_channel {
+        Some(parquet_waveform::read_channel_values(
+            path,
+            summary,
+            channel_path,
+        )?)
+    } else {
+        None
+    };
+
+    if let (Some(time), Some(channel)) = (&time, &channel)
+        && time.sample_count() != channel.sample_count()
+    {
+        return Err(format!(
+            "time/value length mismatch: {} vs {}",
+            time.sample_count(),
+            channel.sample_count()
+        ));
+    }
+
+    Ok(LoadedChannelData { time, channel })
+}
+
+fn spawn_load_channel_job(
+    tx: mpsc::Sender<LoadJobResult>,
+    ctx: egui::Context,
+    job_id: u64,
+    path: String,
+    summary: parquet_schema::SchemaSummary,
+    channel_path: String,
+    needs_time: bool,
+    needs_channel: bool,
+) {
+    std::thread::spawn(move || {
+        let result = load_channel_data(&path, &summary, &channel_path, needs_time, needs_channel);
+        let _ = tx.send(LoadJobResult {
+            job_id,
+            parquet_path: path,
+            channel_path,
+            result,
+        });
+        ctx.request_repaint();
+    });
+}
+
 impl PanelYApp {
     fn load_schema(&mut self) {
+        if self.load.is_busy() {
+            self.load.status = "Wait for active load jobs before loading schema".to_owned();
+            return;
+        }
+
         match parquet_schema::read_schema_summary(&self.dataset.parquet_path) {
             Ok(summary) => {
                 let time_status = if summary.time_column.is_some() {
@@ -1076,7 +2318,7 @@ impl PanelYApp {
         }
     }
 
-    fn load_selected_channel(&mut self) {
+    fn load_selected_channel(&mut self, ctx: &egui::Context) {
         if self.view.selected_channel.is_empty() {
             self.load.status = "Select a channel before loading waveform data".to_owned();
             return;
@@ -1091,73 +2333,94 @@ impl PanelYApp {
             return;
         }
 
-        self.load.pending_jobs = 1;
-        let path = self.dataset.parquet_path.clone();
-        let selected_channel = self.view.selected_channel.clone();
-        let time_was_cached = self.dataset.shared_time.is_some();
-
-        if !time_was_cached {
-            match parquet_waveform::read_time_column(&path, &summary) {
-                Ok(time) => {
-                    self.dataset.shared_time = Some(time);
-                }
-                Err(error) => {
-                    self.load.pending_jobs = 0;
-                    self.load.error = Some(error.clone());
-                    self.load.status = format!("Time load failed: {error}");
-                    return;
-                }
-            }
-        }
-
-        let Some(shared_time) = self.dataset.shared_time.as_ref() else {
-            self.load.pending_jobs = 0;
-            self.load.status = "Time data is not available".to_owned();
+        let Some(target_row_id) = self.view.selected_row_id_or_first() else {
+            self.load.status = "Select a row before loading waveform data".to_owned();
             return;
         };
-        let time_sample_count = shared_time.sample_count();
-        let time_read_sec = shared_time.elapsed.as_secs_f64();
-
+        let path = self.dataset.parquet_path.clone();
+        let selected_channel = self.view.selected_channel.clone();
+        let channel_name = summary
+            .channels
+            .iter()
+            .find(|channel| channel.path == selected_channel)
+            .map(|channel| channel.display_name().to_owned())
+            .unwrap_or_else(|| selected_channel.clone());
+        let target_row_label = self.view.row_display_name(target_row_id);
+        let (row_added, row_id) = self
+            .view
+            .add_channel_to_row(target_row_id, &selected_channel)
+            .unwrap_or((false, target_row_id));
+        let time_was_cached = self.dataset.shared_time.is_some();
         let channel_was_cached = self.dataset.loaded_channels.has_channel(&selected_channel);
-        let channel_path = if channel_was_cached {
-            selected_channel.clone()
-        } else {
-            match parquet_waveform::read_channel_values(&path, &summary, &selected_channel) {
-                Ok(channel) => {
-                    if channel.sample_count() != time_sample_count {
-                        self.load.pending_jobs = 0;
-                        self.load.status = format!(
-                            "Waveform load failed: time/value length mismatch: {} vs {}",
-                            time_sample_count,
-                            channel.sample_count()
-                        );
-                        return;
-                    }
-                    let channel_path = channel.channel_path.clone();
-                    self.dataset.loaded_channels.insert_channel(channel);
-                    channel_path
-                }
-                Err(error) => {
-                    self.load.pending_jobs = 0;
-                    self.load.error = Some(error.clone());
-                    self.load.status = format!("Waveform load failed: {error}");
-                    return;
-                }
-            }
-        };
 
-        let Some(channel) = self.dataset.loaded_channels.channel(&channel_path) else {
-            self.load.pending_jobs = 0;
+        if time_was_cached && channel_was_cached {
+            self.finish_cached_channel_add(
+                &selected_channel,
+                &target_row_label,
+                row_added,
+                row_id,
+                true,
+            );
+            return;
+        }
+
+        if self.load.is_channel_loading(&selected_channel) {
+            let row_note = if row_added {
+                format!("queued display in {target_row_label}")
+            } else {
+                format!("already queued in {target_row_label}")
+            };
+            self.load.status = format!("Already loading: {channel_name}, {row_note}");
+            return;
+        }
+
+        let needs_time = !time_was_cached;
+        let needs_channel = !channel_was_cached;
+        let job_id = self.next_load_job_id;
+        self.next_load_job_id = self.next_load_job_id.saturating_add(1);
+        self.load.active_jobs.insert(
+            job_id,
+            ActiveLoadJob {
+                channel_path: selected_channel.clone(),
+                channel_name: channel_name.clone(),
+                target_row_id,
+                target_row_label: target_row_label.clone(),
+                time_was_cached,
+                channel_was_cached,
+                started: std::time::Instant::now(),
+            },
+        );
+        self.load.error = None;
+        self.load.status = format!("Loading: {channel_name} -> {target_row_label}");
+        self.load.refresh_progress();
+
+        spawn_load_channel_job(
+            self.load_result_tx.clone(),
+            ctx.clone(),
+            job_id,
+            path,
+            summary,
+            selected_channel,
+            needs_time,
+            needs_channel,
+        );
+    }
+
+    fn finish_cached_channel_add(
+        &mut self,
+        channel_path: &str,
+        target_row_label: &str,
+        row_added: bool,
+        row_id: u64,
+        time_was_cached: bool,
+    ) {
+        let Some(channel) = self.dataset.loaded_channels.channel(channel_path) else {
             self.load.status = format!("Loaded channel is missing from cache: {channel_path}");
             return;
         };
-
         let channel_name = channel.channel_name.clone();
-        let channel_read_sec = channel.elapsed.as_secs_f64();
         let channel_sample_count = channel.sample_count();
         let channel_memory = channel.memory_bytes();
-        let target_row_label = self.view.selected_row_display_name();
-        let (row_added, row_id) = self.view.add_channel_to_selected_row(&channel_path);
         if self.view.x_range.is_none() {
             self.view.x_range = self
                 .dataset
@@ -1165,14 +2428,7 @@ impl PanelYApp {
                 .as_ref()
                 .and_then(parquet_waveform::TimeData::time_range);
         }
-
-        self.load.pending_jobs = 0;
         self.load.error = None;
-        let cache_note = if channel_was_cached {
-            "reused cached"
-        } else {
-            "loaded"
-        };
         let row_note = if row_added {
             format!("added to {target_row_label}")
         } else {
@@ -1190,12 +2446,142 @@ impl PanelYApp {
             .map_or(0, parquet_waveform::TimeData::memory_bytes)
             + self.dataset.loaded_channels.raw_memory_bytes();
         self.load.status = format!(
-            "{cache_note}: {channel_name} ({channel_sample_count} samples, {:.1} MiB, read {:.3}s), {row_note} (id {row_id}); {time_note} {:.3}s; cache {} ch, total {:.1} MiB",
+            "reused cached: {channel_name} ({channel_sample_count} samples, {:.1} MiB), {row_note} (id {row_id}); {time_note}; cache {} ch, total {:.1} MiB",
             bytes_to_mib(channel_memory),
-            channel_read_sec,
-            time_read_sec,
             self.dataset.loaded_channels.raw_by_channel.len(),
             bytes_to_mib(total_memory)
+        );
+    }
+
+    fn drain_load_results(&mut self) {
+        while let Ok(result) = self.load_result_rx.try_recv() {
+            self.apply_load_result(result);
+        }
+    }
+
+    fn apply_load_result(&mut self, result: LoadJobResult) {
+        let Some(job) = self.load.active_jobs.remove(&result.job_id) else {
+            self.load.refresh_progress();
+            return;
+        };
+        self.load.refresh_progress();
+
+        if result.parquet_path != self.dataset.parquet_path {
+            self.load.status = format!(
+                "Ignored stale load result for {} from {}",
+                job.channel_name, result.parquet_path
+            );
+            return;
+        }
+        if result.channel_path != job.channel_path {
+            self.load.status = format!(
+                "Ignored mismatched load result: expected {}, got {}",
+                job.channel_path, result.channel_path
+            );
+            return;
+        }
+
+        match result.result {
+            Ok(loaded) => self.apply_loaded_channel(job, loaded),
+            Err(error) => {
+                self.load.error = Some(error.clone());
+                self.load.status = format!("Waveform load failed: {}: {error}", job.channel_name);
+            }
+        }
+    }
+
+    fn apply_loaded_channel(&mut self, job: ActiveLoadJob, loaded: LoadedChannelData) {
+        if let Some(time) = loaded.time {
+            if let Some(existing_time) = &self.dataset.shared_time
+                && existing_time.sample_count() != time.sample_count()
+            {
+                self.load.status = format!(
+                    "Time load failed: sample count changed: {} vs {}",
+                    existing_time.sample_count(),
+                    time.sample_count()
+                );
+                self.load.error = Some(self.load.status.clone());
+                return;
+            }
+            self.dataset.shared_time = Some(time);
+        }
+
+        let Some(shared_time) = self.dataset.shared_time.as_ref() else {
+            self.load.status = "Time data is not available".to_owned();
+            self.load.error = Some(self.load.status.clone());
+            return;
+        };
+        let time_sample_count = shared_time.sample_count();
+        let time_read_sec = shared_time.elapsed.as_secs_f64();
+
+        if let Some(channel) = loaded.channel {
+            if channel.sample_count() != time_sample_count {
+                self.load.status = format!(
+                    "Waveform load failed: time/value length mismatch: {} vs {}",
+                    time_sample_count,
+                    channel.sample_count()
+                );
+                self.load.error = Some(self.load.status.clone());
+                return;
+            }
+            if !self
+                .dataset
+                .loaded_channels
+                .has_channel(&channel.channel_path)
+            {
+                self.dataset.loaded_channels.insert_channel(channel);
+            }
+        }
+
+        let Some(channel) = self.dataset.loaded_channels.channel(&job.channel_path) else {
+            self.load.status =
+                format!("Loaded channel is missing from cache: {}", job.channel_path);
+            self.load.error = Some(self.load.status.clone());
+            return;
+        };
+
+        let channel_name = channel.channel_name.clone();
+        let channel_read_sec = channel.elapsed.as_secs_f64();
+        let channel_sample_count = channel.sample_count();
+        let channel_memory = channel.memory_bytes();
+        let (row_added, row_id) = self
+            .view
+            .add_channel_to_row(job.target_row_id, &job.channel_path)
+            .unwrap_or((false, job.target_row_id));
+        if self.view.x_range.is_none() {
+            self.view.x_range = shared_time.time_range();
+        }
+
+        self.load.error = None;
+        let cache_note = if job.channel_was_cached {
+            "reused cached"
+        } else {
+            "loaded"
+        };
+        let row_note = if row_added {
+            format!("added to {}", job.target_row_label)
+        } else {
+            format!("already in {}", job.target_row_label)
+        };
+        let time_note = if job.time_was_cached {
+            "time cached".to_owned()
+        } else {
+            format!("time loaded {:.3}s", time_read_sec)
+        };
+        let total_memory = self
+            .dataset
+            .shared_time
+            .as_ref()
+            .map_or(0, parquet_waveform::TimeData::memory_bytes)
+            + self.dataset.loaded_channels.raw_memory_bytes();
+        let elapsed_sec = job.started.elapsed().as_secs_f64();
+        self.load.status = format!(
+            "{cache_note}: {channel_name} ({channel_sample_count} samples, {:.1} MiB, read {:.3}s), {row_note} (id {row_id}); {time_note}; cache {} ch, total {:.1} MiB; background {:.3}s",
+            bytes_to_mib(channel_memory),
+            channel_read_sec,
+            self.dataset.loaded_channels.raw_by_channel.len(),
+            bytes_to_mib(total_memory),
+            elapsed_sec
         );
     }
 
@@ -1208,12 +2594,67 @@ impl PanelYApp {
         self.dataset.loaded_channels.clear_envelope_cache();
     }
 
+    fn should_use_interaction_preview(&self) -> bool {
+        if !self.view.large_preview_enabled || !self.interaction.preview_active() {
+            return false;
+        }
+
+        let Some(shared_time) = self.dataset.shared_time.as_ref() else {
+            return false;
+        };
+        let Some(full_range) = shared_time.time_range() else {
+            return false;
+        };
+        let min_span = min_view_span(full_range, shared_time.sample_count());
+        let view_range = clamp_view_range(
+            self.view.x_range.unwrap_or(full_range),
+            full_range,
+            min_span,
+        );
+        let Some(sample_range) =
+            visible_sample_range(&shared_time.time, shared_time.sample_count(), view_range)
+        else {
+            return false;
+        };
+        let (line_channels, step_channels) = self.visible_loaded_draw_mode_counts();
+
+        preview_needed_for_workload(
+            shared_time.sample_count(),
+            sample_range.source_sample_count,
+            line_channels,
+            step_channels,
+        )
+    }
+
+    fn visible_loaded_draw_mode_counts(&self) -> (usize, usize) {
+        self.view
+            .rows
+            .iter()
+            .flat_map(|row| row.channels.iter())
+            .filter(|channel| {
+                channel.visible
+                    && self
+                        .dataset
+                        .loaded_channels
+                        .has_channel(&channel.channel_path)
+            })
+            .fold((0usize, 0usize), |(line, step), channel| {
+                match channel.draw_mode {
+                    DrawMode::Line => (line + 1, step),
+                    DrawMode::Step => (line, step + 1),
+                }
+            })
+    }
+
     fn visible_row_traces(
         &mut self,
         requested_bucket_count: usize,
         dark_mode: bool,
+        preview: bool,
     ) -> Vec<VisibleRowTrace> {
         let rows = self.view.rows.clone();
+        let loading_channel_paths = self.load.loading_channel_paths();
+        self.dataset.loaded_channels.begin_envelope_frame();
         if rows.is_empty() {
             return Vec::new();
         }
@@ -1226,6 +2667,18 @@ impl PanelYApp {
                     row_id: row.id,
                     row_index,
                     row_channel_count: row.channels.len(),
+                    loading_channel_count: row_missing_channel_counts(
+                        &row,
+                        None,
+                        &loading_channel_paths,
+                    )
+                    .0,
+                    unloaded_channel_count: row_missing_channel_counts(
+                        &row,
+                        None,
+                        &loading_channel_paths,
+                    )
+                    .1,
                     y_range: row.y_range,
                     traces: Vec::new(),
                 })
@@ -1241,6 +2694,18 @@ impl PanelYApp {
                     row_id: row.id,
                     row_index,
                     row_channel_count: row.channels.len(),
+                    loading_channel_count: row_missing_channel_counts(
+                        &row,
+                        Some(&self.dataset.loaded_channels),
+                        &loading_channel_paths,
+                    )
+                    .0,
+                    unloaded_channel_count: row_missing_channel_counts(
+                        &row,
+                        Some(&self.dataset.loaded_channels),
+                        &loading_channel_paths,
+                    )
+                    .1,
                     y_range: row.y_range,
                     traces: Vec::new(),
                 })
@@ -1263,6 +2728,7 @@ impl PanelYApp {
         let mut built_count = 0usize;
         let mut exact_step_count = 0usize;
         let mut edge_step_count = 0usize;
+        let mut dense_step_count = 0usize;
         let hover_x = self.view.hover_x;
         {
             let dataset = &mut self.dataset;
@@ -1271,11 +2737,19 @@ impl PanelYApp {
             };
             let time_values = &shared_time.time;
             let loaded_channels = &mut dataset.loaded_channels;
-            loaded_channels.prepare_envelope_context(view_range, requested_bucket_count);
+            loaded_channels.prepare_envelope_context(
+                time_values,
+                shared_time.sample_count(),
+                view_range,
+                full_range,
+                requested_bucket_count,
+            );
 
             for (row_index, row) in rows.into_iter().enumerate() {
                 let mut traces = Vec::with_capacity(row.channels.len());
                 let row_channel_count = row.channels.len();
+                let mut loading_channel_count = 0usize;
+                let mut unloaded_channel_count = 0usize;
                 for row_channel in row.channels {
                     if !row_channel.visible {
                         continue;
@@ -1291,6 +2765,11 @@ impl PanelYApp {
                             )
                         })
                     else {
+                        if loading_channel_paths.contains(&row_channel.channel_path) {
+                            loading_channel_count += 1;
+                        } else {
+                            unloaded_channel_count += 1;
+                        }
                         continue;
                     };
 
@@ -1301,6 +2780,7 @@ impl PanelYApp {
                                 time_values,
                                 view_range,
                                 requested_bucket_count,
+                                true,
                             ) else {
                                 continue;
                             };
@@ -1310,7 +2790,36 @@ impl PanelYApp {
                             VisibleTraceData::Envelope(envelope)
                         }
                         DrawMode::Step => {
-                            if let Some(raw_step) =
+                            let sample_range =
+                                visible_sample_range(time_values, sample_count, view_range);
+                            let use_preview_envelope = preview
+                                && sample_range.is_some_and(|range| {
+                                    range.draw_sample_count > MAX_EXACT_STEP_SAMPLES
+                                });
+                            let use_hint_fallback = sample_range.is_some_and(|range| {
+                                loaded_channels.should_skip_step_change_points(
+                                    &channel_path,
+                                    view_range,
+                                    range.source_sample_count,
+                                )
+                            });
+
+                            if use_preview_envelope || use_hint_fallback {
+                                dense_step_count += 1;
+                                let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
+                                    &channel_path,
+                                    time_values,
+                                    view_range,
+                                    requested_bucket_count,
+                                    false,
+                                ) else {
+                                    continue;
+                                };
+                                if was_built {
+                                    built_count += 1;
+                                }
+                                VisibleTraceData::DenseStepEnvelope(envelope)
+                            } else if let Some(raw_step) =
                                 loaded_channels.channel(&channel_path).and_then(|channel| {
                                     build_raw_step_trace(
                                         time_values,
@@ -1322,31 +2831,65 @@ impl PanelYApp {
                             {
                                 exact_step_count += 1;
                                 VisibleTraceData::RawStep(raw_step)
-                            } else if let Some(edge_step) =
-                                loaded_channels.channel(&channel_path).and_then(|channel| {
-                                    build_change_point_step_trace(
-                                        time_values,
-                                        &channel.values,
-                                        view_range,
-                                        MAX_STEP_CHANGE_POINTS,
-                                    )
-                                })
-                            {
-                                edge_step_count += 1;
-                                VisibleTraceData::RawStep(edge_step)
-                            } else {
-                                let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
+                            } else if let Some(step_result) = loaded_channels
+                                .cached_change_point_step_trace_result(
                                     &channel_path,
                                     time_values,
                                     view_range,
-                                    requested_bucket_count,
-                                ) else {
-                                    continue;
-                                };
-                                if was_built {
-                                    built_count += 1;
+                                    MAX_STEP_CHANGE_POINTS,
+                                )
+                            {
+                                match step_result {
+                                    StepTraceBuildResult::Trace(edge_step) => {
+                                        edge_step_count += 1;
+                                        VisibleTraceData::RawStep(edge_step)
+                                    }
+                                    StepTraceBuildResult::TooManyChangePoints {
+                                        source_sample_count,
+                                    } => {
+                                        loaded_channels.record_step_change_point_fallback(
+                                            &channel_path,
+                                            view_range,
+                                            source_sample_count,
+                                        );
+                                        dense_step_count += 1;
+                                        let Some((envelope, was_built)) = loaded_channels
+                                            .ensure_envelope(
+                                                &channel_path,
+                                                time_values,
+                                                view_range,
+                                                requested_bucket_count,
+                                                false,
+                                            )
+                                        else {
+                                            continue;
+                                        };
+                                        if was_built {
+                                            built_count += 1;
+                                        }
+                                        VisibleTraceData::DenseStepEnvelope(envelope)
+                                    }
+                                    StepTraceBuildResult::Empty => {
+                                        dense_step_count += 1;
+                                        let Some((envelope, was_built)) = loaded_channels
+                                            .ensure_envelope(
+                                                &channel_path,
+                                                time_values,
+                                                view_range,
+                                                requested_bucket_count,
+                                                false,
+                                            )
+                                        else {
+                                            continue;
+                                        };
+                                        if was_built {
+                                            built_count += 1;
+                                        }
+                                        VisibleTraceData::DenseStepEnvelope(envelope)
+                                    }
                                 }
-                                VisibleTraceData::Envelope(envelope)
+                            } else {
+                                continue;
                             }
                         }
                     };
@@ -1380,6 +2923,8 @@ impl PanelYApp {
                     row_id: row.id,
                     row_index,
                     row_channel_count,
+                    loading_channel_count,
+                    unloaded_channel_count,
                     y_range: row.y_range,
                     traces,
                 });
@@ -1404,7 +2949,7 @@ impl PanelYApp {
             }
         }
 
-        if built_count > 0 || exact_step_count > 0 || edge_step_count > 0 {
+        if built_count > 0 || exact_step_count > 0 || edge_step_count > 0 || dense_step_count > 0 {
             let visible_channel_count = visible_rows
                 .iter()
                 .map(|row| row.traces.len())
@@ -1415,8 +2960,10 @@ impl PanelYApp {
                 .next()
                 .map(trace_source_sample_count)
                 .unwrap_or_default();
+            let envelope_stats = self.dataset.loaded_channels.last_envelope_stats;
+            let quality = if preview { "preview" } else { "full" };
             self.load.status = format!(
-                "View {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, cache {}",
+                "{quality} view {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, dense step {}, env h/m {}/{}, ctx {}/{}, clips {}, tile h/b {}/{}, edge h/b {}/{}, cache {}, edge cache {}, hints {}",
                 view_range.0,
                 view_range.1,
                 visible_rows.len(),
@@ -1425,7 +2972,19 @@ impl PanelYApp {
                 built_count,
                 exact_step_count,
                 edge_step_count,
-                self.dataset.loaded_channels.envelope_cache.len()
+                dense_step_count,
+                envelope_stats.hits,
+                envelope_stats.misses,
+                envelope_stats.context_hits,
+                envelope_stats.context_misses,
+                envelope_stats.clipped,
+                envelope_stats.tile_hits,
+                envelope_stats.tile_builds,
+                envelope_stats.step_edge_hits,
+                envelope_stats.step_edge_builds,
+                self.dataset.loaded_channels.envelope_cache.len(),
+                self.dataset.loaded_channels.step_edge_cache.len(),
+                self.dataset.loaded_channels.step_fallback_hints.len()
             );
         }
 
@@ -1516,7 +3075,8 @@ impl PanelYApp {
 
         if changed && next_range != current_range {
             self.view.x_range = Some(next_range);
-            self.dataset.loaded_channels.clear_envelope_cache();
+            self.interaction.mark_range_changed();
+            ui.ctx().request_repaint_after(INTERACTION_PREVIEW_SETTLE);
         }
 
         let next_hover_x = time_at_plot_x(pointer_pos.x, plot_rect, next_range);
@@ -1529,6 +3089,11 @@ impl PanelYApp {
 
 impl eframe::App for PanelYApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let frame_started = Instant::now();
+        self.drain_load_results();
+        let load_active = self.load.is_busy();
+        let loading_channel_paths = self.load.loading_channel_paths();
+
         egui::Panel::top("top_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Panel_y Rust Phase 2");
@@ -1536,7 +3101,16 @@ impl eframe::App for PanelYApp {
                 ui.label(&self.load.status);
                 if self.load.pending_jobs > 0 {
                     ui.separator();
+                    ui.add(egui::Spinner::new());
                     ui.label(format!("jobs: {}", self.load.pending_jobs));
+                }
+                if let Some(progress) = &self.load.progress {
+                    ui.separator();
+                    ui.label(progress);
+                }
+                if self.perf.show {
+                    ui.separator();
+                    ui.monospace(self.perf.summary());
                 }
             });
         });
@@ -1551,10 +3125,16 @@ impl eframe::App for PanelYApp {
                     .show(ui, |ui| {
                         ui.heading("Dataset");
                         ui.label("Parquet path");
-                        ui.text_edit_singleline(&mut self.dataset.parquet_path);
+                        ui.add_enabled(
+                            !load_active,
+                            egui::TextEdit::singleline(&mut self.dataset.parquet_path),
+                        );
 
                         ui.add_space(12.0);
-                        if ui.button("Load Schema").clicked() {
+                        if ui
+                            .add_enabled(!load_active, egui::Button::new("Load Schema"))
+                            .clicked()
+                        {
                             self.load_schema();
                         }
 
@@ -1568,7 +3148,7 @@ impl eframe::App for PanelYApp {
                             .add_enabled(can_load_waveform, egui::Button::new(add_channel_label))
                             .clicked()
                         {
-                            self.load_selected_channel();
+                            self.load_selected_channel(ui.ctx());
                         }
 
                         ui.add_space(16.0);
@@ -1590,10 +3170,20 @@ impl eframe::App for PanelYApp {
                             if let Some((start, end)) = self.view.x_range {
                                 ui.monospace(format!("x: {start:.6} .. {end:.6} s"));
                             }
+                            ui.checkbox(&mut self.perf.show, "Frame timing");
+                            ui.checkbox(&mut self.view.large_preview_enabled, "Emergency preview")
+                                .on_hover_text(
+                                    "Debug option: temporarily reduces quality only while interacting with very large visible ranges",
+                                );
                         }
 
                         draw_channel_cache_controls(ui, &self.dataset);
-                        if draw_row_controls(ui, &mut self.view, self.dataset.schema.as_ref()) {
+                        if draw_row_controls(
+                            ui,
+                            &mut self.view,
+                            self.dataset.schema.as_ref(),
+                            &loading_channel_paths,
+                        ) {
                             self.dataset.loaded_channels.clear_envelope_cache();
                         }
                     });
@@ -1628,10 +3218,22 @@ impl eframe::App for PanelYApp {
                         .map(visible_envelope_bucket_count)
                         .unwrap_or(MIN_VISIBLE_ENVELOPE_BUCKETS);
 
+                    let interaction_started = Instant::now();
                     self.handle_plot_interaction(ui, &response, &plot_rects);
-                    let visible_rows =
-                        self.visible_row_traces(requested_buckets, ui.visuals().dark_mode);
+                    let interaction_elapsed = interaction_started.elapsed();
 
+                    let preview = self.should_use_interaction_preview();
+                    let effective_buckets = if preview {
+                        preview_envelope_bucket_count(requested_buckets)
+                    } else {
+                        requested_buckets
+                    };
+                    let visible_started = Instant::now();
+                    let visible_rows =
+                        self.visible_row_traces(effective_buckets, ui.visuals().dark_mode, preview);
+                    let visible_elapsed = visible_started.elapsed();
+
+                    let draw_started = Instant::now();
                     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
                     for (index, row_rect) in row_rects.iter().copied().enumerate() {
                         let Some(plot_rect) = plot_rects.get(index).copied() else {
@@ -1653,6 +3255,16 @@ impl eframe::App for PanelYApp {
                                     ui.visuals(),
                                     &row.traces,
                                     row.y_range,
+                                );
+                            }
+                            Some(row) if row.loading_channel_count > 0 => {
+                                draw_status_label(&painter, plot_rect, "Loading waveform data...");
+                            }
+                            Some(row) if row.unloaded_channel_count > 0 => {
+                                draw_status_label(
+                                    &painter,
+                                    plot_rect,
+                                    "Waveform data is not loaded",
                                 );
                             }
                             Some(row) if row.row_channel_count > 0 => {
@@ -1686,6 +3298,21 @@ impl eframe::App for PanelYApp {
                             );
                         }
                     }
+                    let draw_elapsed = draw_started.elapsed();
+                    let envelope_stats = self.dataset.loaded_channels.last_envelope_stats;
+                    self.perf.update(
+                        FrameTiming {
+                            frame: frame_started.elapsed(),
+                            interaction: interaction_elapsed,
+                            visible: visible_elapsed,
+                            draw: draw_elapsed,
+                        },
+                        &visible_rows,
+                        requested_buckets,
+                        effective_buckets,
+                        preview,
+                        envelope_stats,
+                    );
                 });
         });
     }
@@ -1802,6 +3429,29 @@ fn draw_channel_cache_controls(ui: &mut egui::Ui, dataset: &DatasetState) {
         dataset.loaded_channels.raw_by_channel.len(),
         bytes_to_mib(dataset.loaded_channels.raw_memory_bytes())
     ));
+    if !dataset.loaded_channels.line_tile_cache.is_empty() {
+        ui.label(format!(
+            "Line tiles: {} cached ({:.1} MiB, build {:.3}s)",
+            dataset.loaded_channels.line_tile_cache.len(),
+            bytes_to_mib(dataset.loaded_channels.line_tile_memory_bytes()),
+            dataset.loaded_channels.line_tile_build_seconds()
+        ));
+    }
+    if !dataset.loaded_channels.step_edge_cache.is_empty() {
+        let edge_count = dataset
+            .loaded_channels
+            .step_edge_cache
+            .values()
+            .map(StepEdgeCache::edge_count)
+            .sum::<usize>();
+        ui.label(format!(
+            "Step edges: {} cached, {} edges ({:.1} MiB, build {:.3}s)",
+            dataset.loaded_channels.step_edge_cache.len(),
+            edge_count,
+            bytes_to_mib(dataset.loaded_channels.step_edge_memory_bytes()),
+            dataset.loaded_channels.step_edge_build_seconds()
+        ));
+    }
     for channel in dataset.loaded_channels.raw_by_channel.values() {
         let file_name = channel
             .path
@@ -1822,6 +3472,7 @@ fn draw_row_controls(
     ui: &mut egui::Ui,
     view: &mut ViewState,
     schema: Option<&parquet_schema::SchemaSummary>,
+    loading_channel_paths: &BTreeSet<String>,
 ) -> bool {
     ui.add_space(16.0);
     ui.heading("Rows");
@@ -1843,6 +3494,10 @@ fn draw_row_controls(
 
     for (row_index, row) in view.rows.iter_mut().enumerate() {
         ui.separator();
+        let row_has_loading_channel = row
+            .channels
+            .iter()
+            .any(|channel| loading_channel_paths.contains(&channel.channel_path));
         ui.horizontal(|ui| {
             let row_label = format!("Row {}", row_index + 1);
             if ui
@@ -1852,7 +3507,10 @@ fn draw_row_controls(
                 selected_row_id = Some(row.id);
             }
             if ui
-                .add_enabled(can_delete_row, egui::Button::new("Delete"))
+                .add_enabled(
+                    can_delete_row && !row_has_loading_channel,
+                    egui::Button::new("Delete"),
+                )
                 .clicked()
             {
                 remove_row_id = Some(row.id);
@@ -1874,6 +3532,7 @@ fn draw_row_controls(
                 ("channel_style", row.id, channel.channel_path.clone()),
                 |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        let channel_loading = loading_channel_paths.contains(&channel.channel_path);
                         if ui
                             .checkbox(&mut channel.visible, "")
                             .on_hover_text("Visible")
@@ -1894,7 +3553,15 @@ fn draw_row_controls(
                             changed = true;
                         }
 
-                        ui.label(channel_display_name(schema, &channel.channel_path));
+                        let label = if channel_loading {
+                            format!(
+                                "{} (loading)",
+                                channel_display_name(schema, &channel.channel_path)
+                            )
+                        } else {
+                            channel_display_name(schema, &channel.channel_path)
+                        };
+                        ui.label(label);
                         egui::ComboBox::from_id_salt("draw_mode")
                             .selected_text(channel.draw_mode.as_str())
                             .show_ui(ui, |ui| {
@@ -1935,7 +3602,10 @@ fn draw_row_controls(
                             changed = true;
                         }
 
-                        if ui.small_button("Remove").clicked() {
+                        if ui
+                            .add_enabled(!channel_loading, egui::Button::new("Remove"))
+                            .clicked()
+                        {
                             remove_channel = Some(channel.channel_path.clone());
                         }
                     });
@@ -2177,7 +3847,8 @@ fn draw_waveform_traces(
         let line_stroke = egui::Stroke::new(line_width, visible.color);
 
         match &visible.data {
-            VisibleTraceData::Envelope(envelope) => {
+            VisibleTraceData::Envelope(envelope)
+            | VisibleTraceData::DenseStepEnvelope(envelope) => {
                 let mut upper = Vec::with_capacity(envelope.buckets.len());
                 let mut lower = Vec::with_capacity(envelope.buckets.len());
                 for bucket in &envelope.buckets {
@@ -2250,14 +3921,18 @@ fn draw_raw_step_trace(
 
 fn trace_time_range(trace: &VisibleTrace) -> Option<(f64, f64)> {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.time_range,
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.time_range
+        }
         VisibleTraceData::RawStep(raw_step) => raw_step.time_range,
     }
 }
 
 fn trace_value_range(trace: &VisibleTrace) -> Option<(f64, f64)> {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.value_range,
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.value_range
+        }
         VisibleTraceData::RawStep(raw_step) => raw_step.value_range,
     }
 }
@@ -2295,21 +3970,27 @@ fn normalized_y_range(min: f64, max: f64) -> Option<(f64, f64)> {
 
 fn trace_source_sample_count(trace: &VisibleTrace) -> usize {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.source_sample_count,
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.source_sample_count
+        }
         VisibleTraceData::RawStep(raw_step) => raw_step.source_sample_count,
     }
 }
 
 fn trace_bucket_count(trace: &VisibleTrace) -> usize {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.bucket_count(),
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.bucket_count()
+        }
         VisibleTraceData::RawStep(_) => 0,
     }
 }
 
 fn trace_draw_point_count(trace: &VisibleTrace) -> usize {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.draw_point_count(),
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.draw_point_count()
+        }
         VisibleTraceData::RawStep(raw_step) => raw_step.samples.len().saturating_mul(2),
     }
 }
@@ -2317,13 +3998,40 @@ fn trace_draw_point_count(trace: &VisibleTrace) -> usize {
 fn trace_step_kind(trace: &VisibleTrace) -> Option<StepTraceKind> {
     match &trace.data {
         VisibleTraceData::RawStep(raw_step) => Some(raw_step.kind),
-        VisibleTraceData::Envelope(_) => None,
+        VisibleTraceData::Envelope(_) | VisibleTraceData::DenseStepEnvelope(_) => None,
     }
 }
 
 fn visible_envelope_bucket_count(rect: egui::Rect) -> usize {
     (rect.width().round() as usize)
         .clamp(MIN_VISIBLE_ENVELOPE_BUCKETS, MAX_VISIBLE_ENVELOPE_BUCKETS)
+}
+
+fn preview_envelope_bucket_count(requested_bucket_count: usize) -> usize {
+    (requested_bucket_count / PREVIEW_BUCKET_DIVISOR)
+        .max(MIN_VISIBLE_ENVELOPE_BUCKETS)
+        .min(MAX_PREVIEW_ENVELOPE_BUCKETS)
+}
+
+fn preview_needed_for_workload(
+    dataset_sample_count: usize,
+    visible_source_sample_count: usize,
+    line_channel_count: usize,
+    step_channel_count: usize,
+) -> bool {
+    if dataset_sample_count < PREVIEW_MIN_DATASET_SAMPLES {
+        return false;
+    }
+
+    let line_sample_work = visible_source_sample_count.saturating_mul(line_channel_count);
+    line_sample_work >= PREVIEW_MIN_VISIBLE_LINE_SAMPLE_WORK
+        || (step_channel_count > 0
+            && visible_source_sample_count >= PREVIEW_MIN_VISIBLE_STEP_SAMPLES)
+}
+
+fn should_use_line_tile_lod(plan: &parquet_waveform::MinMaxEnvelopePlan) -> bool {
+    plan.source_sample_count >= LINE_TILE_MIN_SOURCE_SAMPLES
+        && plan.bucket_size >= LINE_TILE_MIN_BUCKET_SIZE
 }
 
 fn channel_color(index: usize, dark_mode: bool) -> egui::Color32 {
@@ -2399,16 +4107,21 @@ fn draw_axis_labels(
         .iter()
         .filter(|visible| trace_step_kind(visible) == Some(StepTraceKind::ChangePoints))
         .count();
+    let dense_step_count = visible_traces
+        .iter()
+        .filter(|visible| matches!(&visible.data, VisibleTraceData::DenseStepEnvelope(_)))
+        .count();
 
     painter.text(
         rect.left_top() + egui::vec2(0.0, -16.0),
         egui::Align2::LEFT_TOP,
         format!(
-            "{}  ch={}  step={}  edge={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
+            "{}  ch={}  step={}  edge={}  dense={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
             channel_label,
             visible_traces.len(),
             step_count,
             edge_step_count,
+            dense_step_count,
             source_sample_count,
             raw_sample_count,
             bucket_count,
@@ -2780,6 +4493,10 @@ fn bytes_to_mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
 fn padded_range(min: f64, max: f64) -> (f64, f64) {
     if min == max {
         let pad = min.abs().max(1.0) * 0.05;
@@ -2801,46 +4518,58 @@ fn extend_range(range: Option<(f64, f64)>, value: f64) -> Option<(f64, f64)> {
     }
 }
 
+fn visible_sample_range(
+    time: &[f64],
+    value_count: usize,
+    time_range: (f64, f64),
+) -> Option<VisibleSampleRange> {
+    let (range_start, range_end) = normalized_range(time_range)?;
+    let sample_count = time.len().min(value_count);
+    if sample_count == 0 {
+        return None;
+    }
+
+    let time = &time[..sample_count];
+    let start = time.partition_point(|time| *time < range_start);
+    let end = time.partition_point(|time| *time <= range_end);
+    let context_start = start.saturating_sub(usize::from(start > 0));
+    Some(VisibleSampleRange {
+        range_start,
+        range_end,
+        start,
+        end,
+        context_start,
+        source_sample_count: end.saturating_sub(start),
+        draw_sample_count: end.saturating_sub(context_start),
+    })
+}
+
 fn build_raw_step_trace(
     time: &[f64],
     values: &[f32],
     time_range: (f64, f64),
     max_samples: usize,
 ) -> Option<RawStepTrace> {
-    let (range_start, range_end) = normalized_range(time_range)?;
-    let sample_count = time.len().min(values.len());
-    if sample_count == 0 {
+    let sample_range = visible_sample_range(time, values.len(), time_range)?;
+    if sample_range.draw_sample_count == 0 || sample_range.draw_sample_count > max_samples {
         return None;
     }
 
-    let start = time
-        .partition_point(|time| *time < range_start)
-        .min(sample_count);
-    let end = time
-        .partition_point(|time| *time <= range_end)
-        .min(sample_count);
-    let context_start = start.saturating_sub(usize::from(start > 0));
-    let source_sample_count = end.saturating_sub(start);
-    let draw_sample_count = end.saturating_sub(context_start);
-    if draw_sample_count == 0 || draw_sample_count > max_samples {
-        return None;
-    }
-
-    let mut samples = Vec::with_capacity(draw_sample_count);
+    let mut samples = Vec::with_capacity(sample_range.draw_sample_count);
     let mut value_range = None;
 
-    if context_start < start {
-        let value = values[context_start];
+    if sample_range.context_start < sample_range.start {
+        let value = values[sample_range.context_start];
         if value.is_finite() {
             samples.push(StepSample {
-                time: range_start,
+                time: sample_range.range_start,
                 value,
             });
             value_range = extend_range(value_range, f64::from(value));
         }
     }
 
-    for index in start..end {
+    for index in sample_range.start..sample_range.end {
         let sample_time = time[index];
         let value = values[index];
         if !sample_time.is_finite() || !value.is_finite() {
@@ -2848,7 +4577,7 @@ fn build_raw_step_trace(
         }
 
         samples.push(StepSample {
-            time: sample_time.clamp(range_start, range_end),
+            time: sample_time.clamp(sample_range.range_start, sample_range.range_end),
             value,
         });
         value_range = extend_range(value_range, f64::from(value));
@@ -2860,35 +4589,38 @@ fn build_raw_step_trace(
 
     Some(RawStepTrace {
         samples,
-        source_sample_count,
-        time_range: Some((range_start, range_end)),
+        source_sample_count: sample_range.source_sample_count,
+        time_range: Some((sample_range.range_start, sample_range.range_end)),
         value_range,
         kind: StepTraceKind::RawSamples,
     })
 }
 
+#[cfg(test)]
 fn build_change_point_step_trace(
     time: &[f64],
     values: &[f32],
     time_range: (f64, f64),
     max_change_points: usize,
 ) -> Option<RawStepTrace> {
-    let (range_start, range_end) = normalized_range(time_range)?;
-    let sample_count = time.len().min(values.len());
-    if sample_count == 0 {
-        return None;
+    match build_change_point_step_trace_result(time, values, time_range, max_change_points) {
+        StepTraceBuildResult::Trace(trace) => Some(trace),
+        StepTraceBuildResult::TooManyChangePoints { .. } | StepTraceBuildResult::Empty => None,
     }
+}
 
-    let start = time
-        .partition_point(|time| *time < range_start)
-        .min(sample_count);
-    let end = time
-        .partition_point(|time| *time <= range_end)
-        .min(sample_count);
-    let context_start = start.saturating_sub(usize::from(start > 0));
-    let source_sample_count = end.saturating_sub(start);
-    if end.saturating_sub(context_start) == 0 {
-        return None;
+#[cfg(test)]
+fn build_change_point_step_trace_result(
+    time: &[f64],
+    values: &[f32],
+    time_range: (f64, f64),
+    max_change_points: usize,
+) -> StepTraceBuildResult {
+    let Some(sample_range) = visible_sample_range(time, values.len(), time_range) else {
+        return StepTraceBuildResult::Empty;
+    };
+    if sample_range.draw_sample_count == 0 {
+        return StepTraceBuildResult::Empty;
     }
 
     let mut samples = Vec::new();
@@ -2896,11 +4628,11 @@ fn build_change_point_step_trace(
     let mut previous_value = None;
     let mut change_points = 0usize;
 
-    if context_start < start {
-        let value = values[context_start];
+    if sample_range.context_start < sample_range.start {
+        let value = values[sample_range.context_start];
         if value.is_finite() {
             samples.push(StepSample {
-                time: range_start,
+                time: sample_range.range_start,
                 value,
             });
             value_range = extend_range(value_range, f64::from(value));
@@ -2908,7 +4640,7 @@ fn build_change_point_step_trace(
         }
     }
 
-    for index in start..end {
+    for index in sample_range.start..sample_range.end {
         let sample_time = time[index];
         let value = values[index];
         if !sample_time.is_finite() || !value.is_finite() {
@@ -2920,10 +4652,12 @@ fn build_change_point_step_trace(
             Some(previous) if previous == value => {}
             Some(_) => {
                 if change_points >= max_change_points {
-                    return None;
+                    return StepTraceBuildResult::TooManyChangePoints {
+                        source_sample_count: sample_range.source_sample_count,
+                    };
                 }
                 samples.push(StepSample {
-                    time: sample_time.clamp(range_start, range_end),
+                    time: sample_time.clamp(sample_range.range_start, sample_range.range_end),
                     value,
                 });
                 previous_value = Some(value);
@@ -2931,7 +4665,7 @@ fn build_change_point_step_trace(
             }
             None => {
                 samples.push(StepSample {
-                    time: sample_time.clamp(range_start, range_end),
+                    time: sample_time.clamp(sample_range.range_start, sample_range.range_end),
                     value,
                 });
                 previous_value = Some(value);
@@ -2940,13 +4674,114 @@ fn build_change_point_step_trace(
     }
 
     if samples.is_empty() || value_range.is_none() {
-        return None;
+        return StepTraceBuildResult::Empty;
     }
 
-    Some(RawStepTrace {
+    StepTraceBuildResult::Trace(RawStepTrace {
         samples,
-        source_sample_count,
-        time_range: Some((range_start, range_end)),
+        source_sample_count: sample_range.source_sample_count,
+        time_range: Some((sample_range.range_start, sample_range.range_end)),
+        value_range,
+        kind: StepTraceKind::ChangePoints,
+    })
+}
+
+fn build_step_edge_cache(time: &[f64], values: &[f32]) -> StepEdgeCache {
+    let started = Instant::now();
+    let sample_count = time.len().min(values.len());
+    let mut edges = Vec::new();
+    let mut previous_value = None;
+
+    for index in 0..sample_count {
+        let sample_time = time[index];
+        let value = values[index];
+        if !sample_time.is_finite() || !value.is_finite() {
+            continue;
+        }
+
+        match previous_value {
+            Some(previous) if previous == value => {}
+            _ => {
+                edges.push(StepEdge {
+                    index,
+                    time: sample_time,
+                    value,
+                });
+                previous_value = Some(value);
+            }
+        }
+    }
+
+    StepEdgeCache {
+        sample_count,
+        edges,
+        elapsed: started.elapsed(),
+    }
+}
+
+fn build_change_point_step_trace_from_cache(
+    time: &[f64],
+    edge_cache: &StepEdgeCache,
+    time_range: (f64, f64),
+    max_change_points: usize,
+) -> StepTraceBuildResult {
+    let Some(sample_range) = visible_sample_range(time, edge_cache.sample_count, time_range) else {
+        return StepTraceBuildResult::Empty;
+    };
+    if sample_range.draw_sample_count == 0 || edge_cache.edges.is_empty() {
+        return StepTraceBuildResult::Empty;
+    }
+
+    let edge_start = edge_cache
+        .edges
+        .partition_point(|edge| edge.time < sample_range.range_start);
+    let edge_end = edge_cache
+        .edges
+        .partition_point(|edge| edge.time <= sample_range.range_end);
+    let visible_edge_count = edge_end.saturating_sub(edge_start);
+    let has_context = edge_start > 0;
+    let change_points = if has_context {
+        visible_edge_count
+    } else {
+        visible_edge_count.saturating_sub(1)
+    };
+
+    if change_points > max_change_points {
+        return StepTraceBuildResult::TooManyChangePoints {
+            source_sample_count: sample_range.source_sample_count,
+        };
+    }
+
+    let mut samples = Vec::with_capacity(visible_edge_count + usize::from(has_context));
+    let mut value_range = None;
+
+    if has_context {
+        let edge = edge_cache.edges[edge_start - 1];
+        samples.push(StepSample {
+            time: sample_range.range_start,
+            value: edge.value,
+        });
+        value_range = extend_range(value_range, f64::from(edge.value));
+    }
+
+    for edge in &edge_cache.edges[edge_start..edge_end] {
+        samples.push(StepSample {
+            time: edge
+                .time
+                .clamp(sample_range.range_start, sample_range.range_end),
+            value: edge.value,
+        });
+        value_range = extend_range(value_range, f64::from(edge.value));
+    }
+
+    if samples.is_empty() || value_range.is_none() {
+        return StepTraceBuildResult::Empty;
+    }
+
+    StepTraceBuildResult::Trace(RawStepTrace {
+        samples,
+        source_sample_count: sample_range.source_sample_count,
+        time_range: Some((sample_range.range_start, sample_range.range_end)),
         value_range,
         kind: StepTraceKind::ChangePoints,
     })
@@ -3033,6 +4868,51 @@ fn range_with_start(start: f64, span: f64, full_range: (f64, f64)) -> (f64, f64)
 
     let start = start.clamp(full_start, full_end - span);
     (start, start + span)
+}
+
+fn overscan_cache_range(view_range: (f64, f64), full_range: (f64, f64)) -> Option<(f64, f64)> {
+    let (view_start, view_end) = normalized_range(view_range)?;
+    let (full_start, full_end) = normalized_range(full_range)?;
+    let view_span = view_end - view_start;
+    if view_span <= 0.0 {
+        return None;
+    }
+
+    let overscan = view_span * ENVELOPE_OVERSCAN_RATIO;
+    let start = (view_start - overscan).max(full_start);
+    let end = (view_end + overscan).min(full_end);
+    normalized_range((start, end))
+}
+
+fn cache_bucket_count_for_view(
+    view_range: (f64, f64),
+    cache_range: (f64, f64),
+    requested_bucket_count: usize,
+) -> usize {
+    let Some((view_start, view_end)) = normalized_range(view_range) else {
+        return requested_bucket_count.max(1);
+    };
+    let Some((cache_start, cache_end)) = normalized_range(cache_range) else {
+        return requested_bucket_count.max(1);
+    };
+    let view_span = view_end - view_start;
+    let cache_span = cache_end - cache_start;
+    if view_span <= 0.0 || cache_span <= 0.0 {
+        return requested_bucket_count.max(1);
+    }
+
+    let scale = (cache_span / view_span).max(1.0);
+    (((requested_bucket_count.max(1) as f64) * scale).ceil() as usize)
+        .clamp(requested_bucket_count.max(1), MAX_CACHED_ENVELOPE_BUCKETS)
+}
+
+fn similar_span(left: f64, right: f64, tolerance: f64) -> bool {
+    if !left.is_finite() || !right.is_finite() || left <= 0.0 || right <= 0.0 {
+        return false;
+    }
+
+    let ratio = left.min(right) / left.max(right);
+    ratio >= 1.0 - tolerance
 }
 
 fn normalized_range((start, end): (f64, f64)) -> Option<(f64, f64)> {
@@ -3355,5 +5235,234 @@ mod app_tests {
         let trace = build_change_point_step_trace(&time, &values, (0.0, 4.0), 2);
 
         assert!(trace.is_none());
+    }
+
+    #[test]
+    fn change_point_step_trace_reports_dense_fallback() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 1.0, 0.0, 1.0, 0.0];
+
+        let result = build_change_point_step_trace_result(&time, &values, (0.0, 4.0), 2);
+
+        assert_eq!(
+            result,
+            StepTraceBuildResult::TooManyChangePoints {
+                source_sample_count: 5
+            }
+        );
+    }
+
+    #[test]
+    fn step_edge_cache_trace_preserves_edges_by_range_lookup() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let values = [0.0, 0.0, 0.0, 5.0, 5.0, 0.0, 0.0];
+        let cache = build_step_edge_cache(&time, &values);
+
+        let result = build_change_point_step_trace_from_cache(&time, &cache, (0.0, 6.0), 3);
+        let StepTraceBuildResult::Trace(trace) = result else {
+            panic!("expected cached edge trace");
+        };
+
+        assert_eq!(cache.edge_count(), 3);
+        assert_eq!(trace.kind, StepTraceKind::ChangePoints);
+        assert_eq!(trace.source_sample_count, 7);
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 0.0,
+                    value: 0.0,
+                },
+                StepSample {
+                    time: 3.0,
+                    value: 5.0,
+                },
+                StepSample {
+                    time: 5.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 5.0)));
+    }
+
+    #[test]
+    fn step_edge_cache_trace_carries_previous_state_at_range_start() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 5.0, 5.0, 0.0, 0.0];
+        let cache = build_step_edge_cache(&time, &values);
+
+        let result = build_change_point_step_trace_from_cache(&time, &cache, (2.5, 4.0), 3);
+        let StepTraceBuildResult::Trace(trace) = result else {
+            panic!("expected cached edge trace");
+        };
+
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 2.5,
+                    value: 5.0,
+                },
+                StepSample {
+                    time: 3.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 5.0)));
+    }
+
+    #[test]
+    fn step_edge_cache_trace_reports_dense_fallback() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 1.0, 0.0, 1.0, 0.0];
+        let cache = build_step_edge_cache(&time, &values);
+
+        let result = build_change_point_step_trace_from_cache(&time, &cache, (0.0, 4.0), 2);
+
+        assert_eq!(
+            result,
+            StepTraceBuildResult::TooManyChangePoints {
+                source_sample_count: 5
+            }
+        );
+    }
+
+    #[test]
+    fn channel_store_reuses_step_edge_cache() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let channel = parquet_waveform::ChannelData {
+            path: std::path::PathBuf::new(),
+            channel_name: "gate_pwm".to_owned(),
+            channel_path: "gate_pwm".to_owned(),
+            values: vec![0.0, 1.0, 0.0, 1.0, 0.0],
+            projected_column_index: 1,
+            elapsed: Duration::ZERO,
+        };
+        let mut store = ChannelStore::default();
+        store.insert_channel(channel);
+
+        let _ = store.cached_change_point_step_trace_result("gate_pwm", &time, (0.0, 4.0), 10);
+        let first_stats = store.last_envelope_stats;
+        let _ = store.cached_change_point_step_trace_result("gate_pwm", &time, (1.0, 3.0), 10);
+        let second_stats = store.last_envelope_stats;
+
+        assert_eq!(store.step_edge_cache.len(), 1);
+        assert_eq!(first_stats.step_edge_builds, 1);
+        assert_eq!(first_stats.step_edge_hits, 0);
+        assert_eq!(second_stats.step_edge_builds, 1);
+        assert_eq!(second_stats.step_edge_hits, 1);
+    }
+
+    #[test]
+    fn step_fallback_hint_applies_to_same_or_wider_ranges() {
+        let mut store = ChannelStore::default();
+
+        store.record_step_change_point_fallback("gate_pwm", (10.0, 20.0), 100_000);
+
+        assert!(store.should_skip_step_change_points("gate_pwm", (10.0, 20.0), 95_000));
+        assert!(store.should_skip_step_change_points("gate_pwm", (10.0, 30.0), 150_000));
+        assert!(!store.should_skip_step_change_points("gate_pwm", (12.0, 18.0), 60_000));
+        assert!(!store.should_skip_step_change_points("other", (10.0, 30.0), 150_000));
+    }
+
+    #[test]
+    fn preview_bucket_count_is_capped_and_reduced() {
+        assert_eq!(
+            preview_envelope_bucket_count(100),
+            MIN_VISIBLE_ENVELOPE_BUCKETS
+        );
+        assert_eq!(preview_envelope_bucket_count(1_200), 300);
+        assert_eq!(
+            preview_envelope_bucket_count(8_192),
+            MAX_PREVIEW_ENVELOPE_BUCKETS
+        );
+    }
+
+    #[test]
+    fn preview_workload_gate_excludes_medium_class_data() {
+        assert!(!preview_needed_for_workload(2_000_000, 1_000_000, 8, 3));
+    }
+
+    #[test]
+    fn preview_workload_gate_excludes_small_large_data_windows() {
+        assert!(!preview_needed_for_workload(10_000_000, 100_000, 8, 1));
+    }
+
+    #[test]
+    fn preview_workload_gate_allows_large_wide_ranges() {
+        assert!(preview_needed_for_workload(10_000_000, 5_000_000, 8, 1));
+    }
+
+    #[test]
+    fn preview_is_disabled_by_default() {
+        assert!(!ViewState::default().large_preview_enabled);
+    }
+
+    #[test]
+    fn overscan_envelope_cache_reuses_same_span_pan() {
+        let time = (0..100).map(|value| value as f64).collect::<Vec<_>>();
+        let values = (0..100).map(|value| value as f32).collect::<Vec<_>>();
+        let mut store = ChannelStore::default();
+        store.insert_channel(parquet_waveform::ChannelData {
+            path: std::path::PathBuf::new(),
+            channel_name: "ch".to_owned(),
+            channel_path: "ch".to_owned(),
+            values,
+            projected_column_index: 1,
+            elapsed: Duration::ZERO,
+        });
+
+        store.begin_envelope_frame();
+        store.prepare_envelope_context(&time, time.len(), (10.0, 30.0), (0.0, 99.0), 10);
+        let first = store
+            .ensure_envelope("ch", &time, (10.0, 30.0), 10, true)
+            .expect("first envelope");
+        assert!(first.1);
+        assert_eq!(first.0.time_range, Some((10.0, 30.0)));
+        assert_eq!(store.last_envelope_stats.context_misses, 1);
+        assert_eq!(store.last_envelope_stats.misses, 1);
+
+        store.begin_envelope_frame();
+        store.prepare_envelope_context(&time, time.len(), (15.0, 35.0), (0.0, 99.0), 10);
+        let second = store
+            .ensure_envelope("ch", &time, (15.0, 35.0), 10, true)
+            .expect("second envelope");
+        assert!(!second.1);
+        assert_eq!(second.0.time_range, Some((15.0, 35.0)));
+        assert_eq!(store.last_envelope_stats.context_hits, 1);
+        assert_eq!(store.last_envelope_stats.hits, 1);
+    }
+
+    #[test]
+    fn overscan_envelope_context_rejects_zoom_span_change() {
+        let context = EnvelopeContext::for_view((10.0, 30.0), (0.0, 100.0), 100).expect("context");
+
+        assert!(context.reuses_for_view((15.0, 35.0), 100));
+        assert!(!context.reuses_for_view((15.0, 25.0), 100));
+    }
+
+    #[test]
+    fn line_tile_lod_only_applies_to_wide_line_buckets() {
+        let wide_plan = parquet_waveform::MinMaxEnvelopePlan {
+            bucket_spans: Vec::new(),
+            source_sample_count: LINE_TILE_MIN_SOURCE_SAMPLES,
+            requested_bucket_count: 100,
+            bucket_size: LINE_TILE_MIN_BUCKET_SIZE,
+            time_range: Some((0.0, 1.0)),
+        };
+        let narrow_plan = parquet_waveform::MinMaxEnvelopePlan {
+            bucket_size: LINE_TILE_MIN_BUCKET_SIZE - 1,
+            ..wide_plan.clone()
+        };
+        let small_plan = parquet_waveform::MinMaxEnvelopePlan {
+            source_sample_count: LINE_TILE_MIN_SOURCE_SAMPLES - 1,
+            ..wide_plan.clone()
+        };
+
+        assert!(should_use_line_tile_lod(&wide_plan));
+        assert!(!should_use_line_tile_lod(&narrow_plan));
+        assert!(!should_use_line_tile_lod(&small_plan));
     }
 }
