@@ -25,6 +25,9 @@ const PREVIEW_MIN_VISIBLE_LINE_SAMPLE_WORK: usize = 32_000_000;
 const PREVIEW_MIN_VISIBLE_STEP_SAMPLES: usize = 1_000_000;
 const PREVIEW_BUCKET_DIVISOR: usize = 4;
 const MAX_PREVIEW_ENVELOPE_BUCKETS: usize = 512;
+const ENVELOPE_OVERSCAN_RATIO: f64 = 0.5;
+const ENVELOPE_CONTEXT_SPAN_TOLERANCE: f64 = 0.05;
+const MAX_CACHED_ENVELOPE_BUCKETS: usize = MAX_VISIBLE_ENVELOPE_BUCKETS * 3;
 const DEFAULT_TRACE_LINE_WIDTH: f32 = 1.25;
 const MIN_TRACE_LINE_WIDTH: f32 = 0.5;
 const MAX_TRACE_LINE_WIDTH: f32 = 6.0;
@@ -218,6 +221,10 @@ struct PerfStats {
     requested_buckets: usize,
     effective_buckets: usize,
     preview: bool,
+    envelope_cache_hits: usize,
+    envelope_cache_misses: usize,
+    envelope_context_hits: usize,
+    envelope_context_misses: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +294,8 @@ struct ChannelStore {
     raw_by_channel: BTreeMap<String, parquet_waveform::ChannelData>,
     envelope_cache: BTreeMap<EnvelopeKey, parquet_waveform::MinMaxEnvelope>,
     envelope_context: Option<EnvelopeContext>,
+    envelope_plan: Option<parquet_waveform::MinMaxEnvelopePlan>,
+    last_envelope_stats: EnvelopeCacheStats,
     step_fallback_hints: BTreeMap<String, StepFallbackHint>,
 }
 
@@ -298,9 +307,20 @@ struct StepFallbackHint {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EnvelopeContext {
-    range_start_bits: u64,
-    range_end_bits: u64,
-    requested_bucket_count: usize,
+    cache_range_start_bits: u64,
+    cache_range_end_bits: u64,
+    view_span_bits: u64,
+    requested_view_bucket_count: usize,
+    cache_bucket_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EnvelopeCacheStats {
+    context_hits: usize,
+    context_misses: usize,
+    hits: usize,
+    misses: usize,
+    clipped: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -414,7 +434,7 @@ impl Default for ViewState {
             next_row_id: 1,
             x_range: None,
             hover_x: None,
-            large_preview_enabled: true,
+            large_preview_enabled: false,
             rows: vec![PlotRow::new(0)],
         }
     }
@@ -454,6 +474,10 @@ impl Default for PerfStats {
             requested_buckets: 0,
             effective_buckets: 0,
             preview: false,
+            envelope_cache_hits: 0,
+            envelope_cache_misses: 0,
+            envelope_context_hits: 0,
+            envelope_context_misses: 0,
         }
     }
 }
@@ -511,6 +535,7 @@ impl PerfStats {
         requested_buckets: usize,
         effective_buckets: usize,
         preview: bool,
+        envelope_stats: EnvelopeCacheStats,
     ) {
         self.frame_ms = duration_ms(timing.frame);
         self.interaction_ms = duration_ms(timing.interaction);
@@ -529,12 +554,16 @@ impl PerfStats {
         self.requested_buckets = requested_buckets;
         self.effective_buckets = effective_buckets;
         self.preview = preview;
+        self.envelope_cache_hits = envelope_stats.hits;
+        self.envelope_cache_misses = envelope_stats.misses;
+        self.envelope_context_hits = envelope_stats.context_hits;
+        self.envelope_context_misses = envelope_stats.context_misses;
     }
 
     fn summary(&self) -> String {
         let mode = if self.preview { "preview" } else { "full" };
         format!(
-            "{mode} frame {:.1}ms visible {:.1}ms draw {:.1}ms input {:.1}ms rows {} ch {} points {} buckets {}/{}",
+            "{mode} frame {:.1}ms visible {:.1}ms draw {:.1}ms input {:.1}ms rows {} ch {} points {} buckets {}/{} env h/m {}/{} ctx {}/{}",
             self.frame_ms,
             self.visible_ms,
             self.draw_ms,
@@ -543,7 +572,11 @@ impl PerfStats {
             self.channels,
             self.draw_points,
             self.effective_buckets,
-            self.requested_buckets
+            self.requested_buckets,
+            self.envelope_cache_hits,
+            self.envelope_cache_misses,
+            self.envelope_context_hits,
+            self.envelope_context_misses
         )
     }
 }
@@ -804,6 +837,7 @@ impl ChannelStore {
     fn clear_envelope_cache(&mut self) {
         self.envelope_cache.clear();
         self.envelope_context = None;
+        self.envelope_plan = None;
     }
 
     fn has_channel(&self, channel_path: &str) -> bool {
@@ -828,35 +862,94 @@ impl ChannelStore {
             .sum()
     }
 
-    fn prepare_envelope_context(&mut self, time_range: (f64, f64), requested_bucket_count: usize) {
-        let context = EnvelopeContext::new(time_range, requested_bucket_count);
-        if self.envelope_context != Some(context) {
-            self.envelope_cache.clear();
-            self.envelope_context = Some(context);
+    fn begin_envelope_frame(&mut self) {
+        self.last_envelope_stats = EnvelopeCacheStats::default();
+    }
+
+    fn prepare_envelope_context(
+        &mut self,
+        time: &[f64],
+        value_count: usize,
+        view_range: (f64, f64),
+        full_range: (f64, f64),
+        requested_bucket_count: usize,
+    ) {
+        let Some(context) =
+            EnvelopeContext::for_view(view_range, full_range, requested_bucket_count)
+        else {
+            self.clear_envelope_cache();
+            self.last_envelope_stats.context_misses += 1;
+            return;
+        };
+
+        if self
+            .envelope_context
+            .is_some_and(|current| current.reuses_for_view(view_range, requested_bucket_count))
+        {
+            self.last_envelope_stats.context_hits += 1;
+            return;
         }
+
+        self.envelope_cache.clear();
+        self.envelope_plan = Some(parquet_waveform::min_max_envelope_plan_for_range(
+            time,
+            value_count,
+            context.cache_range(),
+            context.cache_bucket_count,
+        ));
+        self.envelope_context = Some(context);
+        self.last_envelope_stats.context_misses += 1;
     }
 
     fn ensure_envelope(
         &mut self,
         channel_path: &str,
         time: &[f64],
-        time_range: (f64, f64),
+        view_range: (f64, f64),
         requested_bucket_count: usize,
     ) -> Option<(parquet_waveform::MinMaxEnvelope, bool)> {
-        let key = EnvelopeKey::new(channel_path, time_range, requested_bucket_count);
+        let context = self.envelope_context?;
+        let cache_range = context.cache_range();
+        let key = EnvelopeKey::new(channel_path, cache_range, context.cache_bucket_count);
         let was_cached = self.envelope_cache.contains_key(&key);
         if !was_cached {
             let envelope = {
                 let channel = self.raw_by_channel.get(channel_path)?;
-                channel.min_max_envelope_for_range(time, time_range, requested_bucket_count)
+                if let Some(plan) = self.envelope_plan.as_ref() {
+                    parquet_waveform::min_max_envelope_for_plan(&channel.values, plan)
+                } else {
+                    channel.min_max_envelope_for_range(
+                        time,
+                        cache_range,
+                        context.cache_bucket_count,
+                    )
+                }
             };
             self.envelope_cache.insert(key.clone(), envelope);
+            self.last_envelope_stats.misses += 1;
+        } else {
+            self.last_envelope_stats.hits += 1;
         }
 
-        self.envelope_cache
-            .get(&key)
-            .cloned()
-            .map(|envelope| (envelope, !was_cached))
+        let cached = self.envelope_cache.get(&key)?.clone();
+        if context.cache_range_equals(view_range)
+            && context.cache_bucket_count == requested_bucket_count
+        {
+            return Some((cached, !was_cached));
+        }
+
+        let channel = self.raw_by_channel.get(channel_path)?;
+        self.last_envelope_stats.clipped += 1;
+        Some((
+            parquet_waveform::clip_min_max_envelope_to_range(
+                &cached,
+                time,
+                &channel.values,
+                view_range,
+                requested_bucket_count,
+            ),
+            !was_cached,
+        ))
     }
 
     fn should_skip_step_change_points(
@@ -900,12 +993,65 @@ impl ChannelStore {
 }
 
 impl EnvelopeContext {
-    fn new(time_range: (f64, f64), requested_bucket_count: usize) -> Self {
-        Self {
-            range_start_bits: time_range.0.to_bits(),
-            range_end_bits: time_range.1.to_bits(),
-            requested_bucket_count,
+    fn for_view(
+        view_range: (f64, f64),
+        full_range: (f64, f64),
+        requested_bucket_count: usize,
+    ) -> Option<Self> {
+        let (view_start, view_end) = normalized_range(view_range)?;
+        let (cache_start, cache_end) = overscan_cache_range((view_start, view_end), full_range)?;
+        let view_span = view_end - view_start;
+        if !view_span.is_finite() || view_span <= 0.0 {
+            return None;
         }
+
+        Some(Self {
+            cache_range_start_bits: cache_start.to_bits(),
+            cache_range_end_bits: cache_end.to_bits(),
+            view_span_bits: view_span.to_bits(),
+            requested_view_bucket_count: requested_bucket_count,
+            cache_bucket_count: cache_bucket_count_for_view(
+                (view_start, view_end),
+                (cache_start, cache_end),
+                requested_bucket_count,
+            ),
+        })
+    }
+
+    fn cache_range(self) -> (f64, f64) {
+        (
+            f64::from_bits(self.cache_range_start_bits),
+            f64::from_bits(self.cache_range_end_bits),
+        )
+    }
+
+    fn view_span(self) -> f64 {
+        f64::from_bits(self.view_span_bits)
+    }
+
+    fn reuses_for_view(self, view_range: (f64, f64), requested_bucket_count: usize) -> bool {
+        if self.requested_view_bucket_count != requested_bucket_count {
+            return false;
+        }
+
+        let Some((view_start, view_end)) = normalized_range(view_range) else {
+            return false;
+        };
+        let view_span = view_end - view_start;
+        if !similar_span(self.view_span(), view_span, ENVELOPE_CONTEXT_SPAN_TOLERANCE) {
+            return false;
+        }
+
+        let (cache_start, cache_end) = self.cache_range();
+        view_start >= cache_start && view_end <= cache_end
+    }
+
+    fn cache_range_equals(self, view_range: (f64, f64)) -> bool {
+        let Some((view_start, view_end)) = normalized_range(view_range) else {
+            return false;
+        };
+        self.cache_range_start_bits == view_start.to_bits()
+            && self.cache_range_end_bits == view_end.to_bits()
     }
 }
 
@@ -1162,7 +1308,14 @@ fn benchmark_multi_channel(path: String, channels: Vec<String>) -> Result<String
         channel_results.push(result);
     }
 
-    store.prepare_envelope_context(full_range, BENCH_VISIBLE_ENVELOPE_BUCKETS);
+    store.begin_envelope_frame();
+    store.prepare_envelope_context(
+        &time.time,
+        time.sample_count(),
+        full_range,
+        full_range,
+        BENCH_VISIBLE_ENVELOPE_BUCKETS,
+    );
     let mut envelope_results = Vec::with_capacity(selected_channels.len());
     for channel_path in channel_results
         .iter()
@@ -1340,6 +1493,7 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         let started = std::time::Instant::now();
         let visible_rows = app.visible_row_traces(BENCH_VISIBLE_ENVELOPE_BUCKETS, true, false);
         let elapsed_sec = started.elapsed().as_secs_f64();
+        let envelope_stats = app.dataset.loaded_channels.last_envelope_stats;
 
         let mut visible_channel_count = 0usize;
         let mut envelope_trace_count = 0usize;
@@ -1387,8 +1541,10 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
             draw_point_count,
             source_sample_count,
             hover_value_count,
+            envelope_stats,
         });
     }
+    let pan_cache_result = benchmark_phase2_pan_cache(&mut app, full_range);
     let rss_after_visible_benchmark = process_rss_mib();
 
     let hover_result = benchmark_phase2_hover(&app, full_range);
@@ -1427,6 +1583,22 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         .map(|result| result.raw_step_sample_count)
         .max()
         .unwrap_or(0);
+    let total_envelope_hits = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.hits)
+        .sum::<usize>();
+    let total_envelope_misses = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.misses)
+        .sum::<usize>();
+    let total_context_hits = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.context_hits)
+        .sum::<usize>();
+    let total_context_misses = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.context_misses)
+        .sum::<usize>();
 
     let schema = app.dataset.schema.as_ref().expect("schema is set");
     let shared_time = app.dataset.shared_time.as_ref().expect("time is set");
@@ -1467,6 +1639,21 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         max_raw_step_samples
     ));
     report.push_str(&format!(
+        "envelope cache: hits {}, misses {}, context hits {}, context misses {}\n",
+        total_envelope_hits, total_envelope_misses, total_context_hits, total_context_misses
+    ));
+    report.push_str(&format!(
+        "pan cache benchmark: {} ranges, total {:.3}s, avg {:.4}s, max {:.4}s, cache hits {}, misses {}, context hits {}, context misses {}\n",
+        pan_cache_result.ranges,
+        pan_cache_result.elapsed_sec,
+        pan_cache_result.avg_visible_sec(),
+        pan_cache_result.max_elapsed_sec,
+        pan_cache_result.envelope_hits,
+        pan_cache_result.envelope_misses,
+        pan_cache_result.context_hits,
+        pan_cache_result.context_misses
+    ));
+    report.push_str(&format!(
         "hover benchmark: {} positions, {} lookups, {} hits, total {:.4}s, avg {:.3} us/lookup\n",
         hover_result.positions,
         hover_result.lookups,
@@ -1499,7 +1686,7 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
     report.push_str("visible runs:\n");
     for result in &visible_results {
         report.push_str(&format!(
-            "  #{:02} {:.6}..{:.6}s {:.4}s rows={} ch={} samples={} env={} step={} edge={} step_samples={} draw_points={} hover_values={}\n",
+            "  #{:02} {:.6}..{:.6}s {:.4}s rows={} ch={} samples={} env={} step={} edge={} step_samples={} draw_points={} hover_values={} cache_h/m={}/{} ctx={}/{}\n",
             result.index,
             result.range.0,
             result.range.1,
@@ -1512,7 +1699,11 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
             result.edge_step_trace_count,
             result.raw_step_sample_count,
             result.draw_point_count,
-            result.hover_value_count
+            result.hover_value_count,
+            result.envelope_stats.hits,
+            result.envelope_stats.misses,
+            result.envelope_stats.context_hits,
+            result.envelope_stats.context_misses
         ));
     }
 
@@ -1560,6 +1751,40 @@ fn phase2_benchmark_mode_counts(rows: &[PlotRow]) -> (usize, usize) {
             DrawMode::Step => (line, step + 1),
         },
     )
+}
+
+fn benchmark_phase2_pan_cache(
+    app: &mut PanelYApp,
+    full_range: (f64, f64),
+) -> Phase2PanCacheBenchmarkResult {
+    let ranges = benchmark_pan_ranges(full_range, BENCH_RANGE_RUNS);
+    if ranges.is_empty() {
+        return Phase2PanCacheBenchmarkResult::default();
+    }
+
+    app.dataset.loaded_channels.clear_envelope_cache();
+    let mut result = Phase2PanCacheBenchmarkResult {
+        ranges: ranges.len(),
+        ..Phase2PanCacheBenchmarkResult::default()
+    };
+
+    for range in ranges {
+        app.view.x_range = Some(range);
+        app.view.hover_x = Some((range.0 + range.1) * 0.5);
+        let started = std::time::Instant::now();
+        let _visible_rows = app.visible_row_traces(BENCH_VISIBLE_ENVELOPE_BUCKETS, true, false);
+        let elapsed_sec = started.elapsed().as_secs_f64();
+        let envelope_stats = app.dataset.loaded_channels.last_envelope_stats;
+
+        result.elapsed_sec += elapsed_sec;
+        result.max_elapsed_sec = result.max_elapsed_sec.max(elapsed_sec);
+        result.envelope_hits += envelope_stats.hits;
+        result.envelope_misses += envelope_stats.misses;
+        result.context_hits += envelope_stats.context_hits;
+        result.context_misses += envelope_stats.context_misses;
+    }
+
+    result
 }
 
 fn benchmark_phase2_hover(app: &PanelYApp, full_range: (f64, f64)) -> Phase2HoverBenchmarkResult {
@@ -1668,6 +1893,28 @@ struct Phase2VisibleRunResult {
     draw_point_count: usize,
     source_sample_count: usize,
     hover_value_count: usize,
+    envelope_stats: EnvelopeCacheStats,
+}
+
+#[derive(Debug, Default)]
+struct Phase2PanCacheBenchmarkResult {
+    ranges: usize,
+    elapsed_sec: f64,
+    max_elapsed_sec: f64,
+    envelope_hits: usize,
+    envelope_misses: usize,
+    context_hits: usize,
+    context_misses: usize,
+}
+
+impl Phase2PanCacheBenchmarkResult {
+    fn avg_visible_sec(&self) -> f64 {
+        if self.ranges == 0 {
+            0.0
+        } else {
+            self.elapsed_sec / self.ranges as f64
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1722,6 +1969,34 @@ fn benchmark_ranges(full_range: (f64, f64), run_count: usize) -> Vec<(f64, f64)>
     }
 
     ranges
+}
+
+fn benchmark_pan_ranges(full_range: (f64, f64), run_count: usize) -> Vec<(f64, f64)> {
+    let Some((start, end)) = normalized_range(full_range) else {
+        return Vec::new();
+    };
+    let span = end - start;
+    if span <= 0.0 || run_count == 0 {
+        return Vec::new();
+    }
+
+    let window = (span * 0.20).max(span * 1.0e-9).min(span);
+    if window >= span || run_count == 1 {
+        return vec![(start, start + window)];
+    }
+
+    let available = span - window;
+    let requested_total_shift = window * 0.10 * run_count.saturating_sub(1) as f64;
+    let total_shift = requested_total_shift.min(available);
+    let step = total_shift / run_count.saturating_sub(1) as f64;
+    let first_left = start + (available - total_shift) * 0.5;
+
+    (0..run_count)
+        .map(|index| {
+            let left = (first_left + step * index as f64).min(end - window);
+            (left, left + window)
+        })
+        .collect()
 }
 
 fn process_rss_mib() -> Option<f64> {
@@ -2175,6 +2450,7 @@ impl PanelYApp {
     ) -> Vec<VisibleRowTrace> {
         let rows = self.view.rows.clone();
         let loading_channel_paths = self.load.loading_channel_paths();
+        self.dataset.loaded_channels.begin_envelope_frame();
         if rows.is_empty() {
             return Vec::new();
         }
@@ -2257,7 +2533,13 @@ impl PanelYApp {
             };
             let time_values = &shared_time.time;
             let loaded_channels = &mut dataset.loaded_channels;
-            loaded_channels.prepare_envelope_context(view_range, requested_bucket_count);
+            loaded_channels.prepare_envelope_context(
+                time_values,
+                shared_time.sample_count(),
+                view_range,
+                full_range,
+                requested_bucket_count,
+            );
 
             for (row_index, row) in rows.into_iter().enumerate() {
                 let mut traces = Vec::with_capacity(row.channels.len());
@@ -2475,9 +2757,10 @@ impl PanelYApp {
                 .next()
                 .map(trace_source_sample_count)
                 .unwrap_or_default();
+            let envelope_stats = self.dataset.loaded_channels.last_envelope_stats;
             let quality = if preview { "preview" } else { "full" };
             self.load.status = format!(
-                "{quality} view {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, step fallback {}, cache {}, hints {}",
+                "{quality} view {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, step fallback {}, env h/m {}/{}, ctx {}/{}, clips {}, cache {}, hints {}",
                 view_range.0,
                 view_range.1,
                 visible_rows.len(),
@@ -2487,6 +2770,11 @@ impl PanelYApp {
                 exact_step_count,
                 edge_step_count,
                 early_step_fallback_count,
+                envelope_stats.hits,
+                envelope_stats.misses,
+                envelope_stats.context_hits,
+                envelope_stats.context_misses,
+                envelope_stats.clipped,
                 self.dataset.loaded_channels.envelope_cache.len(),
                 self.dataset.loaded_channels.step_fallback_hints.len()
             );
@@ -2579,7 +2867,6 @@ impl PanelYApp {
 
         if changed && next_range != current_range {
             self.view.x_range = Some(next_range);
-            self.dataset.loaded_channels.clear_envelope_cache();
             self.interaction.mark_range_changed();
             ui.ctx().request_repaint_after(INTERACTION_PREVIEW_SETTLE);
         }
@@ -2676,9 +2963,9 @@ impl eframe::App for PanelYApp {
                                 ui.monospace(format!("x: {start:.6} .. {end:.6} s"));
                             }
                             ui.checkbox(&mut self.perf.show, "Frame timing");
-                            ui.checkbox(&mut self.view.large_preview_enabled, "Large-data preview")
+                            ui.checkbox(&mut self.view.large_preview_enabled, "Emergency preview")
                                 .on_hover_text(
-                                    "Only reduces quality while interacting with very large visible ranges",
+                                    "Debug option: temporarily reduces quality only while interacting with very large visible ranges",
                                 );
                         }
 
@@ -2804,6 +3091,7 @@ impl eframe::App for PanelYApp {
                         }
                     }
                     let draw_elapsed = draw_started.elapsed();
+                    let envelope_stats = self.dataset.loaded_channels.last_envelope_stats;
                     self.perf.update(
                         FrameTiming {
                             frame: frame_started.elapsed(),
@@ -2815,6 +3103,7 @@ impl eframe::App for PanelYApp {
                         requested_buckets,
                         effective_buckets,
                         preview,
+                        envelope_stats,
                     );
                 });
         });
@@ -4227,6 +4516,51 @@ fn range_with_start(start: f64, span: f64, full_range: (f64, f64)) -> (f64, f64)
     (start, start + span)
 }
 
+fn overscan_cache_range(view_range: (f64, f64), full_range: (f64, f64)) -> Option<(f64, f64)> {
+    let (view_start, view_end) = normalized_range(view_range)?;
+    let (full_start, full_end) = normalized_range(full_range)?;
+    let view_span = view_end - view_start;
+    if view_span <= 0.0 {
+        return None;
+    }
+
+    let overscan = view_span * ENVELOPE_OVERSCAN_RATIO;
+    let start = (view_start - overscan).max(full_start);
+    let end = (view_end + overscan).min(full_end);
+    normalized_range((start, end))
+}
+
+fn cache_bucket_count_for_view(
+    view_range: (f64, f64),
+    cache_range: (f64, f64),
+    requested_bucket_count: usize,
+) -> usize {
+    let Some((view_start, view_end)) = normalized_range(view_range) else {
+        return requested_bucket_count.max(1);
+    };
+    let Some((cache_start, cache_end)) = normalized_range(cache_range) else {
+        return requested_bucket_count.max(1);
+    };
+    let view_span = view_end - view_start;
+    let cache_span = cache_end - cache_start;
+    if view_span <= 0.0 || cache_span <= 0.0 {
+        return requested_bucket_count.max(1);
+    }
+
+    let scale = (cache_span / view_span).max(1.0);
+    (((requested_bucket_count.max(1) as f64) * scale).ceil() as usize)
+        .clamp(requested_bucket_count.max(1), MAX_CACHED_ENVELOPE_BUCKETS)
+}
+
+fn similar_span(left: f64, right: f64, tolerance: f64) -> bool {
+    if !left.is_finite() || !right.is_finite() || left <= 0.0 || right <= 0.0 {
+        return false;
+    }
+
+    let ratio = left.min(right) / left.max(right);
+    ratio >= 1.0 - tolerance
+}
+
 fn normalized_range((start, end): (f64, f64)) -> Option<(f64, f64)> {
     if !start.is_finite() || !end.is_finite() {
         return None;
@@ -4602,5 +4936,53 @@ mod app_tests {
     #[test]
     fn preview_workload_gate_allows_large_wide_ranges() {
         assert!(preview_needed_for_workload(10_000_000, 5_000_000, 8, 1));
+    }
+
+    #[test]
+    fn preview_is_disabled_by_default() {
+        assert!(!ViewState::default().large_preview_enabled);
+    }
+
+    #[test]
+    fn overscan_envelope_cache_reuses_same_span_pan() {
+        let time = (0..100).map(|value| value as f64).collect::<Vec<_>>();
+        let values = (0..100).map(|value| value as f32).collect::<Vec<_>>();
+        let mut store = ChannelStore::default();
+        store.insert_channel(parquet_waveform::ChannelData {
+            path: std::path::PathBuf::new(),
+            channel_name: "ch".to_owned(),
+            channel_path: "ch".to_owned(),
+            values,
+            projected_column_index: 1,
+            elapsed: Duration::ZERO,
+        });
+
+        store.begin_envelope_frame();
+        store.prepare_envelope_context(&time, time.len(), (10.0, 30.0), (0.0, 99.0), 10);
+        let first = store
+            .ensure_envelope("ch", &time, (10.0, 30.0), 10)
+            .expect("first envelope");
+        assert!(first.1);
+        assert_eq!(first.0.time_range, Some((10.0, 30.0)));
+        assert_eq!(store.last_envelope_stats.context_misses, 1);
+        assert_eq!(store.last_envelope_stats.misses, 1);
+
+        store.begin_envelope_frame();
+        store.prepare_envelope_context(&time, time.len(), (15.0, 35.0), (0.0, 99.0), 10);
+        let second = store
+            .ensure_envelope("ch", &time, (15.0, 35.0), 10)
+            .expect("second envelope");
+        assert!(!second.1);
+        assert_eq!(second.0.time_range, Some((15.0, 35.0)));
+        assert_eq!(store.last_envelope_stats.context_hits, 1);
+        assert_eq!(store.last_envelope_stats.hits, 1);
+    }
+
+    #[test]
+    fn overscan_envelope_context_rejects_zoom_span_change() {
+        let context = EnvelopeContext::for_view((10.0, 30.0), (0.0, 100.0), 100).expect("context");
+
+        assert!(context.reuses_for_view((15.0, 35.0), 100));
+        assert!(!context.reuses_for_view((15.0, 25.0), 100));
     }
 }
