@@ -230,6 +230,8 @@ struct PerfStats {
     envelope_context_misses: usize,
     line_tile_hits: usize,
     line_tile_builds: usize,
+    step_edge_hits: usize,
+    step_edge_builds: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -298,6 +300,7 @@ enum DrawMode {
 struct ChannelStore {
     raw_by_channel: BTreeMap<String, parquet_waveform::ChannelData>,
     line_tile_cache: BTreeMap<String, parquet_waveform::LineTileCache>,
+    step_edge_cache: BTreeMap<String, StepEdgeCache>,
     envelope_cache: BTreeMap<EnvelopeKey, parquet_waveform::MinMaxEnvelope>,
     envelope_context: Option<EnvelopeContext>,
     envelope_plan: Option<parquet_waveform::MinMaxEnvelopePlan>,
@@ -330,6 +333,8 @@ struct EnvelopeCacheStats {
     tile_hits: usize,
     tile_builds: usize,
     tile_buckets: usize,
+    step_edge_hits: usize,
+    step_edge_builds: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -355,6 +360,7 @@ struct VisibleTrace {
 #[derive(Clone, Debug)]
 enum VisibleTraceData {
     Envelope(parquet_waveform::MinMaxEnvelope),
+    DenseStepEnvelope(parquet_waveform::MinMaxEnvelope),
     RawStep(RawStepTrace),
 }
 
@@ -378,6 +384,20 @@ enum StepTraceBuildResult {
     Trace(RawStepTrace),
     TooManyChangePoints { source_sample_count: usize },
     Empty,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StepEdgeCache {
+    sample_count: usize,
+    edges: Vec<StepEdge>,
+    elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepEdge {
+    index: usize,
+    time: f64,
+    value: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -489,6 +509,8 @@ impl Default for PerfStats {
             envelope_context_misses: 0,
             line_tile_hits: 0,
             line_tile_builds: 0,
+            step_edge_hits: 0,
+            step_edge_builds: 0,
         }
     }
 }
@@ -571,12 +593,14 @@ impl PerfStats {
         self.envelope_context_misses = envelope_stats.context_misses;
         self.line_tile_hits = envelope_stats.tile_hits;
         self.line_tile_builds = envelope_stats.tile_builds;
+        self.step_edge_hits = envelope_stats.step_edge_hits;
+        self.step_edge_builds = envelope_stats.step_edge_builds;
     }
 
     fn summary(&self) -> String {
         let mode = if self.preview { "preview" } else { "full" };
         format!(
-            "{mode} frame {:.1}ms visible {:.1}ms draw {:.1}ms input {:.1}ms rows {} ch {} points {} buckets {}/{} env h/m {}/{} ctx {}/{} tile h/b {}/{}",
+            "{mode} frame {:.1}ms visible {:.1}ms draw {:.1}ms input {:.1}ms rows {} ch {} points {} buckets {}/{} env h/m {}/{} ctx {}/{} tile h/b {}/{} edge h/b {}/{}",
             self.frame_ms,
             self.visible_ms,
             self.draw_ms,
@@ -591,7 +615,9 @@ impl PerfStats {
             self.envelope_context_hits,
             self.envelope_context_misses,
             self.line_tile_hits,
-            self.line_tile_builds
+            self.line_tile_builds,
+            self.step_edge_hits,
+            self.step_edge_builds
         )
     }
 }
@@ -846,6 +872,7 @@ impl ChannelStore {
     fn clear_all(&mut self) {
         self.raw_by_channel.clear();
         self.line_tile_cache.clear();
+        self.step_edge_cache.clear();
         self.clear_envelope_cache();
         self.step_fallback_hints.clear();
     }
@@ -867,6 +894,7 @@ impl ChannelStore {
     fn insert_channel(&mut self, channel: parquet_waveform::ChannelData) {
         self.step_fallback_hints.remove(&channel.channel_path);
         self.line_tile_cache.remove(&channel.channel_path);
+        self.step_edge_cache.remove(&channel.channel_path);
         self.raw_by_channel
             .insert(channel.channel_path.clone(), channel);
         self.clear_envelope_cache();
@@ -893,6 +921,20 @@ impl ChannelStore {
             .sum()
     }
 
+    fn step_edge_memory_bytes(&self) -> usize {
+        self.step_edge_cache
+            .values()
+            .map(StepEdgeCache::memory_bytes)
+            .sum()
+    }
+
+    fn step_edge_build_seconds(&self) -> f64 {
+        self.step_edge_cache
+            .values()
+            .map(|cache| cache.elapsed.as_secs_f64())
+            .sum()
+    }
+
     fn begin_envelope_frame(&mut self) {
         self.last_envelope_stats = EnvelopeCacheStats::default();
     }
@@ -911,6 +953,34 @@ impl ChannelStore {
         }
 
         Some(!was_cached)
+    }
+
+    fn ensure_step_edge_cache(&mut self, channel_path: &str, time: &[f64]) -> Option<bool> {
+        let was_cached = self.step_edge_cache.contains_key(channel_path);
+        if !was_cached {
+            let channel = self.raw_by_channel.get(channel_path)?;
+            let edge_cache = build_step_edge_cache(time, &channel.values);
+            self.step_edge_cache
+                .insert(channel_path.to_owned(), edge_cache);
+            self.last_envelope_stats.step_edge_builds += 1;
+        } else {
+            self.last_envelope_stats.step_edge_hits += 1;
+        }
+
+        Some(!was_cached)
+    }
+
+    fn cached_change_point_step_trace_result(
+        &mut self,
+        channel_path: &str,
+        time: &[f64],
+        time_range: (f64, f64),
+        max_change_points: usize,
+    ) -> Option<StepTraceBuildResult> {
+        self.ensure_step_edge_cache(channel_path, time)?;
+        self.step_edge_cache.get(channel_path).map(|cache| {
+            build_change_point_step_trace_from_cache(time, cache, time_range, max_change_points)
+        })
     }
 
     fn prepare_envelope_context(
@@ -1130,6 +1200,16 @@ impl EnvelopeKey {
             range_end_bits: time_range.1.to_bits(),
             requested_bucket_count,
         }
+    }
+}
+
+impl StepEdgeCache {
+    fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.edges.len() * std::mem::size_of::<StepEdge>()
     }
 }
 
@@ -1565,6 +1645,7 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
 
         let mut visible_channel_count = 0usize;
         let mut envelope_trace_count = 0usize;
+        let mut dense_step_trace_count = 0usize;
         let mut raw_step_trace_count = 0usize;
         let mut edge_step_trace_count = 0usize;
         let mut raw_step_sample_count = 0usize;
@@ -1585,6 +1666,9 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
                     VisibleTraceData::Envelope(_) => {
                         envelope_trace_count += 1;
                     }
+                    VisibleTraceData::DenseStepEnvelope(_) => {
+                        dense_step_trace_count += 1;
+                    }
                     VisibleTraceData::RawStep(raw_step) => {
                         raw_step_trace_count += 1;
                         raw_step_sample_count += raw_step.samples.len();
@@ -1603,6 +1687,7 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
             row_count: visible_rows.len(),
             visible_channel_count,
             envelope_trace_count,
+            dense_step_trace_count,
             raw_step_trace_count,
             edge_step_trace_count,
             raw_step_sample_count,
@@ -1675,6 +1760,21 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         .iter()
         .map(|result| result.envelope_stats.tile_builds)
         .sum::<usize>();
+    let total_step_edge_hits = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.step_edge_hits)
+        .sum::<usize>();
+    let total_step_edge_builds = visible_results
+        .iter()
+        .map(|result| result.envelope_stats.step_edge_builds)
+        .sum::<usize>();
+    let step_edge_count = app
+        .dataset
+        .loaded_channels
+        .step_edge_cache
+        .values()
+        .map(StepEdgeCache::edge_count)
+        .sum::<usize>();
 
     let schema = app.dataset.schema.as_ref().expect("schema is set");
     let shared_time = app.dataset.shared_time.as_ref().expect("time is set");
@@ -1715,17 +1815,21 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         max_raw_step_samples
     ));
     report.push_str(&format!(
-        "envelope cache: hits {}, misses {}, context hits {}, context misses {}, line tile hits {}, builds {}, tile memory {:.1} MiB\n",
+        "envelope cache: hits {}, misses {}, context hits {}, context misses {}, line tile hits {}, builds {}, tile memory {:.1} MiB, step edge hits {}, builds {}, edges {}, edge memory {:.1} MiB\n",
         total_envelope_hits,
         total_envelope_misses,
         total_context_hits,
         total_context_misses,
         total_tile_hits,
         total_tile_builds,
-        bytes_to_mib(app.dataset.loaded_channels.line_tile_memory_bytes())
+        bytes_to_mib(app.dataset.loaded_channels.line_tile_memory_bytes()),
+        total_step_edge_hits,
+        total_step_edge_builds,
+        step_edge_count,
+        bytes_to_mib(app.dataset.loaded_channels.step_edge_memory_bytes())
     ));
     report.push_str(&format!(
-        "pan cache benchmark: {} ranges, total {:.3}s, avg {:.4}s, max {:.4}s, cache hits {}, misses {}, context hits {}, context misses {}, tile hits {}, builds {}\n",
+        "pan cache benchmark: {} ranges, total {:.3}s, avg {:.4}s, max {:.4}s, cache hits {}, misses {}, context hits {}, context misses {}, tile hits {}, builds {}, step edge hits {}, builds {}\n",
         pan_cache_result.ranges,
         pan_cache_result.elapsed_sec,
         pan_cache_result.avg_visible_sec(),
@@ -1735,7 +1839,9 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
         pan_cache_result.context_hits,
         pan_cache_result.context_misses,
         pan_cache_result.tile_hits,
-        pan_cache_result.tile_builds
+        pan_cache_result.tile_builds,
+        pan_cache_result.step_edge_hits,
+        pan_cache_result.step_edge_builds
     ));
     report.push_str(&format!(
         "hover benchmark: {} positions, {} lookups, {} hits, total {:.4}s, avg {:.3} us/lookup\n",
@@ -1770,7 +1876,7 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
     report.push_str("visible runs:\n");
     for result in &visible_results {
         report.push_str(&format!(
-            "  #{:02} {:.6}..{:.6}s {:.4}s rows={} ch={} samples={} env={} step={} edge={} step_samples={} draw_points={} hover_values={} cache_h/m={}/{} ctx={}/{} tile_h/b={}/{}\n",
+            "  #{:02} {:.6}..{:.6}s {:.4}s rows={} ch={} samples={} env={} dense={} step={} edge={} step_samples={} draw_points={} hover_values={} cache_h/m={}/{} ctx={}/{} tile_h/b={}/{} edge_h/b={}/{}\n",
             result.index,
             result.range.0,
             result.range.1,
@@ -1779,6 +1885,7 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
             result.visible_channel_count,
             result.source_sample_count,
             result.envelope_trace_count,
+            result.dense_step_trace_count,
             result.raw_step_trace_count,
             result.edge_step_trace_count,
             result.raw_step_sample_count,
@@ -1789,7 +1896,9 @@ fn benchmark_phase2_view(path: String, channels: Vec<String>) -> Result<String, 
             result.envelope_stats.context_hits,
             result.envelope_stats.context_misses,
             result.envelope_stats.tile_hits,
-            result.envelope_stats.tile_builds
+            result.envelope_stats.tile_builds,
+            result.envelope_stats.step_edge_hits,
+            result.envelope_stats.step_edge_builds
         ));
     }
 
@@ -1870,6 +1979,8 @@ fn benchmark_phase2_pan_cache(
         result.context_misses += envelope_stats.context_misses;
         result.tile_hits += envelope_stats.tile_hits;
         result.tile_builds += envelope_stats.tile_builds;
+        result.step_edge_hits += envelope_stats.step_edge_hits;
+        result.step_edge_builds += envelope_stats.step_edge_builds;
     }
 
     result
@@ -1975,6 +2086,7 @@ struct Phase2VisibleRunResult {
     row_count: usize,
     visible_channel_count: usize,
     envelope_trace_count: usize,
+    dense_step_trace_count: usize,
     raw_step_trace_count: usize,
     edge_step_trace_count: usize,
     raw_step_sample_count: usize,
@@ -1995,6 +2107,8 @@ struct Phase2PanCacheBenchmarkResult {
     context_misses: usize,
     tile_hits: usize,
     tile_builds: usize,
+    step_edge_hits: usize,
+    step_edge_builds: usize,
 }
 
 impl Phase2PanCacheBenchmarkResult {
@@ -2614,7 +2728,7 @@ impl PanelYApp {
         let mut built_count = 0usize;
         let mut exact_step_count = 0usize;
         let mut edge_step_count = 0usize;
-        let mut early_step_fallback_count = 0usize;
+        let mut dense_step_count = 0usize;
         let hover_x = self.view.hover_x;
         {
             let dataset = &mut self.dataset;
@@ -2691,7 +2805,7 @@ impl PanelYApp {
                             });
 
                             if use_preview_envelope || use_hint_fallback {
-                                early_step_fallback_count += 1;
+                                dense_step_count += 1;
                                 let Some((envelope, was_built)) = loaded_channels.ensure_envelope(
                                     &channel_path,
                                     time_values,
@@ -2704,7 +2818,7 @@ impl PanelYApp {
                                 if was_built {
                                     built_count += 1;
                                 }
-                                VisibleTraceData::Envelope(envelope)
+                                VisibleTraceData::DenseStepEnvelope(envelope)
                             } else if let Some(raw_step) =
                                 loaded_channels.channel(&channel_path).and_then(|channel| {
                                     build_raw_step_trace(
@@ -2717,15 +2831,13 @@ impl PanelYApp {
                             {
                                 exact_step_count += 1;
                                 VisibleTraceData::RawStep(raw_step)
-                            } else if let Some(step_result) =
-                                loaded_channels.channel(&channel_path).map(|channel| {
-                                    build_change_point_step_trace_result(
-                                        time_values,
-                                        &channel.values,
-                                        view_range,
-                                        MAX_STEP_CHANGE_POINTS,
-                                    )
-                                })
+                            } else if let Some(step_result) = loaded_channels
+                                .cached_change_point_step_trace_result(
+                                    &channel_path,
+                                    time_values,
+                                    view_range,
+                                    MAX_STEP_CHANGE_POINTS,
+                                )
                             {
                                 match step_result {
                                     StepTraceBuildResult::Trace(edge_step) => {
@@ -2740,7 +2852,7 @@ impl PanelYApp {
                                             view_range,
                                             source_sample_count,
                                         );
-                                        early_step_fallback_count += 1;
+                                        dense_step_count += 1;
                                         let Some((envelope, was_built)) = loaded_channels
                                             .ensure_envelope(
                                                 &channel_path,
@@ -2755,9 +2867,10 @@ impl PanelYApp {
                                         if was_built {
                                             built_count += 1;
                                         }
-                                        VisibleTraceData::Envelope(envelope)
+                                        VisibleTraceData::DenseStepEnvelope(envelope)
                                     }
                                     StepTraceBuildResult::Empty => {
+                                        dense_step_count += 1;
                                         let Some((envelope, was_built)) = loaded_channels
                                             .ensure_envelope(
                                                 &channel_path,
@@ -2772,7 +2885,7 @@ impl PanelYApp {
                                         if was_built {
                                             built_count += 1;
                                         }
-                                        VisibleTraceData::Envelope(envelope)
+                                        VisibleTraceData::DenseStepEnvelope(envelope)
                                     }
                                 }
                             } else {
@@ -2836,11 +2949,7 @@ impl PanelYApp {
             }
         }
 
-        if built_count > 0
-            || exact_step_count > 0
-            || edge_step_count > 0
-            || early_step_fallback_count > 0
-        {
+        if built_count > 0 || exact_step_count > 0 || edge_step_count > 0 || dense_step_count > 0 {
             let visible_channel_count = visible_rows
                 .iter()
                 .map(|row| row.traces.len())
@@ -2854,7 +2963,7 @@ impl PanelYApp {
             let envelope_stats = self.dataset.loaded_channels.last_envelope_stats;
             let quality = if preview { "preview" } else { "full" };
             self.load.status = format!(
-                "{quality} view {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, step fallback {}, env h/m {}/{}, ctx {}/{}, clips {}, tile h/b {}/{}, cache {}, hints {}",
+                "{quality} view {:.6}..{:.6}s: {} rows, {} ch, {} visible samples, built {} envelope(s), raw step {}, edge step {}, dense step {}, env h/m {}/{}, ctx {}/{}, clips {}, tile h/b {}/{}, edge h/b {}/{}, cache {}, edge cache {}, hints {}",
                 view_range.0,
                 view_range.1,
                 visible_rows.len(),
@@ -2863,7 +2972,7 @@ impl PanelYApp {
                 built_count,
                 exact_step_count,
                 edge_step_count,
-                early_step_fallback_count,
+                dense_step_count,
                 envelope_stats.hits,
                 envelope_stats.misses,
                 envelope_stats.context_hits,
@@ -2871,7 +2980,10 @@ impl PanelYApp {
                 envelope_stats.clipped,
                 envelope_stats.tile_hits,
                 envelope_stats.tile_builds,
+                envelope_stats.step_edge_hits,
+                envelope_stats.step_edge_builds,
                 self.dataset.loaded_channels.envelope_cache.len(),
+                self.dataset.loaded_channels.step_edge_cache.len(),
                 self.dataset.loaded_channels.step_fallback_hints.len()
             );
         }
@@ -3325,6 +3437,21 @@ fn draw_channel_cache_controls(ui: &mut egui::Ui, dataset: &DatasetState) {
             dataset.loaded_channels.line_tile_build_seconds()
         ));
     }
+    if !dataset.loaded_channels.step_edge_cache.is_empty() {
+        let edge_count = dataset
+            .loaded_channels
+            .step_edge_cache
+            .values()
+            .map(StepEdgeCache::edge_count)
+            .sum::<usize>();
+        ui.label(format!(
+            "Step edges: {} cached, {} edges ({:.1} MiB, build {:.3}s)",
+            dataset.loaded_channels.step_edge_cache.len(),
+            edge_count,
+            bytes_to_mib(dataset.loaded_channels.step_edge_memory_bytes()),
+            dataset.loaded_channels.step_edge_build_seconds()
+        ));
+    }
     for channel in dataset.loaded_channels.raw_by_channel.values() {
         let file_name = channel
             .path
@@ -3720,7 +3847,8 @@ fn draw_waveform_traces(
         let line_stroke = egui::Stroke::new(line_width, visible.color);
 
         match &visible.data {
-            VisibleTraceData::Envelope(envelope) => {
+            VisibleTraceData::Envelope(envelope)
+            | VisibleTraceData::DenseStepEnvelope(envelope) => {
                 let mut upper = Vec::with_capacity(envelope.buckets.len());
                 let mut lower = Vec::with_capacity(envelope.buckets.len());
                 for bucket in &envelope.buckets {
@@ -3793,14 +3921,18 @@ fn draw_raw_step_trace(
 
 fn trace_time_range(trace: &VisibleTrace) -> Option<(f64, f64)> {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.time_range,
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.time_range
+        }
         VisibleTraceData::RawStep(raw_step) => raw_step.time_range,
     }
 }
 
 fn trace_value_range(trace: &VisibleTrace) -> Option<(f64, f64)> {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.value_range,
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.value_range
+        }
         VisibleTraceData::RawStep(raw_step) => raw_step.value_range,
     }
 }
@@ -3838,21 +3970,27 @@ fn normalized_y_range(min: f64, max: f64) -> Option<(f64, f64)> {
 
 fn trace_source_sample_count(trace: &VisibleTrace) -> usize {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.source_sample_count,
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.source_sample_count
+        }
         VisibleTraceData::RawStep(raw_step) => raw_step.source_sample_count,
     }
 }
 
 fn trace_bucket_count(trace: &VisibleTrace) -> usize {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.bucket_count(),
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.bucket_count()
+        }
         VisibleTraceData::RawStep(_) => 0,
     }
 }
 
 fn trace_draw_point_count(trace: &VisibleTrace) -> usize {
     match &trace.data {
-        VisibleTraceData::Envelope(envelope) => envelope.draw_point_count(),
+        VisibleTraceData::Envelope(envelope) | VisibleTraceData::DenseStepEnvelope(envelope) => {
+            envelope.draw_point_count()
+        }
         VisibleTraceData::RawStep(raw_step) => raw_step.samples.len().saturating_mul(2),
     }
 }
@@ -3860,7 +3998,7 @@ fn trace_draw_point_count(trace: &VisibleTrace) -> usize {
 fn trace_step_kind(trace: &VisibleTrace) -> Option<StepTraceKind> {
     match &trace.data {
         VisibleTraceData::RawStep(raw_step) => Some(raw_step.kind),
-        VisibleTraceData::Envelope(_) => None,
+        VisibleTraceData::Envelope(_) | VisibleTraceData::DenseStepEnvelope(_) => None,
     }
 }
 
@@ -3969,16 +4107,21 @@ fn draw_axis_labels(
         .iter()
         .filter(|visible| trace_step_kind(visible) == Some(StepTraceKind::ChangePoints))
         .count();
+    let dense_step_count = visible_traces
+        .iter()
+        .filter(|visible| matches!(&visible.data, VisibleTraceData::DenseStepEnvelope(_)))
+        .count();
 
     painter.text(
         rect.left_top() + egui::vec2(0.0, -16.0),
         egui::Align2::LEFT_TOP,
         format!(
-            "{}  ch={}  step={}  edge={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
+            "{}  ch={}  step={}  edge={}  dense={}  visible_samples={}  raw_samples={}  buckets={}  draw_points={}",
             channel_label,
             visible_traces.len(),
             step_count,
             edge_step_count,
+            dense_step_count,
             source_sample_count,
             raw_sample_count,
             bucket_count,
@@ -4466,6 +4609,7 @@ fn build_change_point_step_trace(
     }
 }
 
+#[cfg(test)]
 fn build_change_point_step_trace_result(
     time: &[f64],
     values: &[f32],
@@ -4527,6 +4671,107 @@ fn build_change_point_step_trace_result(
                 previous_value = Some(value);
             }
         }
+    }
+
+    if samples.is_empty() || value_range.is_none() {
+        return StepTraceBuildResult::Empty;
+    }
+
+    StepTraceBuildResult::Trace(RawStepTrace {
+        samples,
+        source_sample_count: sample_range.source_sample_count,
+        time_range: Some((sample_range.range_start, sample_range.range_end)),
+        value_range,
+        kind: StepTraceKind::ChangePoints,
+    })
+}
+
+fn build_step_edge_cache(time: &[f64], values: &[f32]) -> StepEdgeCache {
+    let started = Instant::now();
+    let sample_count = time.len().min(values.len());
+    let mut edges = Vec::new();
+    let mut previous_value = None;
+
+    for index in 0..sample_count {
+        let sample_time = time[index];
+        let value = values[index];
+        if !sample_time.is_finite() || !value.is_finite() {
+            continue;
+        }
+
+        match previous_value {
+            Some(previous) if previous == value => {}
+            _ => {
+                edges.push(StepEdge {
+                    index,
+                    time: sample_time,
+                    value,
+                });
+                previous_value = Some(value);
+            }
+        }
+    }
+
+    StepEdgeCache {
+        sample_count,
+        edges,
+        elapsed: started.elapsed(),
+    }
+}
+
+fn build_change_point_step_trace_from_cache(
+    time: &[f64],
+    edge_cache: &StepEdgeCache,
+    time_range: (f64, f64),
+    max_change_points: usize,
+) -> StepTraceBuildResult {
+    let Some(sample_range) = visible_sample_range(time, edge_cache.sample_count, time_range) else {
+        return StepTraceBuildResult::Empty;
+    };
+    if sample_range.draw_sample_count == 0 || edge_cache.edges.is_empty() {
+        return StepTraceBuildResult::Empty;
+    }
+
+    let edge_start = edge_cache
+        .edges
+        .partition_point(|edge| edge.time < sample_range.range_start);
+    let edge_end = edge_cache
+        .edges
+        .partition_point(|edge| edge.time <= sample_range.range_end);
+    let visible_edge_count = edge_end.saturating_sub(edge_start);
+    let has_context = edge_start > 0;
+    let change_points = if has_context {
+        visible_edge_count
+    } else {
+        visible_edge_count.saturating_sub(1)
+    };
+
+    if change_points > max_change_points {
+        return StepTraceBuildResult::TooManyChangePoints {
+            source_sample_count: sample_range.source_sample_count,
+        };
+    }
+
+    let mut samples = Vec::with_capacity(visible_edge_count + usize::from(has_context));
+    let mut value_range = None;
+
+    if has_context {
+        let edge = edge_cache.edges[edge_start - 1];
+        samples.push(StepSample {
+            time: sample_range.range_start,
+            value: edge.value,
+        });
+        value_range = extend_range(value_range, f64::from(edge.value));
+    }
+
+    for edge in &edge_cache.edges[edge_start..edge_end] {
+        samples.push(StepSample {
+            time: edge
+                .time
+                .clamp(sample_range.range_start, sample_range.range_end),
+            value: edge.value,
+        });
+        value_range = extend_range(value_range, f64::from(edge.value));
     }
 
     if samples.is_empty() || value_range.is_none() {
@@ -5005,6 +5250,109 @@ mod app_tests {
                 source_sample_count: 5
             }
         );
+    }
+
+    #[test]
+    fn step_edge_cache_trace_preserves_edges_by_range_lookup() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let values = [0.0, 0.0, 0.0, 5.0, 5.0, 0.0, 0.0];
+        let cache = build_step_edge_cache(&time, &values);
+
+        let result = build_change_point_step_trace_from_cache(&time, &cache, (0.0, 6.0), 3);
+        let StepTraceBuildResult::Trace(trace) = result else {
+            panic!("expected cached edge trace");
+        };
+
+        assert_eq!(cache.edge_count(), 3);
+        assert_eq!(trace.kind, StepTraceKind::ChangePoints);
+        assert_eq!(trace.source_sample_count, 7);
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 0.0,
+                    value: 0.0,
+                },
+                StepSample {
+                    time: 3.0,
+                    value: 5.0,
+                },
+                StepSample {
+                    time: 5.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 5.0)));
+    }
+
+    #[test]
+    fn step_edge_cache_trace_carries_previous_state_at_range_start() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 5.0, 5.0, 0.0, 0.0];
+        let cache = build_step_edge_cache(&time, &values);
+
+        let result = build_change_point_step_trace_from_cache(&time, &cache, (2.5, 4.0), 3);
+        let StepTraceBuildResult::Trace(trace) = result else {
+            panic!("expected cached edge trace");
+        };
+
+        assert_eq!(
+            trace.samples,
+            vec![
+                StepSample {
+                    time: 2.5,
+                    value: 5.0,
+                },
+                StepSample {
+                    time: 3.0,
+                    value: 0.0,
+                },
+            ]
+        );
+        assert_eq!(trace.value_range, Some((0.0, 5.0)));
+    }
+
+    #[test]
+    fn step_edge_cache_trace_reports_dense_fallback() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let values = [0.0, 1.0, 0.0, 1.0, 0.0];
+        let cache = build_step_edge_cache(&time, &values);
+
+        let result = build_change_point_step_trace_from_cache(&time, &cache, (0.0, 4.0), 2);
+
+        assert_eq!(
+            result,
+            StepTraceBuildResult::TooManyChangePoints {
+                source_sample_count: 5
+            }
+        );
+    }
+
+    #[test]
+    fn channel_store_reuses_step_edge_cache() {
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let channel = parquet_waveform::ChannelData {
+            path: std::path::PathBuf::new(),
+            channel_name: "gate_pwm".to_owned(),
+            channel_path: "gate_pwm".to_owned(),
+            values: vec![0.0, 1.0, 0.0, 1.0, 0.0],
+            projected_column_index: 1,
+            elapsed: Duration::ZERO,
+        };
+        let mut store = ChannelStore::default();
+        store.insert_channel(channel);
+
+        let _ = store.cached_change_point_step_trace_result("gate_pwm", &time, (0.0, 4.0), 10);
+        let first_stats = store.last_envelope_stats;
+        let _ = store.cached_change_point_step_trace_result("gate_pwm", &time, (1.0, 3.0), 10);
+        let second_stats = store.last_envelope_stats;
+
+        assert_eq!(store.step_edge_cache.len(), 1);
+        assert_eq!(first_stats.step_edge_builds, 1);
+        assert_eq!(first_stats.step_edge_hits, 0);
+        assert_eq!(second_stats.step_edge_builds, 1);
+        assert_eq!(second_stats.step_edge_hits, 1);
     }
 
     #[test]

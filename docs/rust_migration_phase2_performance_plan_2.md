@@ -4,7 +4,7 @@ doc_type: Phase 2性能改善計画 その2
 target: Rust移植 Phase 2
 created: "2026-05-02"
 updated: "2026-05-02"
-status: 計画
+status: 一部実装済み
 source: "docs/rust_migration_phase2_performance_plan.md"
 implementation: "code/rust_phase1"
 ---
@@ -220,6 +220,15 @@ Phase 2性能改善の主戦略を、操作中previewから「イベントを隠
 - `step_validation_100k.parquet` の1sample進み/遅れ確認を維持する
 - gate_pwmの広範囲表示で無駄なchange-point走査が減る
 - dense表示でもedgeが少ない範囲では正確なStep表示へ戻る
+
+実装結果:
+
+- `ChannelStore` にStep channelごとのedge cacheを追加した
+- cacheは初回だけ `index/time/value` のchange-point listをlazy buildする
+- 表示rangeではedge listをbinary searchして、左端直前の状態とrange内edgeだけを抽出する
+- edge数が `MAX_STEP_CHANGE_POINTS` を超える場合はStep専用dense envelopeへfallbackする
+- dense envelopeはLine tile LODを使わず、Step fallbackとしてmin/max ribbonを描く
+- frame timing / benchにStep edge cache hit/buildとedge memoryを表示するようにした
 
 ### 5.6 channel並列化
 
