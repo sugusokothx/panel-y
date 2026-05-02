@@ -1,5 +1,6 @@
 use eframe::egui;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,7 @@ const DEFAULT_TRACE_LINE_WIDTH: f32 = 1.25;
 const MIN_TRACE_LINE_WIDTH: f32 = 0.5;
 const MAX_TRACE_LINE_WIDTH: f32 = 6.0;
 const MAX_HOVER_READOUT_CHANNELS: usize = 4;
+const MAX_RECENT_PARQUET_PATHS: usize = 8;
 
 fn main() -> eframe::Result {
     if let Some(command) = cli_command_arg() {
@@ -181,6 +183,7 @@ struct PanelYApp {
 #[derive(Debug)]
 struct DatasetState {
     parquet_path: String,
+    recent_parquet_paths: Vec<String>,
     schema: Option<parquet_schema::SchemaSummary>,
     shared_time: Option<parquet_waveform::TimeData>,
     loaded_channels: ChannelStore,
@@ -189,6 +192,9 @@ struct DatasetState {
 #[derive(Debug)]
 struct ViewState {
     selected_channel: String,
+    channel_filter: String,
+    channel_state_filter: ChannelStateFilter,
+    channel_sort: ChannelSort,
     selected_row_id: Option<u64>,
     next_row_id: u64,
     x_range: Option<(f64, f64)>,
@@ -257,6 +263,43 @@ struct LoadJobResult {
 struct LoadedChannelData {
     time: Option<parquet_waveform::TimeData>,
     channel: Option<parquet_waveform::ChannelData>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SchemaControlsResponse {
+    selection_changed: bool,
+    load_channel: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ParquetPathValidationError {
+    Empty,
+    Missing { path: String },
+    NotAccessible { path: String, error: String },
+    NotFile { path: String },
+    WrongExtension { path: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChannelLoadState {
+    Loaded,
+    Loading,
+    Unloaded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChannelStateFilter {
+    All,
+    Loaded,
+    Loading,
+    Unloaded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChannelSort {
+    SchemaOrder,
+    Name,
+    LoadedFirst,
 }
 
 #[derive(Clone, Debug)]
@@ -446,8 +489,10 @@ impl Default for PanelYApp {
 
 impl Default for DatasetState {
     fn default() -> Self {
+        let parquet_path = default_parquet_path();
         Self {
-            parquet_path: default_parquet_path(),
+            parquet_path: parquet_path.clone(),
+            recent_parquet_paths: vec![parquet_path],
             schema: None,
             shared_time: None,
             loaded_channels: ChannelStore::default(),
@@ -459,6 +504,9 @@ impl Default for ViewState {
     fn default() -> Self {
         Self {
             selected_channel: String::new(),
+            channel_filter: String::new(),
+            channel_state_filter: ChannelStateFilter::All,
+            channel_sort: ChannelSort::SchemaOrder,
             selected_row_id: Some(0),
             next_row_id: 1,
             x_range: None,
@@ -714,14 +762,285 @@ impl RowChannel {
 }
 
 fn default_parquet_path() -> String {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../proto_3_1b/data/test_100k.parquet")
         .display()
         .to_string()
 }
 
+impl ParquetPathValidationError {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Empty => "Parquet path is empty",
+            Self::Missing { .. }
+            | Self::NotAccessible { .. }
+            | Self::NotFile { .. }
+            | Self::WrongExtension { .. } => "Invalid Parquet path",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Empty => "Enter a .parquet file path or choose one with Browse.".to_owned(),
+            Self::Missing { path } => format!("File does not exist:\n{path}"),
+            Self::NotAccessible { path, error } => {
+                format!("Cannot check this path:\n{path}\n\nDetails: {error}")
+            }
+            Self::NotFile { path } => format!("Path is not a file:\n{path}"),
+            Self::WrongExtension { path } => {
+                format!("Expected a .parquet file, but got:\n{path}")
+            }
+        }
+    }
+}
+
+fn validate_parquet_path(path: &str) -> Result<PathBuf, ParquetPathValidationError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(ParquetPathValidationError::Empty);
+    }
+
+    let path = PathBuf::from(trimmed);
+    let display_path = path.display().to_string();
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(ParquetPathValidationError::Missing { path: display_path });
+        }
+        Err(error) => {
+            return Err(ParquetPathValidationError::NotAccessible {
+                path: display_path,
+                error: error.to_string(),
+            });
+        }
+    }
+
+    if !path.is_file() {
+        return Err(ParquetPathValidationError::NotFile { path: display_path });
+    }
+
+    let has_parquet_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"));
+    if !has_parquet_extension {
+        return Err(ParquetPathValidationError::WrongExtension { path: display_path });
+    }
+
+    Ok(path)
+}
+
+fn format_schema_load_error(path: &Path, error: &str) -> String {
+    format!(
+        "Could not load the Parquet schema.\nPath:\n{}\n\nDetails: {error}\n\nThe file exists and has a .parquet extension, but the metadata could not be read.",
+        path.display()
+    )
+}
+
+fn remember_recent_parquet_path(recent_paths: &mut Vec<String>, path: impl Into<String>) {
+    let path = path.into();
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+
+    let path = path.to_owned();
+    recent_paths.retain(|current| current != &path);
+    recent_paths.insert(0, path);
+    recent_paths.truncate(MAX_RECENT_PARQUET_PATHS);
+}
+
+fn recent_path_label(path: &str) -> String {
+    let path_ref = Path::new(path);
+    let file_name = path_ref
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    let parent_name = path_ref
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str());
+
+    match parent_name {
+        Some(parent_name) if !parent_name.is_empty() => format!("{file_name} ({parent_name})"),
+        _ => file_name.to_owned(),
+    }
+}
+
+fn parquet_dialog_directory(path: &str) -> Option<PathBuf> {
+    let path = Path::new(path.trim());
+    if path.is_dir() {
+        return Some(path.to_path_buf());
+    }
+
+    path.parent()
+        .filter(|parent| parent.exists())
+        .map(Path::to_path_buf)
+}
+
+impl ChannelLoadState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Loading => "loading",
+            Self::Unloaded => "unloaded",
+        }
+    }
+
+    fn action_label(self) -> &'static str {
+        match self {
+            Self::Loaded => "Add",
+            Self::Loading => "Loading",
+            Self::Unloaded => "Load",
+        }
+    }
+
+    fn can_load_or_add(self) -> bool {
+        !matches!(self, Self::Loading)
+    }
+}
+
+impl ChannelStateFilter {
+    const ALL: [Self; 4] = [Self::All, Self::Loaded, Self::Loading, Self::Unloaded];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Loaded => "Loaded",
+            Self::Loading => "Loading",
+            Self::Unloaded => "Unloaded",
+        }
+    }
+
+    fn matches(self, load_state: ChannelLoadState) -> bool {
+        match self {
+            Self::All => true,
+            Self::Loaded => load_state == ChannelLoadState::Loaded,
+            Self::Loading => load_state == ChannelLoadState::Loading,
+            Self::Unloaded => load_state == ChannelLoadState::Unloaded,
+        }
+    }
+}
+
+impl ChannelSort {
+    const ALL: [Self; 3] = [Self::SchemaOrder, Self::Name, Self::LoadedFirst];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SchemaOrder => "Schema order",
+            Self::Name => "Name",
+            Self::LoadedFirst => "Loaded first",
+        }
+    }
+}
+
+fn channel_load_state(
+    channel_path: &str,
+    loaded_channels: &ChannelStore,
+    loading_channel_paths: &BTreeSet<String>,
+) -> ChannelLoadState {
+    if loaded_channels.has_channel(channel_path) {
+        ChannelLoadState::Loaded
+    } else if loading_channel_paths.contains(channel_path) {
+        ChannelLoadState::Loading
+    } else {
+        ChannelLoadState::Unloaded
+    }
+}
+
+fn channel_list_entries<'a>(
+    channels: &'a [parquet_schema::ColumnInfo],
+    text_filter: &str,
+    state_filter: ChannelStateFilter,
+    sort: ChannelSort,
+    loaded_channels: &ChannelStore,
+    loading_channel_paths: &BTreeSet<String>,
+) -> Vec<(&'a parquet_schema::ColumnInfo, ChannelLoadState)> {
+    let mut entries = channels
+        .iter()
+        .filter_map(|channel| {
+            let load_state =
+                channel_load_state(&channel.path, loaded_channels, loading_channel_paths);
+            (channel_matches_filter(channel, text_filter) && state_filter.matches(load_state))
+                .then_some((channel, load_state))
+        })
+        .collect::<Vec<_>>();
+
+    match sort {
+        ChannelSort::SchemaOrder => {}
+        ChannelSort::Name => {
+            entries.sort_by(|(left, _), (right, _)| {
+                left.display_name()
+                    .to_ascii_lowercase()
+                    .cmp(&right.display_name().to_ascii_lowercase())
+                    .then(left.index.cmp(&right.index))
+            });
+        }
+        ChannelSort::LoadedFirst => {
+            entries.sort_by(|(left, left_state), (right, right_state)| {
+                channel_loaded_first_rank(*left_state)
+                    .cmp(&channel_loaded_first_rank(*right_state))
+                    .then(left.index.cmp(&right.index))
+            });
+        }
+    }
+
+    entries
+}
+
+fn channel_loaded_first_rank(load_state: ChannelLoadState) -> usize {
+    match load_state {
+        ChannelLoadState::Loaded => 0,
+        ChannelLoadState::Loading => 1,
+        ChannelLoadState::Unloaded => 2,
+    }
+}
+
+fn channel_matches_filter(channel: &parquet_schema::ColumnInfo, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+
+    let filter = filter.to_ascii_lowercase();
+    channel.name.to_ascii_lowercase().contains(&filter)
+        || channel.path.to_ascii_lowercase().contains(&filter)
+        || channel
+            .display_name()
+            .to_ascii_lowercase()
+            .contains(&filter)
+}
+
+fn estimated_sample_rate_hz(sample_count: usize, time_range: Option<(f64, f64)>) -> Option<f64> {
+    let (start, end) = time_range?;
+    let span = (end - start).abs();
+    if sample_count < 2 || !span.is_finite() || span <= 0.0 {
+        return None;
+    }
+
+    Some((sample_count - 1) as f64 / span)
+}
+
+fn format_frequency_hz(frequency_hz: f64) -> String {
+    let frequency_hz = frequency_hz.abs();
+    if !frequency_hz.is_finite() {
+        return "-".to_owned();
+    }
+
+    if frequency_hz >= 1_000_000.0 {
+        format!("{:.3} MHz", frequency_hz / 1_000_000.0)
+    } else if frequency_hz >= 1_000.0 {
+        format!("{:.3} kHz", frequency_hz / 1_000.0)
+    } else {
+        format!("{frequency_hz:.3} Hz")
+    }
+}
+
 impl ViewState {
     fn reset_for_schema(&mut self, schema: &parquet_schema::SchemaSummary) {
+        self.channel_filter.clear();
+        self.channel_state_filter = ChannelStateFilter::All;
+        self.channel_sort = ChannelSort::SchemaOrder;
         if !schema
             .channels
             .iter()
@@ -743,6 +1062,9 @@ impl ViewState {
 
     fn reset_empty(&mut self) {
         self.selected_channel.clear();
+        self.channel_filter.clear();
+        self.channel_state_filter = ChannelStateFilter::All;
+        self.channel_sort = ChannelSort::SchemaOrder;
         self.x_range = None;
         self.hover_x = None;
         self.selected_row_id = Some(0);
@@ -2282,14 +2604,85 @@ fn spawn_load_channel_job(
 }
 
 impl PanelYApp {
+    fn select_parquet_path(&mut self, path: String) {
+        if self.load.is_busy() {
+            self.load.status = "Wait for active load jobs before changing Parquet path".to_owned();
+            return;
+        }
+
+        let path = path.trim().to_owned();
+        if path.is_empty() {
+            return;
+        }
+
+        if self.dataset.parquet_path != path {
+            self.dataset.parquet_path = path.clone();
+            self.reset_dataset_after_path_change();
+        }
+        remember_recent_parquet_path(&mut self.dataset.recent_parquet_paths, path);
+        self.load.error = None;
+        self.load.status = "Selected Parquet path. Load schema to continue.".to_owned();
+    }
+
+    fn reset_dataset_after_path_change(&mut self) {
+        self.dataset.schema = None;
+        self.dataset.shared_time = None;
+        self.dataset.loaded_channels.clear_all();
+        self.view.reset_empty();
+        self.load.progress = None;
+        self.load.error = None;
+        self.load.status = "Path changed. Load schema to continue.".to_owned();
+    }
+
+    fn clear_dataset_after_schema_failure(&mut self) {
+        self.dataset.schema = None;
+        self.dataset.shared_time = None;
+        self.dataset.loaded_channels.clear_all();
+        self.view.reset_empty();
+        self.load.progress = None;
+    }
+
+    fn browse_parquet_path(&mut self) {
+        if self.load.is_busy() {
+            self.load.status = "Wait for active load jobs before browsing".to_owned();
+            return;
+        }
+
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open Parquet file")
+            .add_filter("Parquet", &["parquet"]);
+        if let Some(directory) = parquet_dialog_directory(&self.dataset.parquet_path) {
+            dialog = dialog.set_directory(directory);
+        }
+
+        if let Some(path) = dialog.pick_file() {
+            self.select_parquet_path(path.display().to_string());
+        }
+    }
+
     fn load_schema(&mut self) {
         if self.load.is_busy() {
             self.load.status = "Wait for active load jobs before loading schema".to_owned();
             return;
         }
 
-        match parquet_schema::read_schema_summary(&self.dataset.parquet_path) {
+        let parquet_path = match validate_parquet_path(&self.dataset.parquet_path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.clear_dataset_after_schema_failure();
+                self.load.status = error.status().to_owned();
+                self.load.error = Some(error.message());
+                return;
+            }
+        };
+
+        match parquet_schema::read_schema_summary(&parquet_path) {
             Ok(summary) => {
+                self.dataset.parquet_path = parquet_path.display().to_string();
+                remember_recent_parquet_path(
+                    &mut self.dataset.recent_parquet_paths,
+                    self.dataset.parquet_path.clone(),
+                );
                 let time_status = if summary.time_column.is_some() {
                     "time column detected"
                 } else {
@@ -2308,12 +2701,9 @@ impl PanelYApp {
                 self.dataset.schema = Some(summary);
             }
             Err(error) => {
-                self.load.status = format!("Schema load failed: {error}");
-                self.load.error = Some(error);
-                self.dataset.schema = None;
-                self.dataset.shared_time = None;
-                self.dataset.loaded_channels.clear_all();
-                self.view.reset_empty();
+                self.clear_dataset_after_schema_failure();
+                self.load.status = "Schema load failed".to_owned();
+                self.load.error = Some(format_schema_load_error(&parquet_path, &error));
             }
         }
     }
@@ -3125,17 +3515,102 @@ impl eframe::App for PanelYApp {
                     .show(ui, |ui| {
                         ui.heading("Dataset");
                         ui.label("Parquet path");
-                        ui.add_enabled(
-                            !load_active,
-                            egui::TextEdit::singleline(&mut self.dataset.parquet_path),
-                        );
+                        ui.horizontal(|ui| {
+                            let browse_width = 72.0;
+                            let text_width = (ui.available_width()
+                                - browse_width
+                                - ui.spacing().item_spacing.x)
+                                .max(80.0);
+                            let path_before_edit = self.dataset.parquet_path.clone();
+                            let path_response = ui.add_enabled(
+                                !load_active,
+                                egui::TextEdit::singleline(&mut self.dataset.parquet_path)
+                                    .desired_width(text_width),
+                            );
+                            if path_response.changed()
+                                && self.dataset.parquet_path != path_before_edit
+                            {
+                                self.reset_dataset_after_path_change();
+                            }
+
+                            if ui
+                                .add_enabled(
+                                    !load_active,
+                                    egui::Button::new("Browse").min_size(egui::vec2(
+                                        browse_width,
+                                        ui.spacing().interact_size.y,
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                self.browse_parquet_path();
+                            }
+                        });
+
+                        let parquet_path_validation =
+                            validate_parquet_path(&self.dataset.parquet_path);
+                        match &parquet_path_validation {
+                            Ok(path) => {
+                                ui.label(format!("Ready: {}", path.display()));
+                            }
+                            Err(error) => {
+                                ui.colored_label(ui.visuals().warn_fg_color, error.message());
+                            }
+                        }
+
+                        if !self.dataset.recent_parquet_paths.is_empty() {
+                            let mut selected_recent_path = None;
+                            ui.horizontal(|ui| {
+                                ui.label("Recent");
+                                egui::ComboBox::from_id_salt("recent_parquet_paths")
+                                    .selected_text("Choose...")
+                                    .show_ui(ui, |ui| {
+                                        for path in &self.dataset.recent_parquet_paths {
+                                            let response = ui.selectable_label(
+                                                self.dataset.parquet_path == *path,
+                                                recent_path_label(path),
+                                            );
+                                            if response.clicked() {
+                                                selected_recent_path = Some(path.clone());
+                                            }
+                                            response.on_hover_text(path);
+                                        }
+                                    });
+                            });
+                            if let Some(path) = selected_recent_path {
+                                self.select_parquet_path(path);
+                            }
+                        }
 
                         ui.add_space(12.0);
                         if ui
-                            .add_enabled(!load_active, egui::Button::new("Load Schema"))
+                            .add_enabled(
+                                !load_active && parquet_path_validation.is_ok(),
+                                egui::Button::new("Load Schema"),
+                            )
                             .clicked()
                         {
                             self.load_schema();
+                        }
+
+                        if let Some(error) = self.load.error.clone() {
+                            let mut clear_error = false;
+                            ui.add_space(8.0);
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(ui.visuals().warn_fg_color, "Load issue");
+                                    if ui.button("Clear").clicked() {
+                                        clear_error = true;
+                                    }
+                                });
+                                ui.add(egui::Label::new(error).wrap());
+                            });
+                            if clear_error {
+                                self.load.error = None;
+                                if !load_active {
+                                    self.load.status = "Ready".to_owned();
+                                }
+                            }
                         }
 
                         let can_load_waveform =
@@ -3152,13 +3627,19 @@ impl eframe::App for PanelYApp {
                         }
 
                         ui.add_space(16.0);
-                        if draw_schema_controls(
+                        let schema_response = draw_schema_controls(
                             ui,
-                            &mut self.view.selected_channel,
-                            self.dataset.schema.as_ref(),
-                        ) {
+                            &mut self.view,
+                            &self.dataset,
+                            &loading_channel_paths,
+                        );
+                        if schema_response.selection_changed {
                             self.load.status =
                                 format!("Selected channel: {}", self.view.selected_channel);
+                        }
+                        if let Some(channel_path) = schema_response.load_channel {
+                            self.view.selected_channel = channel_path;
+                            self.load_selected_channel(ui.ctx());
                         }
 
                         if self.dataset.shared_time.is_some() || self.view.has_visible_channels() {
@@ -3320,84 +3801,305 @@ impl eframe::App for PanelYApp {
 
 fn draw_schema_controls(
     ui: &mut egui::Ui,
-    selected_channel: &mut String,
-    schema: Option<&parquet_schema::SchemaSummary>,
-) -> bool {
+    view: &mut ViewState,
+    dataset: &DatasetState,
+    loading_channel_paths: &BTreeSet<String>,
+) -> SchemaControlsResponse {
     ui.heading("Schema");
 
+    let schema = dataset.schema.as_ref();
     let Some(schema) = schema else {
         ui.label("No schema loaded");
-        return false;
+        return SchemaControlsResponse::default();
     };
 
-    let mut selection_changed = false;
+    let mut response = SchemaControlsResponse::default();
 
-    ui.label(format!("Rows: {}", schema.row_count));
-    ui.label(format!("Row groups: {}", schema.row_group_count));
-    ui.label(format!("Columns: {}", schema.column_count));
-
-    match &schema.time_column {
-        Some(time_column) => {
-            ui.label(format!("Time: {}", time_column.display_name()));
-        }
-        None => {
-            ui.colored_label(ui.visuals().warn_fg_color, "Time: not found");
-        }
-    }
+    draw_schema_summary(ui, dataset, schema);
 
     ui.add_space(12.0);
-    ui.heading("Channel");
+    ui.heading("Channels");
+    draw_target_row_selector(ui, view);
+
+    draw_channel_browser_controls(ui, view);
+
     if schema.channels.is_empty() {
         ui.label("No numeric channels found");
     } else {
-        let selected_text = schema
-            .channels
-            .iter()
-            .find(|channel| channel.path == *selected_channel)
-            .map(|channel| channel.display_name())
-            .unwrap_or_else(|| selected_channel.as_str());
+        let channel_filter = view.channel_filter.clone();
+        let state_filter = view.channel_state_filter;
+        let sort = view.channel_sort;
+        let target_row_label = view.selected_row_display_name();
+        let entries = channel_list_entries(
+            &schema.channels,
+            &channel_filter,
+            state_filter,
+            sort,
+            &dataset.loaded_channels,
+            loading_channel_paths,
+        );
+        ui.label(format!(
+            "{} / {} channels",
+            entries.len(),
+            schema.channels.len()
+        ));
 
-        egui::ComboBox::from_id_salt("selected_channel")
-            .selected_text(selected_text)
-            .show_ui(ui, |ui| {
-                for channel in &schema.channels {
-                    if ui
-                        .selectable_value(
-                            selected_channel,
-                            channel.path.clone(),
-                            channel.display_name(),
-                        )
-                        .changed()
-                    {
-                        selection_changed = true;
-                    }
+        egui::ScrollArea::vertical()
+            .id_salt("channel_list")
+            .max_height(320.0)
+            .show(ui, |ui| {
+                if entries.is_empty() {
+                    ui.label("No channels match the filter");
+                }
+
+                for (channel, load_state) in entries {
+                    draw_channel_list_row(
+                        ui,
+                        view,
+                        channel,
+                        load_state,
+                        &target_row_label,
+                        &mut response,
+                    );
                 }
             });
     }
 
-    ui.add_space(12.0);
-    ui.heading("Columns");
-    egui::ScrollArea::vertical()
-        .max_height(360.0)
-        .show(ui, |ui| {
-            for column in &schema.columns {
-                let role = column.role.as_str();
-                let logical = column.logical_type.as_deref().unwrap_or("-");
-                let numeric = if column.is_numeric { "num" } else { "-" };
-                ui.monospace(format!(
-                    "#{:02} {:<7} {:<3} {:<8} {} ({}, {})",
-                    column.index,
-                    role,
-                    numeric,
-                    column.physical_type,
-                    column.display_name(),
-                    logical,
-                    column.converted_type
-                ));
+    draw_selected_channel_details(ui, view, dataset, schema, loading_channel_paths);
+    draw_raw_columns(ui, schema);
+
+    response
+}
+
+fn draw_channel_browser_controls(ui: &mut egui::Ui, view: &mut ViewState) {
+    ui.horizontal(|ui| {
+        ui.label("Filter");
+        ui.add(
+            egui::TextEdit::singleline(&mut view.channel_filter)
+                .hint_text("channel name or path")
+                .desired_width(ui.available_width().max(80.0)),
+        );
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("State");
+        egui::ComboBox::from_id_salt("channel_state_filter")
+            .selected_text(view.channel_state_filter.as_str())
+            .show_ui(ui, |ui| {
+                for state_filter in ChannelStateFilter::ALL {
+                    ui.selectable_value(
+                        &mut view.channel_state_filter,
+                        state_filter,
+                        state_filter.as_str(),
+                    );
+                }
+            });
+
+        ui.label("Sort");
+        egui::ComboBox::from_id_salt("channel_sort")
+            .selected_text(view.channel_sort.as_str())
+            .show_ui(ui, |ui| {
+                for sort in ChannelSort::ALL {
+                    ui.selectable_value(&mut view.channel_sort, sort, sort.as_str());
+                }
+            });
+    });
+}
+
+fn draw_channel_list_row(
+    ui: &mut egui::Ui,
+    view: &mut ViewState,
+    channel: &parquet_schema::ColumnInfo,
+    load_state: ChannelLoadState,
+    target_row_label: &str,
+    response: &mut SchemaControlsResponse,
+) {
+    let selected = view.selected_channel == channel.path;
+    ui.push_id(("channel", channel.path.clone()), |ui| {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    load_state.can_load_or_add(),
+                    egui::Button::new(load_state.action_label())
+                        .min_size(egui::vec2(52.0, ui.spacing().interact_size.y)),
+                )
+                .on_hover_text(format!(
+                    "{} {} to {}",
+                    load_state.action_label(),
+                    channel.display_name(),
+                    target_row_label
+                ))
+                .clicked()
+            {
+                view.selected_channel = channel.path.clone();
+                response.selection_changed = true;
+                response.load_channel = Some(channel.path.clone());
+            }
+
+            ui.monospace(format!("{:<8}", load_state.as_str()));
+            ui.monospace(format!("#{:02}", channel.index));
+
+            if ui
+                .selectable_label(selected, compact_channel_label(channel.display_name(), 24))
+                .on_hover_text(&channel.path)
+                .clicked()
+            {
+                view.selected_channel = channel.path.clone();
+                response.selection_changed = true;
             }
         });
+    });
+}
 
-    selection_changed
+fn draw_selected_channel_details(
+    ui: &mut egui::Ui,
+    view: &ViewState,
+    dataset: &DatasetState,
+    schema: &parquet_schema::SchemaSummary,
+    loading_channel_paths: &BTreeSet<String>,
+) {
+    if view.selected_channel.is_empty() {
+        return;
+    }
+
+    ui.add_space(8.0);
+    let Some(channel) = schema
+        .channels
+        .iter()
+        .find(|channel| channel.path == view.selected_channel)
+    else {
+        ui.label(format!("Selected: {}", view.selected_channel));
+        return;
+    };
+
+    let load_state = channel_load_state(
+        &channel.path,
+        &dataset.loaded_channels,
+        loading_channel_paths,
+    );
+    let rows = channel_row_membership(view, &channel.path);
+    let rows = if rows.is_empty() {
+        "none".to_owned()
+    } else {
+        rows.join(", ")
+    };
+    let logical = channel.logical_type.as_deref().unwrap_or("-");
+    let loaded_note = dataset
+        .loaded_channels
+        .channel(&channel.path)
+        .map(|loaded| {
+            format!(
+                "{} samples, {:.1} MiB, read {:.3}s",
+                loaded.sample_count(),
+                bytes_to_mib(loaded.memory_bytes()),
+                loaded.elapsed.as_secs_f64()
+            )
+        })
+        .unwrap_or_else(|| "not loaded".to_owned());
+
+    ui.group(|ui| {
+        ui.label("Selected channel");
+        ui.monospace(channel.display_name());
+        ui.label(format!("State: {}", load_state.as_str()));
+        ui.label(format!("Rows: {rows}"));
+        ui.label(format!("Index: #{}", channel.index));
+        ui.label(format!("Type: {} / {}", channel.physical_type, logical));
+        ui.label(format!("Cache: {loaded_note}"));
+        ui.monospace(format!("Path: {}", channel.path));
+    });
+}
+
+fn channel_row_membership(view: &ViewState, channel_path: &str) -> Vec<String> {
+    view.rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.channels
+                .iter()
+                .any(|channel| channel.channel_path == channel_path)
+        })
+        .map(|(index, _)| format!("Row {}", index + 1))
+        .collect()
+}
+
+fn draw_raw_columns(ui: &mut egui::Ui, schema: &parquet_schema::SchemaSummary) {
+    ui.add_space(12.0);
+    egui::CollapsingHeader::new("Raw columns")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for column in &schema.columns {
+                        let role = column.role.as_str();
+                        let logical = column.logical_type.as_deref().unwrap_or("-");
+                        let numeric = if column.is_numeric { "num" } else { "-" };
+                        ui.monospace(format!(
+                            "#{:02} {:<7} {:<3} {:<8} {} ({}, {})",
+                            column.index,
+                            role,
+                            numeric,
+                            column.physical_type,
+                            column.display_name(),
+                            logical,
+                            column.converted_type
+                        ));
+                    }
+                });
+        });
+}
+
+fn draw_schema_summary(
+    ui: &mut egui::Ui,
+    dataset: &DatasetState,
+    schema: &parquet_schema::SchemaSummary,
+) {
+    ui.label(format!("Rows: {}", schema.row_count));
+    ui.label(format!("Row groups: {}", schema.row_group_count));
+    ui.label(format!("Columns: {}", schema.column_count));
+    ui.label(format!("Numeric channels: {}", schema.channels.len()));
+
+    match &schema.time_column {
+        Some(time_column) => {
+            ui.label(format!("Time column: {}", time_column.display_name()));
+        }
+        None => {
+            ui.colored_label(ui.visuals().warn_fg_color, "Time column: not found");
+        }
+    }
+
+    if let Some(time) = &dataset.shared_time {
+        ui.label(format!("Time range: {} s", format_range(time.time_range())));
+        let sample_rate = estimated_sample_rate_hz(time.sample_count(), time.time_range())
+            .map(format_frequency_hz)
+            .unwrap_or_else(|| "-".to_owned());
+        ui.label(format!("Estimated sample rate: {sample_rate}"));
+    } else {
+        ui.label("Time range: not loaded");
+        ui.label("Estimated sample rate: -");
+    }
+}
+
+fn draw_target_row_selector(ui: &mut egui::Ui, view: &mut ViewState) {
+    view.ensure_row_state();
+    let mut selected_row_id = view.selected_row_id;
+
+    ui.horizontal(|ui| {
+        ui.label("Target row");
+        egui::ComboBox::from_id_salt("channel_list_target_row")
+            .selected_text(view.selected_row_display_name())
+            .show_ui(ui, |ui| {
+                for (row_index, row) in view.rows.iter().enumerate() {
+                    ui.selectable_value(
+                        &mut selected_row_id,
+                        Some(row.id),
+                        format!("Row {}", row_index + 1),
+                    );
+                }
+            });
+    });
+
+    view.selected_row_id = selected_row_id;
 }
 
 fn draw_channel_cache_controls(ui: &mut egui::Ui, dataset: &DatasetState) {
@@ -4931,6 +5633,19 @@ fn normalized_range((start, end): (f64, f64)) -> Option<(f64, f64)> {
 mod app_tests {
     use super::*;
 
+    fn test_channel_info(index: usize, name: &str) -> parquet_schema::ColumnInfo {
+        parquet_schema::ColumnInfo {
+            index,
+            name: name.to_owned(),
+            path: name.to_owned(),
+            physical_type: "FLOAT".to_owned(),
+            logical_type: None,
+            converted_type: "NONE".to_owned(),
+            is_numeric: true,
+            role: parquet_schema::ColumnRole::Channel,
+        }
+    }
+
     #[test]
     fn adds_channels_to_the_selected_row() {
         let mut view = ViewState::default();
@@ -5398,6 +6113,238 @@ mod app_tests {
     #[test]
     fn preview_is_disabled_by_default() {
         assert!(!ViewState::default().large_preview_enabled);
+    }
+
+    #[test]
+    fn channel_filter_matches_name_or_path_case_insensitively() {
+        let channel = parquet_schema::ColumnInfo {
+            index: 3,
+            name: "GatePWM".to_owned(),
+            path: "motor/gate_pwm".to_owned(),
+            physical_type: "FLOAT".to_owned(),
+            logical_type: None,
+            converted_type: "NONE".to_owned(),
+            is_numeric: true,
+            role: parquet_schema::ColumnRole::Channel,
+        };
+
+        assert!(channel_matches_filter(&channel, ""));
+        assert!(channel_matches_filter(&channel, "gate"));
+        assert!(channel_matches_filter(&channel, "MOTOR/"));
+        assert!(!channel_matches_filter(&channel, "current"));
+    }
+
+    #[test]
+    fn channel_load_state_prioritizes_loaded_over_loading() {
+        let mut store = ChannelStore::default();
+        store.insert_channel(parquet_waveform::ChannelData {
+            path: PathBuf::new(),
+            channel_name: "iu".to_owned(),
+            channel_path: "iu".to_owned(),
+            values: vec![1.0, 2.0],
+            projected_column_index: 1,
+            elapsed: Duration::ZERO,
+        });
+        let mut loading = BTreeSet::new();
+        loading.insert("iu".to_owned());
+        loading.insert("iv".to_owned());
+
+        assert_eq!(
+            channel_load_state("iu", &store, &loading),
+            ChannelLoadState::Loaded
+        );
+        assert_eq!(
+            channel_load_state("iv", &store, &loading),
+            ChannelLoadState::Loading
+        );
+        assert_eq!(
+            channel_load_state("iw", &store, &loading),
+            ChannelLoadState::Unloaded
+        );
+    }
+
+    #[test]
+    fn channel_state_filter_matches_expected_load_states() {
+        assert!(ChannelStateFilter::All.matches(ChannelLoadState::Loaded));
+        assert!(ChannelStateFilter::All.matches(ChannelLoadState::Loading));
+        assert!(ChannelStateFilter::Loaded.matches(ChannelLoadState::Loaded));
+        assert!(!ChannelStateFilter::Loaded.matches(ChannelLoadState::Unloaded));
+        assert!(ChannelStateFilter::Unloaded.matches(ChannelLoadState::Unloaded));
+        assert!(!ChannelStateFilter::Unloaded.matches(ChannelLoadState::Loading));
+    }
+
+    #[test]
+    fn channel_list_entries_filter_and_sort_channels() {
+        let channels = vec![
+            test_channel_info(0, "zeta"),
+            test_channel_info(1, "alpha"),
+            test_channel_info(2, "beta"),
+        ];
+        let mut store = ChannelStore::default();
+        store.insert_channel(parquet_waveform::ChannelData {
+            path: PathBuf::new(),
+            channel_name: "beta".to_owned(),
+            channel_path: "beta".to_owned(),
+            values: vec![1.0, 2.0],
+            projected_column_index: 2,
+            elapsed: Duration::ZERO,
+        });
+        let mut loading = BTreeSet::new();
+        loading.insert("zeta".to_owned());
+
+        let by_name = channel_list_entries(
+            &channels,
+            "",
+            ChannelStateFilter::All,
+            ChannelSort::Name,
+            &store,
+            &loading,
+        );
+        assert_eq!(
+            by_name
+                .iter()
+                .map(|(channel, _)| channel.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "zeta"]
+        );
+
+        let loaded_first = channel_list_entries(
+            &channels,
+            "",
+            ChannelStateFilter::All,
+            ChannelSort::LoadedFirst,
+            &store,
+            &loading,
+        );
+        assert_eq!(
+            loaded_first
+                .iter()
+                .map(|(channel, state)| (channel.path.as_str(), *state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("beta", ChannelLoadState::Loaded),
+                ("zeta", ChannelLoadState::Loading),
+                ("alpha", ChannelLoadState::Unloaded),
+            ]
+        );
+
+        let unloaded = channel_list_entries(
+            &channels,
+            "a",
+            ChannelStateFilter::Unloaded,
+            ChannelSort::SchemaOrder,
+            &store,
+            &loading,
+        );
+        assert_eq!(
+            unloaded
+                .iter()
+                .map(|(channel, _)| channel.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+    }
+
+    #[test]
+    fn channel_row_membership_reports_rows_that_contain_channel() {
+        let mut view = ViewState::default();
+        view.add_channel_to_selected_row("iu");
+        view.add_row();
+        view.add_channel_to_selected_row("iv");
+        view.add_row();
+        view.add_channel_to_selected_row("iu");
+
+        assert_eq!(channel_row_membership(&view, "iu"), vec!["Row 1", "Row 3"]);
+        assert_eq!(channel_row_membership(&view, "iw"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn estimated_sample_rate_uses_sample_intervals() {
+        assert_eq!(
+            estimated_sample_rate_hz(1001, Some((0.0, 1.0))),
+            Some(1000.0)
+        );
+        assert_eq!(estimated_sample_rate_hz(1, Some((0.0, 1.0))), None);
+        assert_eq!(estimated_sample_rate_hz(100, Some((1.0, 1.0))), None);
+    }
+
+    #[test]
+    fn frequency_formatter_scales_units() {
+        assert_eq!(format_frequency_hz(500.0), "500.000 Hz");
+        assert_eq!(format_frequency_hz(12_500.0), "12.500 kHz");
+        assert_eq!(format_frequency_hz(2_500_000.0), "2.500 MHz");
+    }
+
+    #[test]
+    fn parquet_path_validation_accepts_existing_parquet_file() {
+        let path =
+            std::env::temp_dir().join(format!("panel_y_validation_{}.PARQUET", std::process::id()));
+        std::fs::write(&path, b"placeholder").expect("write temp parquet path");
+
+        let result = validate_parquet_path(&path.display().to_string());
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, Ok(path));
+    }
+
+    #[test]
+    fn parquet_path_validation_rejects_missing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "panel_y_validation_missing_{}.parquet",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let error = validate_parquet_path(&path.display().to_string()).expect_err("missing path");
+
+        assert!(matches!(error, ParquetPathValidationError::Missing { .. }));
+    }
+
+    #[test]
+    fn parquet_path_validation_rejects_directory() {
+        let error =
+            validate_parquet_path(&std::env::temp_dir().display().to_string()).expect_err("dir");
+
+        assert!(matches!(error, ParquetPathValidationError::NotFile { .. }));
+    }
+
+    #[test]
+    fn parquet_path_validation_rejects_wrong_extension() {
+        let path =
+            std::env::temp_dir().join(format!("panel_y_validation_{}.csv", std::process::id()));
+        std::fs::write(&path, b"placeholder").expect("write temp csv path");
+
+        let error = validate_parquet_path(&path.display().to_string()).expect_err("wrong ext");
+
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            error,
+            ParquetPathValidationError::WrongExtension { .. }
+        ));
+    }
+
+    #[test]
+    fn recent_parquet_paths_are_deduped_and_limited() {
+        let mut recent_paths = Vec::new();
+        for index in 0..(MAX_RECENT_PARQUET_PATHS + 2) {
+            remember_recent_parquet_path(&mut recent_paths, format!("/tmp/{index}.parquet"));
+        }
+
+        assert_eq!(recent_paths.len(), MAX_RECENT_PARQUET_PATHS);
+        assert_eq!(recent_paths[0], "/tmp/9.parquet");
+        assert!(!recent_paths.iter().any(|path| path == "/tmp/0.parquet"));
+
+        remember_recent_parquet_path(&mut recent_paths, "/tmp/5.parquet");
+
+        assert_eq!(recent_paths.len(), MAX_RECENT_PARQUET_PATHS);
+        assert_eq!(recent_paths[0], "/tmp/5.parquet");
+        assert_eq!(
+            recent_paths
+                .iter()
+                .filter(|path| path.as_str() == "/tmp/5.parquet")
+                .count(),
+            1
+        );
     }
 
     #[test]
